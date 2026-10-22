@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.0.0"
+SB_MANAGER_VERSION="1.0.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -402,7 +402,20 @@ setup_panel() {
 
 install_core_locked() (
     umask 077
-    local requested=${1:-latest} work backup="" existed=0 unit_existed=0 config_existed=0 active=0
+    local requested=${1:-latest} operation=${2:-} work backup="" existed=0 unit_existed=0 config_existed=0 active=0
+    # Recheck after taking the lock: another operation may have installed/uninstalled the core.
+    case "$operation" in
+        install)
+            [[ ! -e "$CORE_BIN" && ! -L "$CORE_BIN" ]] || {
+                fail "核心已安装，请选择 10.更新 sing-box，或执行 sudo sing-box update [版本号]。"
+                exit 1
+            }
+            ;;
+        update)
+            is_managed || { fail "尚未通过本脚本安装 sing-box，请先执行 sudo sing-box install。"; exit 1; }
+            require_core || exit 1
+            ;;
+    esac
     work=$(mktemp -d "$STATE_DIR/install.XXXXXX") || exit 1
     local transaction=0
     # One cleanup path handles command errors, SIGINT/SIGTERM and failed health checks.
@@ -467,21 +480,45 @@ install_core_locked() (
     systemctl daemon-reload || exit 1
     [[ $active -eq 0 ]] || restart_checked || exit 1
     transaction=0
-    info "核心安装完成：$CORE_BIN"
+    if [[ $operation == update ]]; then
+        info "核心更新完成：$CORE_BIN"
+    else
+        info "核心安装完成：$CORE_BIN"
+    fi
     [[ $existed -eq 0 ]] || info "原核心与服务文件备份：$backup"
     if [[ $active -eq 0 ]]; then
-        info "当前未启动。请先添加配置，再选择 3 启动、4 设置开机自启。"
+        if [[ $operation == update ]]; then
+            info "更新后服务保持停止状态，可按需选择 3 启动。"
+        else
+            info "当前未启动。请先添加配置，再选择 3 启动、4 设置开机自启。"
+        fi
     fi
 )
 
 install_core() {
     local version=${1:-latest}
+    [[ ! -e "$CORE_BIN" && ! -L "$CORE_BIN" ]] || {
+        fail "核心已安装，请选择 10.更新 sing-box，或执行 sudo sing-box update [版本号]。"
+        return 1
+    }
     if ! is_managed; then
         setup_panel || return
     else
         require_systemd && check_conflicts && install_dependencies || return
     fi
-    with_lock install_core_locked "$version"
+    with_lock install_core_locked "$version" install
+}
+
+update_core() {
+    local version=${1:-latest}
+    is_managed || {
+        fail "尚未通过本脚本安装 sing-box，请先执行 sudo bash sing-box-manager.sh setup，再执行 sudo sing-box install。"
+        return 1
+    }
+    # Updating must not bootstrap an installation or replace a missing configuration with defaults.
+    require_core || return
+    require_systemd && check_conflicts && install_dependencies || return
+    with_lock install_core_locked "$version" update
 }
 
 confirm() {
@@ -740,8 +777,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box（已安装时更新核心）\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-9]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-10]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -752,8 +789,9 @@ menu() {
             7) show_logs || true ;;
             8) with_lock add_wizard_locked || true ;;
             9) show_config || true ;;
+            10) update_core || true ;;
             0) return 0 ;;
-            *) warn "请输入 0–9。" ;;
+            *) warn "请输入 0–10。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -767,7 +805,8 @@ sing-box 中文终端管理面板
 打开菜单：sudo sing-box
 
 管理命令：
-  sing-box install [版本号]       安装/更新核心，默认官方最新稳定版
+  sing-box install [版本号]       安装核心，默认官方最新稳定版；已安装时提示使用 update
+  sing-box update [版本号]        更新已安装核心，保留配置；默认官方最新稳定版
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
   sing-box enable                 设置开机自启（不改变当前运行状态）
@@ -806,20 +845,24 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|uninstall|start|restart|enable|disable|stop|status|log|logs|add|add-file|import|info|client|validate|remove-panel) ;;
+        menu|setup|install|update|uninstall|start|restart|enable|disable|stop|status|log|logs|add|add-file|import|info|client|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
     if ! is_managed; then
         case "$command" in
             menu) setup_panel || return ;;
-            setup|install) ;;
+            setup|install|update) ;;
             *) fail "请先执行 sudo bash sing-box-manager.sh setup 安装面板。"; return 1 ;;
         esac
     fi
     case "$command" in
         setup) setup_panel ;;
         install) install_core "${1:-latest}" ;;
+        update)
+            [[ $# -le 1 ]] || { fail "用法：sing-box update [版本号]"; return 1; }
+            update_core "${1:-latest}"
+            ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;

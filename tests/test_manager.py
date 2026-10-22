@@ -13,6 +13,8 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import pty
+import re
 import shutil
 import subprocess
 import tarfile
@@ -403,6 +405,85 @@ class ManagerTest(unittest.TestCase):
         self.assertIn("setup-called", lines)
         self.assertIn("menu-called", lines)
         self.assertLess(lines.index("setup-called"), lines.index("menu-called"))
+
+    def test_install_rejects_existing_core_without_downloading_or_replacing(self) -> None:
+        marker = self.core.parent / ".managed"
+        marker.write_text("sing-box-manager-v1\n", encoding="utf-8")
+        before = self.core.read_bytes()
+        result = self.shell(
+            'require_systemd() { return 0; }; check_conflicts() { return 0; }; '
+            'install_dependencies() { return 0; }; '
+            'download_core() { printf "download-called\\n"; return 77; }; install_core'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("download-called", result.stdout)
+        self.assertIn("update", result.stdout + result.stderr)
+        self.assertEqual(self.core.read_bytes(), before)
+
+    def test_update_requires_a_managed_installed_core_before_downloading(self) -> None:
+        marker = self.core.parent / ".managed"
+        marker.write_text("sing-box-manager-v1\n", encoding="utf-8")
+        before = self.core.read_bytes()
+        self.core.unlink()
+        body = (
+            'require_systemd() { return 0; }; check_conflicts() { return 0; }; '
+            'install_dependencies() { return 0; }; '
+            'download_core() { printf "download-called\\n"; return 77; }; update_core'
+        )
+        result = self.shell(body)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("download-called", result.stdout)
+        self.assertRegex(result.stdout + result.stderr, r"install|安装")
+        self.assertFalse(self.core.exists())
+        self.core.write_bytes(before)
+        self.core.chmod(0o755)
+        marker.unlink()
+        result = self.shell(body)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("download-called", result.stdout)
+        self.assertEqual(self.core.read_bytes(), before)
+
+    def test_update_cli_routes_version_through_locked_transaction(self) -> None:
+        marker = self.core.parent / ".managed"
+        marker.write_text("sing-box-manager-v1\n", encoding="utf-8")
+        body = (
+            'SB_ROOT_PREFIX=""; require_root() { return 0; }; require_systemd() { return 0; }; '
+            'check_conflicts() { return 0; }; install_dependencies() { return 0; }; '
+            'with_lock() { printf "lock-acquired\\n"; "$@"; }; '
+            'install_core_locked() { printf "transaction-version:%s\\n" "$1"; }; main update "$@"'
+        )
+        for args, expected in (((), "latest"), (("1.14.3",), "1.14.3")):
+            with self.subTest(version=expected):
+                result = self.shell(body, *args, check=True)
+                self.assertEqual(result.stdout.count("lock-acquired"), 1)
+                self.assertIn("transaction-version:" + expected, result.stdout)
+
+    def test_menu_lists_and_routes_separate_update_option(self) -> None:
+        master, slave = pty.openpty()
+        process = None
+        try:
+            process = subprocess.Popen(
+                ["bash", "-c", 'source "$1"; show_status() { :; }; '
+                 'update_core() { printf "update-called\\n"; }; menu', "test-menu", str(SCRIPT)],
+                env=self.env, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            os.close(slave)
+            slave = -1
+            os.write(master, b"10\n\n0\n")
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertRegex(stdout, r"10\.\s*更新\s*sing-box")
+            install_lines = [line for line in stdout.splitlines() if re.match(r"\s*1\.", line)]
+            self.assertTrue(install_lines)
+            self.assertTrue(all("更新" not in line for line in install_lines))
+            self.assertEqual(stdout.count("update-called"), 1)
+        finally:
+            if slave >= 0:
+                os.close(slave)
+            os.close(master)
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
 
     def upgrade_fixture(self) -> Path:
         upgrade = self.root / "upgrade-core"

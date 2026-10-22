@@ -6,7 +6,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 
 | 菜单 | 功能 | 行为 |
 |---|---|---|
-| 1 | 安装 sing-box | 从官方 GitHub Release 下载最新稳定核心；已安装时更新 |
+| 1 | 安装 sing-box | 首次安装官方最新稳定核心；已安装时提示使用更新选项 |
 | 2 | 卸载 sing-box | 停止并禁用服务，删除核心及 unit，保留面板、配置和备份 |
 | 3 | 启动 | 检查配置后启动，并检查服务状态 |
 | 4 | 设置开机自启 | 启用开机启动，当前运行状态不变 |
@@ -15,6 +15,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 7 | 查看日志 | 显示最近 100 行服务日志 |
 | 8 | 添加配置 | 协议向导、导入单个入站或导入完整 JSON |
 | 9 | 查看配置 | 配置列表、完整 JSON、客户端信息、配置检查 |
+| 10 | 更新 sing-box | 独立更新已安装的核心，保留现有配置，失败时尝试回滚 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -28,28 +29,42 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 
 **不支持 Alpine / OpenRC、OpenWrt，以及未启用 systemd 的容器或 WSL。** 不自动接管其他脚本或包管理器已安装的 sing-box。
 
-## 首次使用
+## 首次使用：直接下载运行
 
-本仓库默认是私有仓库。先登录有访问权限的 GitHub 账号，在仓库中下载 `sing-box-manager.sh`，再将它上传至 Linux 服务器。无需下载整个仓库即可运行。
+本项目采用 MIT 许可证。仓库公开后，下面的命令可直接在 Linux 服务器上下载并运行，无需登录 GitHub。请在可写目录中执行，使用 `bash` 运行。
+
+### 下载、安装面板并打开菜单
 
 ```bash
-# 在存放脚本的目录执行；请使用 bash，不要使用 sh。
-sudo bash sing-box-manager.sh setup
+curl -fL --retry 3 \
+  https://raw.githubusercontent.com/1622663850/sing-box-manager/main/sing-box-manager.sh \
+  -o sing-box-manager.sh && \
+sudo bash sing-box-manager.sh setup && \
 sudo sing-box
 ```
 
-`setup` 安装面板入口及必要依赖，核心由菜单 1 安装。首次使用顺序：**1 安装核心 → 8 添加配置 → 3 启动 → 4 设置开机自启**。
-
-若服务器已安装 Git、具备此私有仓库读取权限，并已配置对应的 GitHub SSH 密钥，也可以：
+已经使用 **root** 登录时，可以直接复制这一行：
 
 ```bash
-git clone git@github.com:1622663850/sing-box-manager.git
+curl -fL --retry 3 https://raw.githubusercontent.com/1622663850/sing-box-manager/main/sing-box-manager.sh -o sing-box-manager.sh && bash sing-box-manager.sh setup && sing-box
+```
+
+`setup` 安装或更新面板脚本及必要依赖，核心由菜单 **1** 安装。首次使用顺序：**1 安装核心 → 8 添加配置 → 3 启动 → 4 设置开机自启**。以后输入 `sudo sing-box` 打开菜单，root 用户直接输入 `sing-box`。
+
+如果提示没有 `curl`，Debian / Ubuntu 可先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`；使用 DNF 的系统可先执行 `sudo dnf install -y curl ca-certificates`。
+
+下载命令使用 `&&` 串联，下载失败时不会继续执行脚本。脚本需要复制自身到面板入口，因此以上命令先保存为本地文件，再执行该文件。
+
+### 使用 Git 克隆
+
+```bash
+git clone https://github.com/1622663850/sing-box-manager.git
 cd sing-box-manager
-sudo bash sing-box-manager.sh setup
+sudo bash sing-box-manager.sh setup && \
 sudo sing-box
 ```
 
-私有仓库不能通过未认证的 `raw.githubusercontent.com` 下载命令获取脚本。首次安装的基础配置不含入站，需要添加配置后才有可连接的节点。
+也可以[直接下载脚本](https://raw.githubusercontent.com/1622663850/sing-box-manager/main/sing-box-manager.sh)，上传到服务器后运行。首次安装的基础配置不含入站，需要添加配置后才有可连接的节点。
 
 ## 添加与查看配置
 
@@ -91,8 +106,10 @@ sudo sing-box validate
 
 ```bash
 sudo sing-box                     # 中文面板
-sudo sing-box install             # 安装 / 更新官方最新稳定核心
-sudo sing-box install 1.14.3       # 指定正式版本，版本号仅作示例
+sudo sing-box install             # 首次安装官方最新稳定核心
+sudo sing-box install 1.14.3       # 首次安装指定正式版本，版本号仅作示例
+sudo sing-box update              # 独立更新到官方最新稳定核心
+sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
 sudo sing-box enable              # 开机自启，不立即启动
 sudo sing-box restart             # 重新启动
@@ -143,7 +160,9 @@ sudo sing-box remove-panel    # 核心已卸载后，移除面板命令
 
 卸载核心后仍可运行 `sing-box`，通过菜单 1 重新安装。配置、连接信息及备份始终保留；`remove-panel` 也保留这些文件和管理标记，便于恢复。它不是“删除所有数据”的操作。
 
-更新面板时，下载仓库中的新脚本并再次运行 `sudo bash sing-box-manager.sh setup`；更新核心使用菜单 1 或 `sudo sing-box install`。
+**更新核心：**选择菜单 **10. 更新 sing-box**，或运行 `sudo sing-box update`。可以附加正式版本号，例如 `sudo sing-box update 1.14.3`；指定较旧版本会切换到该版本。更新会检查现有配置与新核心的兼容性，保留原运行状态及开机自启设置，失败时尝试恢复旧核心和服务文件。尚未安装核心时，更新选项会提示先安装。
+
+**更新面板脚本：**重新执行上面的“下载、安装面板并打开菜单”命令即可。已安装旧版面板的用户，需要先更新面板脚本，才能看到新增的菜单 10。菜单 1 仅用于首次安装，已存在核心时会提示改用更新选项。
 
 ## 验证与限制
 
@@ -158,7 +177,7 @@ SB_TEST_CORE=/absolute/path/to/sing-box python3 -m unittest discover -s tests -v
 python3 tests/smoke_core.py --core /absolute/path/to/sing-box
 ```
 
-首次发布已用官方 v1.14.3（amd64）完成 Bash 语法检查、ShellCheck、33 项回归测试，以及 VLESS TCP、VLESS WS、Shadowsocks 2022 的真实核心回环转发。REALITY 只完成服务端和客户端配置检查，未进行公网握手验证。GitHub Actions 会重复静态检查、回归和回环测试；系统服务启停与回滚使用模拟 systemctl 验证。
+面板 v1.0.1 已完成 Bash 语法检查、ShellCheck 和 37 项回归测试，回归中使用官方核心 v1.14.3（amd64）检查配置，新增测试覆盖安装与更新分离、未安装时拒绝更新、指定版本传递及菜单 10 的实际调用。首次发布还完成了 VLESS TCP、VLESS WS、Shadowsocks 2022 的真实核心回环转发。REALITY 只完成服务端和客户端配置检查，未进行公网握手验证。仓库的 GitHub Actions 工作流包含静态检查、回归和回环测试；系统服务启停与回滚使用模拟 systemctl 验证。
 
 离线服务模拟和 `sing-box check` 不能证明服务器网络、目标域名、防火墙及客户端端到端连通性。真机部署后应检查服务日志，并用实际客户端验证连接。支持范围之外的发行版和初始化系统不作兼容承诺。
 
