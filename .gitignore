@@ -1,0 +1,32 @@
+# Local test output and editor files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Downloaded cores and archives
+/sing-box
+*.tar.gz
+*.zip
+/downloads/
+/test-output/
+
+# Local server state, credentials, and backups
+/config.json
+/inbound.json
+/outbound.json
+/release.json
+/clients/
+/backups/
+/state/
+/runtime/
+.env
+.env.*
+*.key
+*.pem
+*.log

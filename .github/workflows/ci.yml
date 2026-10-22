@@ -1,0 +1,45 @@
+name: Validate manager
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+      - name: Bash syntax and static analysis
+        run: |
+          bash -n sing-box-manager.sh
+          shellcheck -x sing-box-manager.sh
+      - name: Fetch official core for reproducible tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/sing-box-test"
+          curl --fail --show-error --silent --location --retry 3 \
+            --proto '=https' --proto-redir '=https' \
+            https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz \
+            -o "$RUNNER_TEMP/sing-box-test/core.tar.gz"
+          printf '%s  %s\n' \
+            e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee \
+            "$RUNNER_TEMP/sing-box-test/core.tar.gz" | sha256sum --check
+          tar -xzOf "$RUNNER_TEMP/sing-box-test/core.tar.gz" \
+            sing-box-1.14.3-linux-amd64/sing-box > "$RUNNER_TEMP/sing-box-test/sing-box"
+          chmod +x "$RUNNER_TEMP/sing-box-test/sing-box"
+      - name: Regression tests and real-core configuration checks
+        env:
+          SB_TEST_CORE: ${{ runner.temp }}/sing-box-test/sing-box
+        run: python3 -m unittest discover -s tests -v
+      - name: Real-core loopback proxy tests
+        run: python3 tests/smoke_core.py --core "$RUNNER_TEMP/sing-box-test/sing-box"
