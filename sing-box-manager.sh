@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.4.5"
+SB_MANAGER_VERSION="1.5.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -691,7 +691,7 @@ service_action() {
 
 download_https() {
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
-        --connect-timeout 20 --max-time 600 --retry 3 --retry-delay 2 "$1" -o "$2"
+        --connect-timeout 20 --max-time "${3:-600}" --retry 3 --retry-delay 2 "$1" -o "$2"
 }
 
 detect_arch() {
@@ -773,6 +773,97 @@ setup_panel() {
     atomic_copy "$SCRIPT_FILE" "$WRAPPER" 755 || return
     info "面板已安装。输入 sudo sing-box 即可打开。"
     info "下一步选择 1 安装核心；首次安装后选择 8 添加配置。"
+}
+
+update_panel_locked() (
+    umask 077
+    local work backup="" version transaction=0
+    if ! safe_paths || ! is_managed; then
+        fail "请先通过 setup 安装本项目面板。"; exit 1
+    fi
+    [[ -f $WRAPPER && ! -L $WRAPPER ]] || { fail "面板入口不存在或不是普通文件，请重新运行 setup。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/panel-update.XXXXXX") || exit 1
+    # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
+    rollback_panel_update() {
+        local result=$?
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            if ! cmp -s "$backup" "$WRAPPER"; then
+                atomic_copy "$backup" "$WRAPPER" 755 || true
+            fi
+            if cmp -s "$backup" "$WRAPPER"; then
+                warn "面板更新未完成，已保留或恢复旧版本。"
+            else
+                warn "面板自动恢复失败，请使用备份恢复：$backup"
+            fi
+            result=1
+        fi
+        rm -rf -- "$work"
+        exit "$result"
+    }
+    trap rollback_panel_update EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    info "正在从 GitHub 获取最新面板脚本。"
+    download_https 'https://api.github.com/repos/1622663850/sing-box-manager/contents/sing-box-manager.sh?ref=main' \
+        "$work/source.json" 60 || { fail "面板下载失败，旧版本保留。"; exit 1; }
+    version=$(python3 - "$work/source.json" "$work/panel.sh" <<'PY_PANEL_DOWNLOAD'
+import base64
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+def require(condition):
+    if not condition:
+        raise ValueError("invalid panel response")
+
+try:
+    entry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    require(entry["type"] == "file" and entry["path"] == "sing-box-manager.sh")
+    require(entry["encoding"] == "base64" and type(entry["size"]) is int)
+    require(0 < entry["size"] <= 1048576 and re.fullmatch(r"[a-f0-9]{40}", entry["sha"]))
+    content = base64.b64decode("".join(entry["content"].split()), validate=True)
+    require(len(content) == entry["size"] and b"\0" not in content)
+    digest = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
+    require(digest == entry["sha"])
+    require(content.startswith(b"#!/usr/bin/env bash\n"))
+    require(b"# sing-box-manager: a self-contained Chinese terminal manager." in content.splitlines())
+    versions = re.findall(rb'^SB_MANAGER_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$', content, re.M)
+    require(len(versions) == 1)
+    Path(sys.argv[2]).write_bytes(content)
+    print(versions[0].decode("ascii"))
+except Exception:
+    print("GitHub 面板响应、文件摘要或脚本标识检查失败。", file=sys.stderr)
+    sys.exit(1)
+PY_PANEL_DOWNLOAD
+    ) || { fail "下载内容未通过检查，旧版本保留。"; exit 1; }
+    bash -n "$work/panel.sh" 9>&- || { fail "新面板语法检查失败，旧版本保留。"; exit 1; }
+    if cmp -s "$work/panel.sh" "$WRAPPER"; then
+        info "面板已是 GitHub 最新版本 v$version，无需更新。"
+        exit 0
+    fi
+    install -d -m 700 "$BACKUP_DIR" || exit 1
+    backup=$(mktemp "$BACKUP_DIR/panel-$(date +%Y%m%d-%H%M%S)-XXXXXX.sh") || exit 1
+    install -m 600 "$WRAPPER" "$backup" || exit 1
+    if ! SB_ROOT_PREFIX="" timeout --kill-after=2s 15s bash "$work/panel.sh" help 9>&- </dev/null >"$work/help.log" 2>&1 ||
+       ! grep -Fq 'sing-box 中文终端管理面板' "$work/help.log"; then
+        fail "新面板入口检查失败，旧版本保留。备份：$backup"; exit 1
+    fi
+    transaction=1
+    atomic_copy "$work/panel.sh" "$WRAPPER" 755 || exit 1
+    cmp -s "$work/panel.sh" "$WRAPPER" && bash -n "$WRAPPER" 9>&- || exit 1
+    transaction=0
+    info "面板已更新至 v$version，旧面板备份：$backup"
+    info "现有配置、连接信息、核心和服务状态均保留。"
+)
+
+update_panel() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box update-panel"; return 1; }
+    is_managed || { fail "请先通过 setup 安装本项目面板。"; return 1; }
+    require_systemd && check_conflicts && install_dependencies || return
+    with_lock update_panel_locked
 }
 
 install_core_locked() (
@@ -1855,8 +1946,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-13]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-14]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -1871,8 +1962,14 @@ menu() {
             11) with_lock edit_wizard_locked || true ;;
             12) with_lock delete_inbound || true ;;
             13) management_menu || true ;;
+            14)
+                if update_panel; then
+                    # update_panel returns after its with_lock subshell has released fd 9.
+                    exec bash "$WRAPPER" menu
+                fi
+                ;;
             0) return 0 ;;
-            *) warn "请输入 0–13。" ;;
+            *) warn "请输入 0–14。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -1888,6 +1985,7 @@ sing-box 中文终端管理面板
 管理命令：
   sing-box install [版本号]       安装核心，默认官方最新稳定版；已安装时提示使用 update
   sing-box update [版本号]        更新已安装核心，保留配置；默认官方最新稳定版
+  sing-box update-panel           更新面板脚本到 GitHub 最新版，更新前自动备份
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
   sing-box enable                 设置开机自启（不改变当前运行状态）
@@ -1934,7 +2032,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
+        menu|setup|install|update|update-panel|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -1952,6 +2050,7 @@ main() {
             [[ $# -le 1 ]] || { fail "用法：sing-box update [版本号]"; return 1; }
             update_core "${1:-latest}"
             ;;
+        update-panel) update_panel "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;
