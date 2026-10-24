@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.4.2"
+SB_MANAGER_VERSION="1.4.3"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1814,8 +1814,25 @@ show_config() {
 show_status() {
     local active enabled version="未安装"
     [[ ! -x "$CORE_BIN" ]] || version=$("$CORE_BIN" version 2>/dev/null | head -n 1)
-    active=$(systemctl is-active "$SERVICE" 2>/dev/null) || active=${active:-inactive}
-    enabled=$(systemctl is-enabled "$SERVICE" 2>/dev/null) || enabled=${enabled:-disabled}
+    active=$(systemctl is-active "$SERVICE" 2>/dev/null) || active=${active:-unknown}
+    enabled=$(systemctl is-enabled "$SERVICE" 2>/dev/null) || enabled=${enabled:-unknown}
+    case "$active" in
+        active) active="🟢 运行中 (active)" ;;
+        inactive) active="⚪ 已停止 (inactive)" ;;
+        failed) active="🔴 运行失败 (failed)" ;;
+        activating) active="🟡 启动中 (activating)" ;;
+        deactivating) active="🟡 停止中 (deactivating)" ;;
+        reloading) active="🟡 重新加载中 (reloading)" ;;
+        *) active="❓ 未知状态 ($active)" ;;
+    esac
+    case "$enabled" in
+        enabled) enabled="✅ 已启用 (enabled)" ;;
+        disabled) enabled="❌ 未启用 (disabled)" ;;
+        enabled-runtime) enabled="🟡 临时启用 (enabled-runtime)" ;;
+        masked|masked-runtime) enabled="🚫 已屏蔽 ($enabled)" ;;
+        static|indirect|alias|linked|linked-runtime|generated|transient) enabled="⚪ $enabled" ;;
+        *) enabled="❓ 未知状态 ($enabled)" ;;
+    esac
     printf '\n核心：%s\n状态：%s    开机自启：%s\n配置：%s\n' "$version" "$active" "$enabled" "$CONFIG_FILE"
 }
 
