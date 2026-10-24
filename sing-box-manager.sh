@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.4.4"
+SB_MANAGER_VERSION="1.4.5"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1821,21 +1821,21 @@ show_status() {
     active=$(systemctl is-active "$SERVICE" 2>/dev/null) || active=${active:-unknown}
     enabled=$(systemctl is-enabled "$SERVICE" 2>/dev/null) || enabled=${enabled:-unknown}
     case "$active" in
-        active) active="${green}[+]${reset} 运行中 (active)" ;;
-        inactive) active="${dim}[-]${reset} 已停止 (inactive)" ;;
-        failed) active="${red}[!]${reset} 运行失败 (failed)" ;;
-        activating) active="${yellow}[~]${reset} 启动中 (activating)" ;;
-        deactivating) active="${yellow}[~]${reset} 停止中 (deactivating)" ;;
-        reloading) active="${yellow}[~]${reset} 重新加载中 (reloading)" ;;
-        *) active="${yellow}[?]${reset} 未知状态 ($active)" ;;
+        active) active="${green}●${reset} 运行中 (active)" ;;
+        inactive) active="${dim}●${reset} 已停止 (inactive)" ;;
+        failed) active="${red}●${reset} 运行失败 (failed)" ;;
+        activating) active="${yellow}●${reset} 启动中 (activating)" ;;
+        deactivating) active="${yellow}●${reset} 停止中 (deactivating)" ;;
+        reloading) active="${yellow}●${reset} 重新加载中 (reloading)" ;;
+        *) active="${yellow}●${reset} 未知状态 ($active)" ;;
     esac
     case "$enabled" in
-        enabled) enabled="${green}[+]${reset} 已启用 (enabled)" ;;
-        disabled) enabled="${red}[-]${reset} 未启用 (disabled)" ;;
-        enabled-runtime) enabled="${yellow}[~]${reset} 临时启用 (enabled-runtime)" ;;
-        masked|masked-runtime) enabled="${red}[!]${reset} 已屏蔽 ($enabled)" ;;
-        static|indirect|alias|linked|linked-runtime|generated|transient) enabled="${dim}[i]${reset} $enabled" ;;
-        *) enabled="${yellow}[?]${reset} 未知状态 ($enabled)" ;;
+        enabled) enabled="${green}●${reset} 已启用 (enabled)" ;;
+        disabled) enabled="${red}●${reset} 未启用 (disabled)" ;;
+        enabled-runtime) enabled="${yellow}●${reset} 临时启用 (enabled-runtime)" ;;
+        masked|masked-runtime) enabled="${red}●${reset} 已屏蔽 ($enabled)" ;;
+        static|indirect|alias|linked|linked-runtime|generated|transient) enabled="${dim}●${reset} $enabled" ;;
+        *) enabled="${yellow}●${reset} 未知状态 ($enabled)" ;;
     esac
     printf '\n核心：%s\n状态：%s    开机自启：%s\n配置：%s\n' "$version" "$active" "$enabled" "$CONFIG_FILE"
 }
