@@ -74,6 +74,9 @@ def run(core: Path, manager: Path) -> None:
             require(result > 0, "isolated service has no main process")
             return result
 
+        def fixture_config() -> dict:
+            return json.loads(call("config_jq", "."))
+
         def check_restarted(previous: int) -> None:
             require(pid() != previous, "configuration change did not restart isolated service")
 
@@ -106,7 +109,10 @@ def run(core: Path, manager: Path) -> None:
         baseline_config = smoke.server_config(baseline)
         baseline_metadata = {"server": "", "public_key": "", "inbound": baseline}
         smoke.write_json(config, baseline_config)
-        config.write_text('// JSONC fixture: keep comments when restarting\n' + config.read_text(encoding='utf-8'), encoding='utf-8')
+        commented = config.read_text(encoding="utf-8")
+        commented = commented.replace(f'"listen_port": {baseline["listen_port"]},',
+                                      f'"listen_port": {baseline["listen_port"]}, // baseline port')
+        config.write_text('// JSONC fixture: preserve comments when saving\n' + commented, encoding='utf-8')
         smoke.write_json(clients / "baseline.json", baseline_metadata)
         default_file = state / "default-server"
         default_file.write_text(smoke.LOOPBACK + "\n", encoding="utf-8")
@@ -141,6 +147,7 @@ def run(core: Path, manager: Path) -> None:
             require(backup.parent == state / "backups", "backup escaped fixture")
             bundle = read_json(backup)
             require(bundle["config"] == baseline_config, "backup configuration mismatch")
+            require(bundle["config_source"] == config.read_text(encoding="utf-8"), "backup lost original comments")
             require(bundle["clients"] == {"baseline": baseline_metadata}, "backup metadata mismatch")
             require(bundle["default_server"] == smoke.LOOPBACK, "backup default address mismatch")
             require(backup.stat().st_mode & 0o777 == 0o600, "backup permissions mismatch")
@@ -152,7 +159,8 @@ def run(core: Path, manager: Path) -> None:
             previous = pid()
             call("add_managed_inbound", str(added_file), smoke.LOOPBACK)
             check_restarted(previous)
-            require(read_json(config)["inbounds"] == [baseline, added], "add changed other nodes")
+            require(fixture_config()["inbounds"] == [baseline, added], "add changed other nodes")
+            require("// baseline port" in config.read_text(encoding="utf-8"), "add lost existing comments")
             require(read_json(clients / "added.json")["inbound"] == added, "add metadata mismatch")
             verify_forwarding("added")
             print("PASS add: real restart, metadata synchronization and HTTP forwarding", flush=True)
@@ -163,7 +171,8 @@ def run(core: Path, manager: Path) -> None:
             previous = pid()
             call("replace_inbound_file", "added", str(edited_file), smoke.LOOPBACK, "", str(added_file))
             check_restarted(previous)
-            require(read_json(config)["inbounds"] == [baseline, edited], "edit changed other nodes")
+            require(fixture_config()["inbounds"] == [baseline, edited], "edit changed other nodes")
+            require("// baseline port" in config.read_text(encoding="utf-8"), "edit lost existing comments")
             verify_forwarding("added")
             print("PASS edit: real restart, preserved other node and HTTP forwarding", flush=True)
 
@@ -194,7 +203,8 @@ def run(core: Path, manager: Path) -> None:
             previous = pid()
             call("delete_inbound", "added")
             check_restarted(previous)
-            require(read_json(config) == baseline_config, "delete did not preserve baseline")
+            require(fixture_config() == baseline_config, "delete did not preserve baseline")
+            require("// baseline port" in config.read_text(encoding="utf-8"), "delete lost remaining node comments")
             require(not (clients / "added.json").exists(), "delete left node metadata")
             require(read_json(clients / "baseline.json") == baseline_metadata, "delete altered other metadata")
             print("PASS delete: real restart, selected node removed, baseline preserved", flush=True)
@@ -208,7 +218,8 @@ def run(core: Path, manager: Path) -> None:
             previous = pid()
             call("restore_backup", str(backup))
             check_restarted(previous)
-            require(read_json(config) == baseline_config, "restore configuration mismatch")
+            require(fixture_config() == baseline_config, "restore configuration mismatch")
+            require(config.read_bytes() == original_commented, "restore did not recover original comments and layout")
             require(sorted(path.name for path in clients.iterdir()) == ["baseline.json"], "restore metadata set mismatch")
             require(read_json(clients / "baseline.json") == baseline_metadata, "restore metadata mismatch")
             require(default_file.read_text(encoding="utf-8") == smoke.LOOPBACK + "\n", "restore default address mismatch")

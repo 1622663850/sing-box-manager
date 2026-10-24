@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.4.1"
+SB_MANAGER_VERSION="1.4.2"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -80,7 +80,7 @@ check_conflicts() {
 
 install_dependencies() {
     local need=0 cmd
-    for cmd in curl jq awk tar gzip sha256sum flock ss openssl; do
+    for cmd in curl jq awk python3 tar gzip sha256sum flock ss openssl; do
         have "$cmd" || need=1
     done
     [[ -r /etc/ssl/certs/ca-certificates.crt || -r /etc/pki/tls/certs/ca-bundle.crt ]] || need=1
@@ -88,20 +88,20 @@ install_dependencies() {
     info "安装 curl、jq、OpenSSL 等必要依赖。"
     if have apt-get; then
         apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ca-certificates curl jq gawk tar gzip coreutils util-linux iproute2 openssl || return
+            ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute2 openssl || return
     elif have dnf; then
-        dnf install -y ca-certificates curl jq gawk tar gzip coreutils util-linux iproute openssl || return
+        dnf install -y ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute openssl || return
     elif have yum; then
-        yum install -y ca-certificates curl jq gawk tar gzip coreutils util-linux iproute openssl || return
+        yum install -y ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute openssl || return
     elif have zypper; then
-        zypper --non-interactive install ca-certificates curl jq gawk tar gzip coreutils util-linux iproute2 openssl || return
+        zypper --non-interactive install ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute2 openssl || return
     elif have pacman; then
-        pacman -S --needed --noconfirm ca-certificates curl jq gawk tar gzip coreutils util-linux iproute2 openssl || return
+        pacman -S --needed --noconfirm ca-certificates curl jq gawk python tar gzip coreutils util-linux iproute2 openssl || return
     else
-        fail "无法自动安装依赖。需要 Bash 4+、curl、jq、awk、tar、gzip、sha256sum、flock、ss、openssl。"
+        fail "无法自动安装依赖。需要 Bash 4+、curl、jq、awk、python3、tar、gzip、sha256sum、flock、ss、openssl。"
         return 1
     fi
-    for cmd in curl jq awk tar gzip sha256sum flock ss openssl; do
+    for cmd in curl jq awk python3 tar gzip sha256sum flock ss openssl; do
         have "$cmd" || { fail "依赖安装后仍缺少：$cmd"; return 1; }
     done
 }
@@ -204,6 +204,243 @@ json_query() (
 
 config_jq() { json_query "$CONFIG_FILE" "$@"; }
 
+preserve_config_source() {
+    have python3 || { fail "保留配置注释需要 Python 3，请重新运行 setup 安装依赖。"; return 1; }
+    python3 - "$1" "$2" <<'PY_JSONC_EDITOR'
+"""Update JSONC values without rewriting untouched source text (stdlib only)."""
+import difflib
+import json
+from pathlib import Path
+import re
+import sys
+
+
+TOKEN = re.compile(
+    r'\s+|//[^\r\n]*|/\*[\s\S]*?\*/|'
+    r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|'
+    r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|'
+    r'true|false|null|[{}\[\]:,]'
+)
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":"))
+
+
+def signature(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False,
+                      sort_keys=True, separators=(",", ":"))
+
+
+class Node:
+    def __init__(self, start, end, value, items=None):
+        self.start, self.end, self.value = start, end, value
+        # Each item is (object key or array index, member start, value, comma).
+        self.items = items
+
+
+class Parser:
+    def __init__(self, text):
+        self.tokens, offset = [], 0
+        while offset < len(text):
+            match = TOKEN.match(text, offset)
+            if match is None:
+                raise ValueError("invalid JSONC")
+            token = match.group()
+            if not (token.isspace() or token.startswith(("//", "/*"))):
+                self.tokens.append((token, offset, match.end()))
+            offset = match.end()
+        self.position = 0
+
+    def peek(self):
+        if self.position == len(self.tokens):
+            return ""
+        return self.tokens[self.position][0]
+
+    def take(self, expected=None):
+        if self.position == len(self.tokens):
+            raise ValueError("unexpected end")
+        token = self.tokens[self.position]
+        self.position += 1
+        if expected is not None and token[0] != expected:
+            raise ValueError("unexpected token")
+        return token
+
+    def value(self):
+        token, start, end = self.take()
+        if token not in ("{", "["):
+            value = json.loads(token)
+            encode(value)  # Reject overflowing numbers, NaN and Infinity.
+            return Node(start, end, value)
+        is_object = token == "{"
+        close = "}" if is_object else "]"
+        result, items = ({} if is_object else []), []
+        while self.peek() != close:
+            member_start = self.tokens[self.position][1] if self.peek() else end
+            if is_object:
+                key_token = self.take()[0]
+                if not key_token.startswith('"'):
+                    raise ValueError("invalid object key")
+                key = json.loads(key_token)
+                if key in result:
+                    raise ValueError("duplicate object key")
+                self.take(":")
+            else:
+                key = len(items)
+            child = self.value()
+            if is_object:
+                result[key] = child.value
+            else:
+                result.append(child.value)
+            comma = self.take(",")[1] if self.peek() == "," else None
+            items.append((key, member_start, child, comma))
+            if comma is None:
+                break
+        end = self.take(close)[2]
+        return Node(start, end, result, items)
+
+    def parse(self):
+        root = self.value()
+        if self.position != len(self.tokens):
+            raise ValueError("multiple documents")
+        return root
+
+
+def identity(value):
+    if isinstance(value, dict) and isinstance(value.get("tag"), str):
+        return ("tag", value["tag"])
+    return ("value", signature(value))
+
+
+def array_pairs(old, new):
+    old_tags = [value.get("tag") for value in old if isinstance(value, dict)]
+    new_tags = [value.get("tag") for value in new if isinstance(value, dict)]
+    if (len(old_tags) == len(old) and len(new_tags) == len(new)
+            and all(isinstance(tag, str) for tag in old_tags + new_tags)):
+        common = set(old_tags) & set(new_tags)
+        if ([tag for tag in old_tags if tag in common]
+                != [tag for tag in new_tags if tag in common]):
+            raise ValueError("tag reordering is not supported")
+    if len(old) == len(new):
+        return list(range(len(old)))
+    pairs = [None] * len(new)
+    matcher = difflib.SequenceMatcher(None, list(map(identity, old)),
+                                     list(map(identity, new)), autojunk=False)
+    for operation, a, b, c, d in matcher.get_opcodes():
+        if operation == "equal" or (operation == "replace" and b - a == d - c):
+            pairs[c:d] = range(a, b)
+    return pairs
+
+
+def update(source, candidate):
+    root = Parser(source).parse()
+    signature(candidate)
+    edits = []
+    newline = "\r\n" if "\r\n" in source else "\n"
+
+    def indent(position):
+        line = source[source.rfind("\n", 0, position) + 1:position]
+        return re.match(r"[ \t]*", line).group()
+
+    def change(node, value):
+        if signature(node.value) == signature(value):
+            return
+        if type(node.value) is not type(value) or node.items is None:
+            edits.append((node.start, node.end, encode(value)))
+            return
+        is_object = isinstance(value, dict)
+        if is_object:
+            old_keys = {item[0]: index for index, item in enumerate(node.items)}
+            # Preserve original order for surviving keys; append new keys.
+            keys = [item[0] for item in node.items if item[0] in value]
+            keys += [key for key in value if key not in old_keys]
+            pairs = [old_keys.get(key) for key in keys]
+            values = [value[key] for key in keys]
+        else:
+            keys, values = list(range(len(value))), value
+            pairs = array_pairs(node.value, value)
+        if pairs == list(range(len(node.items))):
+            for position, item in enumerate(node.items):
+                change(item[2], values[position])
+            return
+        retained = set(index for index in pairs if index is not None)
+        for index, item in enumerate(node.items):
+            _, member_start, child, comma = item
+            if index not in retained:
+                edits.append((member_start, child.end, ""))
+            # Existing commas belong to their preceding surviving item.
+            needs_comma = index in retained and pairs.index(index) < len(pairs) - 1
+            if comma is not None and not needs_comma:
+                edits.append((comma, comma + 1, ""))
+            elif comma is None and needs_comma:
+                edits.append((child.end, child.end, ","))
+        for position, index in enumerate(pairs):
+            if index is not None:
+                change(node.items[index][2], values[position])
+        position = 0
+        while position < len(pairs):
+            if pairs[position] is not None:
+                position += 1
+                continue
+            first = position
+            while position < len(pairs) and pairs[position] is None:
+                position += 1
+            fresh = [(encode(keys[i]) + ": " if is_object else "") + encode(values[i])
+                     for i in range(first, position)]
+            if position < len(pairs):
+                start = node.items[pairs[position]][1]
+                spacing = indent(start)
+                text = ("," + newline + spacing).join(fresh) + "," + newline + spacing
+            else:
+                start = node.end - 1
+                closing_indent = indent(start)
+                spacing = indent(node.items[0][1]) if node.items else closing_indent + "  "
+                if spacing == closing_indent:
+                    spacing += "  "
+                text = newline + spacing + ("," + newline + spacing).join(fresh)
+                text += newline + closing_indent
+            edits.append((start, start, text))
+
+    change(root, candidate)
+    # An appended value and its preceding comma can share one source offset.
+    insertions, replacements = {}, []
+    for start, end, text in edits:
+        if start == end:
+            insertions[start] = insertions.get(start, "") + text
+        else:
+            replacements.append((start, end, text))
+    edits = replacements + [(position, position, text) for position, text in insertions.items()]
+    boundary = len(source)
+    for start, end, text in sorted(edits, reverse=True):
+        if not (0 <= start <= end <= boundary):
+            raise ValueError("overlapping changes")
+        source = source[:start] + text + source[end:]
+        boundary = start
+    if signature(Parser(source).parse().value) != signature(candidate):
+        raise ValueError("result differs from candidate")
+    return source
+
+
+def main():
+    try:
+        if len(sys.argv) != 3:
+            raise ValueError("arguments")
+        original = Path(sys.argv[1]).read_bytes().decode("utf-8")
+        candidate = json.loads(Path(sys.argv[2]).read_bytes().decode("utf-8"))
+        result = update(original, candidate).encode("utf-8")
+        sys.stdout.buffer.write(result)
+    except Exception:
+        print("JSONC 更新失败；原文件未修改。", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY_JSONC_EDITOR
+}
+
 validate_config() {
     local file=$1
     [[ -f "$file" ]] || { fail "找不到配置文件：$file"; return 1; }
@@ -243,7 +480,8 @@ atomic_copy() {
 
 commit_config() (
     umask 077
-    local candidate=$1 active=0 old_exists=0 snapshot backup="" transaction=0
+    local candidate=$1 policy=${2:-preserve} active=0 old_exists=0 snapshot backup="" transaction=0
+    case "$policy" in preserve|replace) ;; *) fail "未知的配置保存方式。"; exit 1;; esac
     safe_paths || exit 1
     install -d -m 700 "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR" || exit 1
     snapshot=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX") || exit 1
@@ -270,7 +508,14 @@ commit_config() (
     trap rollback_config EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    cp -- "$candidate" "$snapshot" || exit 1
+    if [[ $policy == preserve && -f $CONFIG_FILE ]]; then
+        preserve_config_source "$CONFIG_FILE" "$candidate" >"$snapshot" || exit 1
+        [[ $(json_query "$snapshot" -Sc .) == "$(json_query "$candidate" -Sc .)" ]] || {
+            fail "保留注释后的配置与目标不一致，已取消保存。"; exit 1;
+        }
+    else
+        cp -- "$candidate" "$snapshot" || exit 1
+    fi
     validate_config "$snapshot" || { fail "配置检查未通过，现有配置未修改。"; exit 1; }
     service_is_active && active=1
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -321,7 +566,7 @@ add_inbound_file() (
 
 import_config() {
     require_core || return
-    commit_config "$1"
+    commit_config "$1" replace
 }
 
 validate_tls_files() {
@@ -1280,9 +1525,10 @@ snapshot_bundle() (
     fi
     server=$(read_default_server) || exit 1
     config_jq . >"$work/config.json" || exit 1
-    jq -n --slurpfile config "$work/config.json" --slurpfile clients "$work/clients.json" --arg server "$server" \
+    jq -n --slurpfile config "$work/config.json" --rawfile source "$CONFIG_FILE" \
+        --slurpfile clients "$work/clients.json" --arg server "$server" \
         '{format:"sing-box-manager-backup-v1",config:$config[0],clients:$clients[0],
-          default_server:(if $server=="" then null else $server end)}'
+          config_source:$source,default_server:(if $server=="" then null else $server end)}'
 )
 
 create_backup() (
@@ -1300,6 +1546,7 @@ validate_bundle() {
     [[ -f $file && ! -L $file ]] || { fail "备份必须为普通 JSON 文件，不能是符号链接。"; return 1; }
     jq -e '.format=="sing-box-manager-backup-v1" and (.config|type=="object") and
       (.clients|type=="object") and (.default_server==null or (.default_server|type=="string")) and
+      (.config_source==null or (.config_source|type=="string")) and
       all(.clients[]; type=="object") and
       all(.clients|keys[]; test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$") and (contains("\n")|not))' "$file" >/dev/null || { fail "备份格式无效。"; return 1; }
     while IFS= read -r tag; do
@@ -1311,7 +1558,8 @@ validate_bundle() {
 
 apply_bundle() (
     umask 077
-    local file=$1 work backup="" tag server active=0 transaction=0 had_clients=0
+    local file=$1 policy=${2:-preserve} work backup="" tag server active=0 transaction=0 had_clients=0
+    case "$policy" in preserve|replace) ;; *) fail "未知的配置恢复方式。"; exit 1;; esac
     require_core && safe_paths && validate_bundle "$file" || exit 1
     work=$(mktemp -d "$STATE_DIR/restore.XXXXXX") || exit 1
     # shellcheck disable=SC2317,SC2329 # Called by the EXIT trap.
@@ -1344,6 +1592,13 @@ apply_bundle() (
     cp -- "$file" "$work/bundle.json" || exit 1
     validate_bundle "$work/bundle.json" || exit 1
     jq .config "$work/bundle.json" >"$work/config.json" || exit 1
+    if [[ $policy == replace ]] && jq -e '.config_source|type=="string"' "$work/bundle.json" >/dev/null; then
+        jq -j .config_source "$work/bundle.json" >"$work/source.json" || exit 1
+        if [[ $(json_query "$work/source.json" -Sc .) != "$(jq -Sc . "$work/config.json")" ]]; then
+            fail "备份的注释原文与配置数据不一致，已取消恢复。"; exit 1
+        fi
+        cp -- "$work/source.json" "$work/config.json" || exit 1
+    fi
     validate_config "$work/config.json" || exit 1
     mkdir -m 700 "$work/clients" || exit 1
     while IFS= read -r tag; do
@@ -1361,8 +1616,9 @@ apply_bundle() (
     mv -- "$work/clients" "$CLIENT_DIR" || exit 1
     if [[ -n $server ]]; then atomic_copy "$work/default-server" "$DEFAULT_SERVER_FILE" || exit 1
     else rm -f -- "$DEFAULT_SERVER_FILE" || exit 1; fi
-    if [[ $(config_jq -Sc .) != "$(jq -Sc . "$work/config.json")" ]]; then
-        commit_config "$work/config.json" || exit 1
+    if { [[ $policy == replace ]] && ! cmp -s "$CONFIG_FILE" "$work/config.json"; } ||
+       [[ $(config_jq -Sc .) != "$(json_query "$work/config.json" -Sc .)" ]]; then
+        commit_config "$work/config.json" "$policy" || exit 1
     fi
     transaction=0
     info "配置及连接信息已保存。操作前备份：$backup"
@@ -1373,7 +1629,7 @@ restore_backup() {
     validate_bundle "$1" || return
     info "恢复配置、全部连接信息和默认地址；证书文件须已在原路径，运行中的服务可能短暂重启。"
     confirm "使用此备份替换当前配置？（恢复前自动备份）" || return
-    apply_bundle "$1"
+    apply_bundle "$1" replace
 }
 
 # shellcheck disable=SC2016 # config_jq filters use literal jq variables.
