@@ -106,6 +106,7 @@ def run(core: Path, manager: Path) -> None:
         baseline_config = smoke.server_config(baseline)
         baseline_metadata = {"server": "", "public_key": "", "inbound": baseline}
         smoke.write_json(config, baseline_config)
+        config.write_text('// JSONC fixture: keep comments when restarting\n' + config.read_text(encoding='utf-8'), encoding='utf-8')
         smoke.write_json(clients / "baseline.json", baseline_metadata)
         default_file = state / "default-server"
         default_file.write_text(smoke.LOOPBACK + "\n", encoding="utf-8")
@@ -127,6 +128,14 @@ def run(core: Path, manager: Path) -> None:
             pid()
             verify_forwarding("baseline")
             print("PASS isolated baseline: real service and exact HTTP forwarding", flush=True)
+
+            original_commented = config.read_bytes()
+            previous = pid()
+            call("service_action", "restart")
+            check_restarted(previous)
+            require(config.read_bytes() == original_commented, "restart rewrote JSONC source")
+            verify_forwarding("baseline")
+            print("PASS JSONC restart: original comments preserved and exact HTTP forwarding", flush=True)
 
             backup = Path(call("create_backup").strip())
             require(backup.parent == state / "backups", "backup escaped fixture")

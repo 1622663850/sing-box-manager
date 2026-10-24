@@ -72,15 +72,28 @@ sys.exit(0)
 
 
 MOCK_CORE = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, subprocess, sys
 args = sys.argv[1:]
 with open(os.environ["SB_MOCK_CORE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\n")
 if args and args[0] == "check":
     try:
         position = args.index("-c") if "-c" in args else args.index("--config")
-        with open(args[position + 1], encoding="utf-8") as file:
-            content = json.load(file)
+        path = args[position + 1]
+        with open(path, encoding="utf-8") as file:
+            source = file.read()
+        try:
+            content = json.loads(source)
+        except json.JSONDecodeError:
+            # Match comment support of the real core; independent real-core
+            # tests also validate the original JSONC bytes directly.
+            parsed = subprocess.run(
+                ["bash", "-c", 'source "$1"; json_query "$2" .',
+                 "mock-core-jsonc", os.environ["SB_MOCK_MANAGER"], path],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert parsed.returncode == 0
+            content = json.loads(parsed.stdout)
         assert isinstance(content, dict)
         assert not content.get("_test_invalid")
         assert isinstance(content.get("inbounds", []), list)
@@ -143,6 +156,7 @@ class ManagerTest(unittest.TestCase):
             "SB_MOCK_STATE_FILE": str(self.mock_state),
             "SB_MOCK_SYSTEMCTL_LOG": str(self.system_log),
             "SB_MOCK_CORE_LOG": str(self.core_log),
+            "SB_MOCK_MANAGER": str(SCRIPT),
             "LC_ALL": "C.UTF-8",
         })
 

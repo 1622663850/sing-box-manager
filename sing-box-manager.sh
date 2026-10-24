@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.4.0"
+SB_MANAGER_VERSION="1.4.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -80,7 +80,7 @@ check_conflicts() {
 
 install_dependencies() {
     local need=0 cmd
-    for cmd in curl jq tar gzip sha256sum flock ss openssl; do
+    for cmd in curl jq awk tar gzip sha256sum flock ss openssl; do
         have "$cmd" || need=1
     done
     [[ -r /etc/ssl/certs/ca-certificates.crt || -r /etc/pki/tls/certs/ca-bundle.crt ]] || need=1
@@ -88,20 +88,20 @@ install_dependencies() {
     info "安装 curl、jq、OpenSSL 等必要依赖。"
     if have apt-get; then
         apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ca-certificates curl jq tar gzip coreutils util-linux iproute2 openssl || return
+            ca-certificates curl jq gawk tar gzip coreutils util-linux iproute2 openssl || return
     elif have dnf; then
-        dnf install -y ca-certificates curl jq tar gzip coreutils util-linux iproute openssl || return
+        dnf install -y ca-certificates curl jq gawk tar gzip coreutils util-linux iproute openssl || return
     elif have yum; then
-        yum install -y ca-certificates curl jq tar gzip coreutils util-linux iproute openssl || return
+        yum install -y ca-certificates curl jq gawk tar gzip coreutils util-linux iproute openssl || return
     elif have zypper; then
-        zypper --non-interactive install ca-certificates curl jq tar gzip coreutils util-linux iproute2 openssl || return
+        zypper --non-interactive install ca-certificates curl jq gawk tar gzip coreutils util-linux iproute2 openssl || return
     elif have pacman; then
-        pacman -S --needed --noconfirm ca-certificates curl jq tar gzip coreutils util-linux iproute2 openssl || return
+        pacman -S --needed --noconfirm ca-certificates curl jq gawk tar gzip coreutils util-linux iproute2 openssl || return
     else
-        fail "无法自动安装依赖。需要 Bash 4+、curl、jq、tar、gzip、sha256sum、flock、ss、openssl。"
+        fail "无法自动安装依赖。需要 Bash 4+、curl、jq、awk、tar、gzip、sha256sum、flock、ss、openssl。"
         return 1
     fi
-    for cmd in curl jq tar gzip sha256sum flock ss openssl; do
+    for cmd in curl jq awk tar gzip sha256sum flock ss openssl; do
         have "$cmd" || { fail "依赖安装后仍缺少：$cmd"; return 1; }
     done
 }
@@ -174,15 +174,45 @@ valid_host() {
     fi
 }
 
+json_query() (
+    # Strip comments only outside strings; never treat https:// or escaped quotes as comments.
+    # Keep line breaks and separate adjacent tokens so malformed JSON still fails in jq.
+    set -o pipefail
+    local file=$1
+    shift
+    awk '
+      {
+        for (i=1; i<=length($0); i++) {
+          c=substr($0,i,1); next_c=substr($0,i+1,1)
+          if (block) {
+            if (c=="*" && next_c=="/") { block=0; i++; printf " " }
+          } else if (quoted) {
+            printf "%s", c
+            if (escaped) escaped=0
+            else if (c=="\\") escaped=1
+            else if (c=="\"") quoted=0
+          } else if (c=="\"") { quoted=1; printf "%s", c }
+          else if (c=="/" && next_c=="/") { printf " "; break }
+          else if (c=="/" && next_c=="*") { block=1; i++; printf " " }
+          else printf "%s", c
+        }
+        printf "\n"
+      }
+      END { if (block) { print "[错误] 配置的 /* 注释未闭合。" > "/dev/stderr"; exit 1 } }
+    ' "$file" | jq "$@"
+)
+
+config_jq() { json_query "$CONFIG_FILE" "$@"; }
+
 validate_config() {
     local file=$1
     [[ -f "$file" ]] || { fail "找不到配置文件：$file"; return 1; }
-    # Strict JSON keeps jq merging predictable; no comments / JSONC.
-    jq -e 'type == "object" and ((.inbounds // []) | type == "array")
-        and ((.outbounds // []) | type == "array")' "$file" >/dev/null || {
-        fail "配置必须是一个合法的 JSON 对象，inbounds/outbounds 必须为数组。"; return 1;
-    }
     [[ -x "$CORE_BIN" ]] || { fail "核心不存在，无法校验配置。"; return 1; }
+    json_query "$file" -e 'type == "object" and ((.inbounds // []) | type == "array")
+        and ((.outbounds // []) | type == "array")' >/dev/null || {
+        fail "配置 JSON 或注释语法无效，inbounds/outbounds 必须为数组。"; return 1;
+    }
+    # The core still validates the original bytes, including its own parser constraints.
     "$CORE_BIN" check -D "$STATE_DIR" -c "$file"
 }
 
@@ -260,10 +290,15 @@ commit_config() (
     fi
 )
 
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 add_inbound_file() (
     umask 077
-    local file=$1 tag port candidate
+    local file=$1 tag port work candidate
     require_core || exit 1
+    work=$(mktemp -d "$STATE_DIR/import-inbound.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    json_query "$file" . >"$work/inbound.json" || exit 1
+    file="$work/inbound.json"
     jq -e 'type == "object" and (.type | type == "string")
         and (.tag | type == "string") and (.listen_port | type == "number")' "$file" >/dev/null || {
         fail "请提供单个 inbound JSON 对象，包含 type、tag、listen_port。"; exit 1;
@@ -271,17 +306,16 @@ add_inbound_file() (
     tag=$(jq -r '.tag' "$file") && port=$(jq -r '.listen_port' "$file") || exit 1
     valid_tag "$tag" || { fail "tag 只能包含字母、数字、短横线、下划线，长度 1–64。"; exit 1; }
     valid_port "$port" || { fail "端口必须为 1–65535 的整数。"; exit 1; }
-    if jq -e --arg tag "$tag" --argjson port "$port" \
-        'any(.inbounds[]?; .tag == $tag or .listen_port == $port)' "$CONFIG_FILE" >/dev/null; then
+    if config_jq -e --arg tag "$tag" --argjson port "$port" \
+        'any(.inbounds[]?; .tag == $tag or .listen_port == $port)' >/dev/null; then
         fail "现有配置已使用该 tag 或端口。"; exit 1
     fi
     if have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then
         fail "端口 $port 正被其他服务占用。"; exit 1
     fi
-    candidate=$(mktemp "$CONFIG_DIR/.merge.XXXXXX") || exit 1
-    trap 'rm -f -- "$candidate"' EXIT
-    jq --slurpfile node "$file" '.inbounds = ((.inbounds // []) + [$node[0]])' \
-        "$CONFIG_FILE" >"$candidate" || exit 1
+    candidate="$work/candidate.json"
+    config_jq --slurpfile node "$file" '.inbounds = ((.inbounds // []) + [$node[0]])' \
+        >"$candidate" || exit 1
     commit_config "$candidate"
 )
 
@@ -709,6 +743,7 @@ detect_inbound_template() {
     }
 }
 
+# shellcheck disable=SC2016 # json_query filters use literal jq variables.
 replace_inbound_file() (
     umask 077
     local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
@@ -754,8 +789,8 @@ replace_inbound_file() (
     trap 'exit 143' TERM
     snapshot="$work/original.json"
     cp -- "$CONFIG_FILE" "$snapshot" || exit 1
-    jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
-        "$snapshot" >"$work/old-inbound.json" || exit 1
+    json_query "$snapshot" -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
+        >"$work/old-inbound.json" || exit 1
     if [[ -n $expected && $(jq -Sc . "$expected") != "$(jq -Sc . "$work/old-inbound.json")" ]]; then
         fail "选中的配置在编辑期间已被修改，请重新打开编辑。"; exit 1
     fi
@@ -763,12 +798,12 @@ replace_inbound_file() (
         fail "修改配置不切换协议类型，请分别添加所需协议。"; exit 1;
     }
     detect_inbound_template "$file" >/dev/null || exit 1
-    if jq -e --arg old "$old_tag" --arg tag "$tag" --argjson port "$port" \
-        'any(.inbounds[]?; .tag != $old and (.tag==$tag or .listen_port==$port))' "$snapshot" >/dev/null; then
+    if json_query "$snapshot" -e --arg old "$old_tag" --arg tag "$tag" --argjson port "$port" \
+        'any(.inbounds[]?; .tag != $old and (.tag==$tag or .listen_port==$port))' >/dev/null; then
         fail "其他配置已使用该名称或端口。"; exit 1
     fi
-    if [[ $tag != "$old_tag" ]] && jq -e --arg old "$old_tag" \
-        'del(.inbounds[] | select(.tag==$old)) | any(.. | strings; .==$old)' "$snapshot" >/dev/null; then
+    if [[ $tag != "$old_tag" ]] && json_query "$snapshot" -e --arg old "$old_tag" \
+        'del(.inbounds[] | select(.tag==$old)) | any(.. | strings; .==$old)' >/dev/null; then
         fail "原名称被路由或其他配置引用，请保留名称或通过完整 JSON 同步修改引用。"; exit 1
     fi
     old_port=$(jq -r .listen_port "$work/old-inbound.json") || exit 1
@@ -784,8 +819,8 @@ replace_inbound_file() (
     [[ -n $effective ]] || effective=$(read_default_server) || exit 1
     if [[ -z $effective && $(jq -r .type "$file") == hysteria2 ]]; then effective=$(jq -r '.tls.server_name // ""' "$file"); fi
     generate_client "$file" "${effective:-example.invalid}" "$public_key" >"$work/client-check.json" || exit 1
-    jq --arg old "$old_tag" --slurpfile node "$file" \
-        '.inbounds |= map(if .tag==$old then $node[0] else . end)' "$snapshot" >"$work/candidate.json" || exit 1
+    json_query "$snapshot" --arg old "$old_tag" --slurpfile node "$file" \
+        '.inbounds |= map(if .tag==$old then $node[0] else . end)' >"$work/candidate.json" || exit 1
     validate_config "$work/candidate.json" || exit 1
     if [[ -f $old_metadata ]]; then
         old_metadata_exists=1
@@ -794,7 +829,7 @@ replace_inbound_file() (
     else printf '{}\n' >"$work/metadata-before.json"; fi
     jq --arg server "$server" --arg key "$public_key" --slurpfile node "$file" \
         '.server=$server | .public_key=$key | .inbound=$node[0]' "$work/metadata-before.json" >"$work/metadata.json" || exit 1
-    [[ $(jq -Sc . "$snapshot") == "$(jq -Sc . "$work/candidate.json")" ]] || changed=1
+    [[ $(json_query "$snapshot" -Sc .) == "$(jq -Sc . "$work/candidate.json")" ]] || changed=1
     if [[ $changed -eq 0 && $old_metadata_exists -eq 1 &&
           $(jq -Sc . "$work/metadata-before.json") == "$(jq -Sc . "$work/metadata.json")" ]]; then
         info "配置没有变化。"; exit 0
@@ -818,6 +853,7 @@ replace_inbound_file() (
     [[ $changed -ne 0 ]] || info "仅更新客户端连接信息，未重启服务。"
 )
 
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 edit_wizard_locked() (
     umask 077
     require_core || exit 1
@@ -825,15 +861,15 @@ edit_wizard_locked() (
     local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" rotation pair
     [[ $# -le 1 ]] || { fail "用法：sing-box edit [配置名称]"; exit 1; }
     if [[ -z $old_tag ]]; then
-        jq -r '["名称","协议","端口"],(.inbounds[]? | [.tag,.type,.listen_port]) | @tsv' "$CONFIG_FILE"
+        config_jq -r '["名称","协议","端口"],(.inbounds[]? | [.tag,.type,.listen_port]) | @tsv' || exit 1
         prompt old_tag "请输入要修改的配置名称（0 返回）" || exit 1
         [[ $old_tag != 0 ]] || exit 0
     fi
     valid_tag "$old_tag" || { fail "配置名称无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/edit-wizard.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
-    jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
-        "$CONFIG_FILE" >"$work/original.json" || exit 1
+    config_jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
+        >"$work/original.json" || exit 1
     protocol=$(detect_inbound_template "$work/original.json") || exit 1
     tag=$old_tag
     port=$(jq -r .listen_port "$work/original.json")
@@ -1176,6 +1212,7 @@ add_wizard_locked() (
     [[ -z $server ]] || show_client "$tag" "$server"
 )
 
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 show_client() (
     umask 077
     local tag=$1 server=${2:-} mode=${3:-full} inbound public_key="" metadata work
@@ -1183,7 +1220,7 @@ show_client() (
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/view.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
-    jq -e --arg tag "$tag" '.inbounds[]? | select(.tag==$tag)' "$CONFIG_FILE" >"$work/inbound.json" || {
+    config_jq -e --arg tag "$tag" '.inbounds[]? | select(.tag==$tag)' >"$work/inbound.json" || {
         fail "配置不存在：$tag"; exit 1;
     }
     inbound="$work/inbound.json"
@@ -1242,7 +1279,8 @@ snapshot_bundle() (
         done
     fi
     server=$(read_default_server) || exit 1
-    jq -n --slurpfile config "$CONFIG_FILE" --slurpfile clients "$work/clients.json" --arg server "$server" \
+    config_jq . >"$work/config.json" || exit 1
+    jq -n --slurpfile config "$work/config.json" --slurpfile clients "$work/clients.json" --arg server "$server" \
         '{format:"sing-box-manager-backup-v1",config:$config[0],clients:$clients[0],
           default_server:(if $server=="" then null else $server end)}'
 )
@@ -1323,7 +1361,7 @@ apply_bundle() (
     mv -- "$work/clients" "$CLIENT_DIR" || exit 1
     if [[ -n $server ]]; then atomic_copy "$work/default-server" "$DEFAULT_SERVER_FILE" || exit 1
     else rm -f -- "$DEFAULT_SERVER_FILE" || exit 1; fi
-    if [[ $(jq -Sc . "$CONFIG_FILE") != "$(jq -Sc . "$work/config.json")" ]]; then
+    if [[ $(config_jq -Sc .) != "$(jq -Sc . "$work/config.json")" ]]; then
         commit_config "$work/config.json" || exit 1
     fi
     transaction=0
@@ -1338,19 +1376,20 @@ restore_backup() {
     apply_bundle "$1"
 }
 
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 delete_inbound() (
     local tag=${1:-} work
     require_core && safe_paths || exit 1
     if [[ -z $tag ]]; then
-        jq -r '.inbounds[]? | [.tag,.type,.listen_port] | @tsv' "$CONFIG_FILE"
+        config_jq -r '.inbounds[]? | [.tag,.type,.listen_port] | @tsv' || exit 1
         prompt tag "要删除的配置名称（0 返回）" || exit 1
         [[ $tag != 0 ]] || exit 0
     fi
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
-    jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | length==1' "$CONFIG_FILE" >/dev/null || {
+    config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | length==1' >/dev/null || {
         fail "配置不存在或名称重复。"; exit 1;
     }
-    if jq -e --arg tag "$tag" 'del(.inbounds[] | select(.tag==$tag)) | any(..|strings; .==$tag)' "$CONFIG_FILE" >/dev/null; then
+    if config_jq -e --arg tag "$tag" 'del(.inbounds[] | select(.tag==$tag)) | any(..|strings; .==$tag)' >/dev/null; then
         fail "节点被路由或其他配置引用，请先通过完整 JSON 导入调整引用。"; exit 1
     fi
     confirm "删除节点 $tag 及其连接信息？（自动备份，其他节点保留）" || exit 1
@@ -1364,6 +1403,7 @@ delete_inbound() (
     info "已删除 $tag。客户端中的旧节点需要自行移除。"
 )
 
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 add_managed_inbound() (
     umask 077
     local file=$1 server=${2:-} public_key=${3:-} work tag port
@@ -1371,7 +1411,7 @@ add_managed_inbound() (
     tag=$(jq -er .tag "$file") && port=$(jq -er .listen_port "$file") || exit 1
     valid_tag "$tag" && valid_port "$port" || exit 1
     [[ -z $server ]] || valid_host "$server" || exit 1
-    if jq -e --arg tag "$tag" --argjson port "$port" 'any(.inbounds[]?; .tag==$tag or .listen_port==$port)' "$CONFIG_FILE" >/dev/null; then
+    if config_jq -e --arg tag "$tag" --argjson port "$port" 'any(.inbounds[]?; .tag==$tag or .listen_port==$port)' >/dev/null; then
         fail "现有配置已使用该 tag 或端口。"; exit 1
     fi
     if have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then fail "端口已被占用。"; exit 1; fi
@@ -1404,12 +1444,12 @@ export_clients() (
     work=$(mktemp -d "$STATE_DIR/export.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"; [[ -z $tmp ]] || rm -f -- "$tmp"' EXIT
     : >"$work/nodes"
-    jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null || { fail "没有可导出的节点。"; exit 1; }
+    config_jq -e '.inbounds|length>0' >/dev/null || { fail "没有可导出的节点。"; exit 1; }
     while IFS= read -r tag; do
         if [[ $format == json ]]; then
             show_client "$tag" "" json-only >>"$work/nodes" || exit 1
         else show_client "$tag" "" link-only >>"$work/nodes" || exit 1; fi
-    done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+    done < <(config_jq -r '.inbounds[].tag')
     case "$format" in
         links) cp -- "$work/nodes" "$work/result" ;;
         base64) base64 -w 0 "$work/nodes" >"$work/result" ;;
@@ -1461,7 +1501,7 @@ diagnose() (
         fi
         if show_client "$tag" "" link-only >"$work/client" 2>"$work/client-error"; then info "客户端链接生成检查通过（不显示凭据）。"
         else warn "客户端链接不能生成，请检查连接地址、公钥元数据或模板支持范围。"; issue=1; fi
-    done < <(jq -c '.inbounds[]?' "$CONFIG_FILE")
+    done < <(config_jq -c '.inbounds[]?')
     info "此检查不探测公网，不修改防火墙；云平台入站规则、DNS 解析及实际客户端连接需分别验证。"
     exit "$issue"
 )
@@ -1483,9 +1523,9 @@ management_menu() {
 
 show_config_list() {
     local tag
-    jq -r '["名称","协议","监听地址","端口"],
-        (.inbounds[]? | [.tag,.type,(.listen // "-"),(.listen_port // "-")]) | @tsv' "$CONFIG_FILE" || return
-    if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null; then
+    config_jq -r '["名称","协议","监听地址","端口"],
+        (.inbounds[]? | [.tag,.type,(.listen // "-"),(.listen_port // "-")]) | @tsv' || return
+    if ! config_jq -e '.inbounds | length > 0' >/dev/null; then
         info "暂无入站配置。"
         return 0
     fi
@@ -1493,7 +1533,7 @@ show_config_list() {
     while IFS= read -r tag; do
         printf '\n[%s]\n' "$tag"
         show_client "$tag" "" link-only || warn "此配置暂时无法生成分享链接，其他配置仍会继续显示。"
-    done < <(jq -r '.inbounds[]?.tag' "$CONFIG_FILE")
+    done < <(config_jq -r '.inbounds[]?.tag')
 }
 
 show_config() {
@@ -1504,7 +1544,7 @@ show_config() {
     case "$choice" in
         0) return 0 ;;
         1) show_config_list ;;
-        2) jq . "$CONFIG_FILE" ;;
+        2) config_jq . ;;
         3) prompt selected_tag "配置名称" && show_client "$selected_tag" ;;
         4) validate_config "$CONFIG_FILE" ;;
         5) with_lock set_default_server ;;
