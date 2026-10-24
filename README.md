@@ -20,6 +20,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 12 | 删除配置 | 确认后删除节点及连接信息，阻止删除仍被引用的节点，失败回滚 |
 | 13 | 配置维护 | 成套备份、列表、恢复、批量客户端导出、只读诊断 |
 | 14 | 更新面板脚本 | 获取 GitHub 最新脚本，检查并备份旧版后替换，成功后重新载入菜单 |
+| 15 | 开启 TCP BBR | 确认后检查内核能力、备份参数和专属配置，启用并持久化，失败恢复 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -184,6 +185,8 @@ sudo sing-box install             # 首次安装官方最新稳定核心
 sudo sing-box install 1.14.3       # 首次安装指定正式版本，版本号仅作示例
 sudo sing-box update              # 独立更新到官方最新稳定核心
 sudo sing-box update-panel        # 更新本项目面板脚本到 GitHub main 最新版本，自动备份
+sudo sing-box bbr-status          # 只读查看当前 TCP 算法、默认 qdisc 和已注册算法
+sudo sing-box bbr                 # 确认后启用系统 TCP BBR，并写入持久化配置
 sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
 sudo sing-box enable              # 开机自启，不立即启动
@@ -225,6 +228,18 @@ sudo sing-box core run -c /root/another-config.json
 | `/var/lib/sing-box-manager/backups/` | 配置、卸载及更新备份 |
 
 配置 JSON、连接元数据、配置备份权限为 `600`，配置和状态目录权限为 `700`。完整配置及连接信息包含凭据；请勿提交真实 UUID、密码、私钥、备份到仓库。日志由 systemd journal 管理。
+
+## 开启 TCP BBR
+
+v1.6.0 起选择主菜单 **15. 开启 TCP BBR**，或执行 `sudo sing-box bbr`。先显示内核及当前参数，确认后才加载所需模块、修改系统设置。只读检查使用 `sudo sing-box bbr-status`。部署或更新面板本身不会自动启用 BBR。
+
+设置仅包含 `net.ipv4.tcp_congestion_control=bbr` 和 `net.core.default_qdisc=fq`，写入 `/etc/sysctl.d/99-sing-box-manager-bbr.conf`（权限 `644`）。不会修改其他 sysctl 文件。更新前将旧参数保存至 `/var/lib/sing-box-manager/backups/bbr-*/runtime.json`，已有本项目专属文件另保存为 `sysctl.conf`，备份权限为 `600`；写入、验证或中断失败时恢复原参数及文件。不支持的内核、模块加载受限、同名文件不属于本项目、符号链接或后续持久配置冲突时拒绝设置。已有持久化设置和运行参数都符合目标时不重复写入或备份。
+
+系统会按 `sysctl.d` 同名文件优先级和加载顺序检查覆盖，并另外核对 `/etc/sysctl.conf`，以兼顾 systemd 和 procps；遇到歧义值或冲突会保守拒绝，请先人工核对。确认等待期间如果参数或文件被其他操作改动，也会取消此次设置。脚本不安装或更换内核，不下载第三方加速脚本；需要内核提供 `bbr`，未注册时尝试通过已有 `modprobe` 加载 `tcp_bbr`。失败后可能保留已加载的模块，不会强制卸载可能正在被使用的模块。
+
+这是整台 VPS 的 **TCP 默认设置**，不能替代 Hy2/TUIC 的 UDP/QUIC 内部拥塞控制，也不承诺必然提速。已有连接及监听 socket 可能继续采用旧算法；若需让现有 sing-box 入站监听重新建立，请自行选择菜单 **5. 重新启动**，该操作会短暂中断节点连接。BBR 启用选项不会自动重启服务或重启服务器，不使用 `tc` 重建现有网卡队列；设置默认 qdisc 不等于现有网卡的 qdisc 已被替换。
+
+依据：[Linux TCP 参数](https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html)、[默认 qdisc](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/net.html)、[sysctl.d 优先级](https://www.freedesktop.org/software/systemd/man/latest/sysctl.d.html)。
 
 ## 卸载与更新面板
 

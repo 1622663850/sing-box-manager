@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.5.0"
+SB_MANAGER_VERSION="1.6.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -14,6 +14,8 @@ STATE_DIR="${SB_ROOT_PREFIX}/var/lib/sing-box-manager"
 BACKUP_DIR="$STATE_DIR/backups"
 CLIENT_DIR="$STATE_DIR/clients"
 DEFAULT_SERVER_FILE="$STATE_DIR/default-server"
+BBR_SYSCTL_DIR="${SB_ROOT_PREFIX}/etc/sysctl.d"
+BBR_SYSCTL_FILE="$BBR_SYSCTL_DIR/99-sing-box-manager-bbr.conf"
 UNIT_FILE="${SB_ROOT_PREFIX}/etc/systemd/system/sing-box.service"
 MANAGED_MARKER="$LIB_DIR/.managed"
 SERVICE="sing-box.service"
@@ -80,7 +82,7 @@ check_conflicts() {
 
 install_dependencies() {
     local need=0 cmd
-    for cmd in curl jq awk python3 tar gzip sha256sum flock ss openssl; do
+    for cmd in curl jq awk python3 tar gzip sha256sum flock ss openssl sysctl; do
         have "$cmd" || need=1
     done
     [[ -r /etc/ssl/certs/ca-certificates.crt || -r /etc/pki/tls/certs/ca-bundle.crt ]] || need=1
@@ -88,20 +90,20 @@ install_dependencies() {
     info "安装 curl、jq、OpenSSL 等必要依赖。"
     if have apt-get; then
         apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute2 openssl || return
+            ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute2 openssl procps || return
     elif have dnf; then
-        dnf install -y ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute openssl || return
+        dnf install -y ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute openssl procps-ng || return
     elif have yum; then
-        yum install -y ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute openssl || return
+        yum install -y ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute openssl procps-ng || return
     elif have zypper; then
-        zypper --non-interactive install ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute2 openssl || return
+        zypper --non-interactive install ca-certificates curl jq gawk python3 tar gzip coreutils util-linux iproute2 openssl procps || return
     elif have pacman; then
-        pacman -S --needed --noconfirm ca-certificates curl jq gawk python tar gzip coreutils util-linux iproute2 openssl || return
+        pacman -S --needed --noconfirm ca-certificates curl jq gawk python tar gzip coreutils util-linux iproute2 openssl procps-ng || return
     else
-        fail "无法自动安装依赖。需要 Bash 4+、curl、jq、awk、python3、tar、gzip、sha256sum、flock、ss、openssl。"
+        fail "无法自动安装依赖。需要 Bash 4+、curl、jq、awk、python3、tar、gzip、sha256sum、flock、ss、openssl、sysctl。"
         return 1
     fi
-    for cmd in curl jq awk python3 tar gzip sha256sum flock ss openssl; do
+    for cmd in curl jq awk python3 tar gzip sha256sum flock ss openssl sysctl; do
         have "$cmd" || { fail "依赖安装后仍缺少：$cmd"; return 1; }
     done
 }
@@ -1902,6 +1904,187 @@ show_config() {
     esac
 }
 
+show_bbr_status() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box bbr-status"; return 1; }
+    have sysctl || { fail "缺少 sysctl，请重新运行 setup 安装依赖。"; return 1; }
+    local cc qdisc available
+    if ! cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) ||
+       ! qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) ||
+       ! available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null); then
+        fail "无法读取 TCP BBR 相关内核参数；当前内核或容器可能不支持。"; return 1
+    fi
+    printf '\n内核：%s\nTCP 拥塞控制：%s\n默认队列规则：%s\n已注册的 TCP 算法：%s\n' \
+        "$(uname -r)" "$cc" "$qdisc" "$available"
+}
+
+check_bbr_persistence() {
+    # Simulate sysctl.d precedence with our future file inserted; never edit foreign files.
+    python3 - "$SB_ROOT_PREFIX" "$BBR_SYSCTL_FILE" <<'PY_BBR_PERSISTENCE'
+from pathlib import Path
+import re
+import sys
+
+prefix, target = sys.argv[1], Path(sys.argv[2])
+desired = {"net.core.default_qdisc": "fq", "net.ipv4.tcp_congestion_control": "bbr"}
+paths = {key.replace(".", "/"): key for key in desired}
+chosen, effective = {}, {}
+try:
+    for directory in ("/etc/sysctl.d", "/run/sysctl.d", "/usr/local/lib/sysctl.d", "/usr/lib/sysctl.d", "/lib/sysctl.d"):
+        for path in (Path(prefix + directory)).glob("*.conf"):
+            if path.is_file() or path.is_symlink():
+                chosen.setdefault(path.name, path)
+    chosen[target.name] = None
+    def read(path):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            key, value = (part.strip() for part in line.split("=", 1))
+            key = key[1:] if key.startswith("-") else key
+            dot, slash = key.find("."), key.find("/")
+            if slash < 0 or (dot >= 0 and dot < slash):
+                key = key.translate(str.maketrans({".": "/", "/": "."}))
+            if key in paths:
+                effective[paths[key]] = (value, path)
+    for name in sorted(chosen):
+        path = chosen[name]
+        if path is None:
+            effective.update({key: (value, target) for key, value in desired.items()})
+        elif path.is_file():
+            read(path)
+    conflicts = [(key, path) for key, (value, path) in effective.items() if value != desired[key]]
+    # procps sysctl --system also reads this file last; check it conservatively.
+    global_conf = Path(prefix + "/etc/sysctl.conf")
+    if global_conf.is_file() and global_conf.resolve() != target.resolve():
+        read(global_conf)
+    conflicts.extend((key, path) for key, (value, path) in effective.items() if value != desired[key])
+    for key, path in sorted(set(conflicts), key=lambda item: (item[0], str(item[1]))):
+        print("[错误] 后续 sysctl 配置可能覆盖 " + key + "：" + str(path) + "；请先核对冲突。", file=sys.stderr)
+    sys.exit(1 if conflicts else 0)
+except (OSError, UnicodeError):
+    print("[错误] 无法完整读取现有 sysctl 配置，已取消 BBR 设置。", file=sys.stderr)
+    sys.exit(1)
+PY_BBR_PERSISTENCE
+}
+
+enable_bbr_locked() (
+    umask 077
+    local old_cc old_qdisc available work backup="" had_file=0 old_mode=644 transaction=0
+    safe_paths || exit 1
+    [[ ! -L $BBR_SYSCTL_DIR && ! -L $BBR_SYSCTL_FILE &&
+       ( ! -e $BBR_SYSCTL_DIR || -d $BBR_SYSCTL_DIR ) &&
+       ( ! -e $BBR_SYSCTL_FILE || -f $BBR_SYSCTL_FILE ) ]] || {
+        fail "BBR 配置目录或文件无效，拒绝操作符号链接。"; exit 1;
+    }
+    show_bbr_status || exit 1
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control) &&
+        old_qdisc=$(sysctl -n net.core.default_qdisc) &&
+        available=$(sysctl -n net.ipv4.tcp_available_congestion_control) || exit 1
+    [[ $old_cc =~ ^[a-zA-Z0-9_-]+$ && $old_qdisc =~ ^[a-zA-Z0-9_-]+$ ]] || {
+        fail "当前内核参数格式异常，已取消。"; exit 1;
+    }
+    if [[ -f $BBR_SYSCTL_FILE ]]; then
+        had_file=1
+        [[ $(head -n 1 "$BBR_SYSCTL_FILE") == '# Managed by sing-box-manager: TCP BBR' ]] || {
+            fail "发现非本项目管理的同名 BBR 文件，不会覆盖。"; exit 1;
+        }
+        if grep -Ev '^[[:space:]]*($|[#;]|-?net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*=)' \
+            "$BBR_SYSCTL_FILE" >/dev/null; then
+            fail "BBR 文件含有其他设置，不会覆盖，请先核对。"; exit 1
+        fi
+        old_mode=$(stat -c '%a' "$BBR_SYSCTL_FILE") || exit 1
+    fi
+    check_bbr_persistence || exit 1
+    work=$(mktemp -d "$STATE_DIR/bbr-enable.XXXXXX") || exit 1
+    # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
+    rollback_bbr() {
+        local result=$? restored=1
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            if [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) != "$old_cc" ]]; then
+                sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+            fi
+            if [[ $(sysctl -n net.core.default_qdisc 2>/dev/null) != "$old_qdisc" ]]; then
+                sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+            fi
+            if [[ $had_file -eq 1 ]]; then
+                if ! cmp -s "$backup/sysctl.conf" "$BBR_SYSCTL_FILE" ||
+                   [[ $(stat -c '%a' "$BBR_SYSCTL_FILE" 2>/dev/null) != "$old_mode" ]]; then
+                    atomic_copy "$backup/sysctl.conf" "$BBR_SYSCTL_FILE" "$old_mode" || true
+                fi
+                cmp -s "$backup/sysctl.conf" "$BBR_SYSCTL_FILE" || restored=0
+                [[ $(stat -c '%a' "$BBR_SYSCTL_FILE" 2>/dev/null) == "$old_mode" ]] || restored=0
+            else
+                rm -f -- "$BBR_SYSCTL_FILE" || restored=0
+            fi
+            [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == "$old_cc" &&
+               $(sysctl -n net.core.default_qdisc 2>/dev/null) == "$old_qdisc" ]] || restored=0
+            if [[ $restored -eq 1 ]]; then warn "BBR 设置未完成，已恢复原参数及配置文件。"
+            else warn "BBR 自动恢复未完全成功，请核对备份：$backup"; fi
+            result=1
+        fi
+        rm -rf -- "$work"
+        exit "$result"
+    }
+    trap rollback_bbr EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '# Managed by sing-box-manager: TCP BBR\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >"$work/sysctl.conf"
+    [[ $had_file -eq 0 ]] || install -m 600 "$BBR_SYSCTL_FILE" "$work/original.conf" || exit 1
+    bbr_inputs_unchanged() {
+        [[ ! -L $BBR_SYSCTL_DIR && ! -L $BBR_SYSCTL_FILE &&
+           ( ! -e $BBR_SYSCTL_DIR || -d $BBR_SYSCTL_DIR ) ]] || return 1
+        [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == "$old_cc" &&
+           $(sysctl -n net.core.default_qdisc 2>/dev/null) == "$old_qdisc" ]] || return 1
+        if [[ $had_file -eq 1 ]]; then
+            [[ -f $BBR_SYSCTL_FILE ]] && cmp -s "$work/original.conf" "$BBR_SYSCTL_FILE" &&
+                [[ $(stat -c '%a' "$BBR_SYSCTL_FILE" 2>/dev/null) == "$old_mode" ]] || return 1
+        else
+            [[ ! -e $BBR_SYSCTL_FILE && ! -L $BBR_SYSCTL_FILE ]] || return 1
+        fi
+        check_bbr_persistence
+    }
+    if [[ $old_cc == bbr && $old_qdisc == fq ]] && cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE"; then
+        info "TCP BBR 已启用，持久化配置也已就绪，无需修改。"; exit 0
+    fi
+    info "将设置整台 VPS 的 TCP 默认拥塞控制为 bbr，默认队列规则为 fq，并写入 $BBR_SYSCTL_FILE。"
+    info "只影响 TCP；Hy2/TUIC 的 UDP/QUIC 拥塞控制不受此设置直接控制。"
+    info "已有连接和监听可能沿用旧算法；本操作不重启服务、不重建现有网卡队列。"
+    confirm "确认启用 TCP BBR？（先备份，失败尝试恢复）" || exit 0
+    bbr_inputs_unchanged || { fail "设置在确认期间发生变化或存在冲突，请重新打开 BBR 选项。"; exit 1; }
+    if [[ ! $available =~ (^|[[:space:]])bbr($|[[:space:]]) ]]; then
+        if have modprobe; then modprobe tcp_bbr >/dev/null 2>&1 || true; fi
+        available=$(sysctl -n net.ipv4.tcp_available_congestion_control) || exit 1
+    fi
+    [[ $available =~ (^|[[:space:]])bbr($|[[:space:]]) ]] || {
+        fail "内核未提供可用的 bbr；模块不存在或加载受限。不会安装内核或修改参数。"; exit 1;
+    }
+    if [[ $old_qdisc != fq ]] && have modprobe; then modprobe sch_fq >/dev/null 2>&1 || true; fi
+    bbr_inputs_unchanged || { fail "设置已被其他操作修改，已取消写入。"; exit 1; }
+    install -d -m 700 "$BACKUP_DIR" || exit 1
+    backup=$(mktemp -d "$BACKUP_DIR/bbr-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
+    jq -n --arg cc "$old_cc" --arg qdisc "$old_qdisc" --argjson existed "$([[ $had_file -eq 1 ]] && printf true || printf false)" \
+        '{tcp_congestion_control:$cc,default_qdisc:$qdisc,config_existed:$existed}' >"$backup/runtime.json" || exit 1
+    [[ $had_file -eq 0 ]] || install -m 600 "$work/original.conf" "$backup/sysctl.conf" || exit 1
+    transaction=1
+    sysctl -w net.core.default_qdisc=fq >/dev/null || exit 1
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null || exit 1
+    [[ -d $BBR_SYSCTL_DIR ]] || install -d -m 755 "$BBR_SYSCTL_DIR" || exit 1
+    atomic_copy "$work/sysctl.conf" "$BBR_SYSCTL_FILE" 644 || exit 1
+    [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr &&
+       $(sysctl -n net.core.default_qdisc) == fq ]] || { fail "内核参数读回校验失败。"; exit 1; }
+    cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE" || exit 1
+    transaction=0
+    info "TCP BBR 已启用并写入持久化配置；操作前备份：$backup"
+    info "如需已有入站监听采用新算法，可自行选择 5.重新启动；重启会短暂中断现有节点连接。"
+)
+
+enable_bbr() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box bbr"; return 1; }
+    if ! have sysctl; then install_dependencies || return; fi
+    with_lock enable_bbr_locked
+}
+
 show_status() {
     local active enabled version="未安装"
     local green="" red="" yellow="" dim="" reset=""
@@ -1946,8 +2129,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-14]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-15]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -1968,8 +2151,9 @@ menu() {
                     exec bash "$WRAPPER" menu
                 fi
                 ;;
+            15) enable_bbr || true ;;
             0) return 0 ;;
-            *) warn "请输入 0–14。" ;;
+            *) warn "请输入 0–15。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -1986,6 +2170,8 @@ sing-box 中文终端管理面板
   sing-box install [版本号]       安装核心，默认官方最新稳定版；已安装时提示使用 update
   sing-box update [版本号]        更新已安装核心，保留配置；默认官方最新稳定版
   sing-box update-panel           更新面板脚本到 GitHub 最新版，更新前自动备份
+  sing-box bbr                    确认后开启系统 TCP BBR，备份并持久化
+  sing-box bbr-status             只读查看 TCP 拥塞控制及默认队列规则
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
   sing-box enable                 设置开机自启（不改变当前运行状态）
@@ -2032,7 +2218,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-status|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2051,6 +2237,8 @@ main() {
             update_core "${1:-latest}"
             ;;
         update-panel) update_panel "$@" ;;
+        bbr) enable_bbr "$@" ;;
+        bbr-status) show_bbr_status "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;
