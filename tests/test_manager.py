@@ -181,6 +181,103 @@ class ManagerTest(unittest.TestCase):
             "transport": {"type": "ws", "path": "/vless"},
         }
 
+    def tls_material(self, common_name: str = "example.com") -> tuple[Path, Path]:
+        """Create a short-lived self-signed pair for TLS template tests."""
+        if not shutil.which("openssl"):
+            self.skipTest("openssl is required for TLS template tests")
+        certificate = self.root / "server-cert.pem"
+        private_key = self.root / "server-key.pem"
+        result = subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(private_key), "-out", str(certificate), "-days", "1",
+                "-subj", f"/CN={common_name}", "-addext", f"subjectAltName=DNS:{common_name}",
+            ],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(certificate.is_file())
+        self.assertTrue(private_key.is_file())
+        return certificate, private_key
+
+    def generate_inbound(
+        self,
+        protocol: str,
+        credential: str,
+        extra: str = "",
+        private_key: str = "",
+        short_id: str = "",
+        tls_server_name: str = "",
+        certificate: Path | None = None,
+        key: Path | None = None,
+        tuic_password: str = "",
+    ) -> dict:
+        """Call the source-only generator with the extended positional seam."""
+        args = (
+            protocol, "extended-test", "18443", credential, extra, private_key,
+            short_id, tls_server_name, str(certificate or ""), str(key or ""),
+            tuic_password,
+        )
+        result = self.shell('generate_inbound "$@"', *args, check=True)
+        return json.loads(result.stdout)
+
+    def edit_protocol_inbound(
+        self,
+        protocol: str,
+        tag: str,
+        port: int,
+        certificate: Path | None = None,
+        private_key: Path | None = None,
+    ) -> dict:
+        uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
+        if protocol == "vless-reality":
+            return self.generate_inbound(
+                protocol, uuid, "example.com",
+                "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw", "0123456789abcdef",
+                "example.com", certificate=certificate, key=private_key,
+            ) | {"tag": tag, "listen_port": port}
+        if protocol == "vless-grpc-reality":
+            return self.generate_inbound(
+                protocol, uuid, "EditGrpcReality",
+                "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw", "0123456789abcdef",
+                "example.com", certificate=certificate, key=private_key,
+            ) | {"tag": tag, "listen_port": port}
+        if protocol == "shadowsocks":
+            return self.generate_inbound(
+                protocol, "8JCsPssfgS8tiRwiMlhARg==",
+            ) | {"tag": tag, "listen_port": port}
+        if protocol == "hysteria2":
+            return self.generate_inbound(
+                protocol, "edit-hy2-password", tls_server_name="example.com",
+                certificate=certificate, key=private_key,
+            ) | {"tag": tag, "listen_port": port}
+        if protocol == "tuic":
+            return self.generate_inbound(
+                protocol, uuid, tuic_password="edit-tuic-password",
+                tls_server_name="example.com", certificate=certificate, key=private_key,
+            ) | {"tag": tag, "listen_port": port}
+        if protocol == "anytls":
+            return self.generate_inbound(
+                protocol, "edit-anytls-password", tls_server_name="example.com",
+                certificate=certificate, key=private_key,
+            ) | {"tag": tag, "listen_port": port}
+        extras = {
+            "vless-tcp": "",
+            "vless-ws": "/edit-vless",
+            "vless-grpc-tls": "EditGrpc",
+            "vmess-tcp": "",
+            "vmess-tcp-tls": "",
+            "vmess-ws": "/edit-vmess",
+            "vmess-ws-tls": "/edit-vmess-tls",
+            "vmess-grpc-tls": "EditVmessGrpc",
+        }
+        extra = extras[protocol]
+        tls = protocol.endswith("-tls")
+        return self.generate_inbound(
+            protocol, uuid, extra, tls_server_name="example.com" if tls else "",
+            certificate=certificate if tls else None, key=private_key if tls else None,
+        ) | {"tag": tag, "listen_port": port}
+
     def test_source_only_defines_functions_without_running_menu_or_services(self) -> None:
         result = self.shell('printf "%s\\n" "$CORE_BIN" "$CONFIG_FILE"', check=True)
         self.assertEqual(result.stdout.splitlines(), [str(self.core), str(self.config)])
@@ -473,6 +570,7 @@ class ManagerTest(unittest.TestCase):
             stdout, stderr = process.communicate(timeout=10)
             self.assertEqual(process.returncode, 0, stdout + stderr)
             self.assertRegex(stdout, r"10\.\s*更新\s*sing-box")
+            self.assertRegex(stdout, r"11\.\s*修改\s*配置")
             install_lines = [line for line in stdout.splitlines() if re.match(r"\s*1\.", line)]
             self.assertTrue(install_lines)
             self.assertTrue(all("更新" not in line for line in install_lines))
@@ -484,6 +582,177 @@ class ManagerTest(unittest.TestCase):
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+
+    def test_add_wizard_lists_all_extended_protocol_routes(self) -> None:
+        result = self.shell(
+            'require_core() { return 0; }; prompt() { printf -v "$1" "%s" 0; }; add_wizard_locked',
+            check=True,
+        )
+        self.assertIn("1. VLESS + TCP + REALITY + Vision", result.stdout)
+        self.assertIn("2. VLESS + WebSocket", result.stdout)
+        self.assertIn("3. VLESS TCP", result.stdout)
+        self.assertIn("4. Shadowsocks 2022", result.stdout)
+        for number, label in (
+            (7, "Hysteria 2"), (8, "TUIC"), (9, "AnyTLS"),
+            (10, "VLESS + gRPC + TLS"), (11, "VMess + TCP"),
+            (12, "VMess + TCP + TLS"), (13, "VMess + WebSocket"),
+            (14, "VMess + WebSocket + TLS"), (15, "VMess + gRPC + TLS"),
+            (16, "VLESS + gRPC + REALITY"),
+        ):
+            with self.subTest(number=number):
+                self.assertRegex(result.stdout, rf"{number}\.\s*{re.escape(label)}")
+
+    def test_add_wizard_routes_each_protocol_to_the_generator(self) -> None:
+        """Drive each interactive choice and assert the selected template id."""
+        wizard_core = self.root / "wizard-core"
+        wizard_core.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ $1 == generate && $2 == reality-keypair ]]; then\n"
+            "  printf '%s\\n' 'PrivateKey: Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw'\n"
+            "  printf '%s\\n' 'PublicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'\n"
+            "  exit 0\n"
+            "fi\n"
+            "case \"$1 $2\" in\n"
+            "  'generate uuid') printf '%s\\n' 'b7efdc96-87aa-4910-81b4-374b2eecc737' ;;\n"
+            "  'generate rand') printf '%s\\n' 'route-password' ;;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        wizard_core.chmod(0o755)
+        openssl_stub = self.bin / "openssl"
+        openssl_stub.write_text(
+            "#!/usr/bin/env bash\n[[ $1 == rand && $2 == -hex ]] && printf '%s\\n' 0123456789abcdef\n",
+            encoding="utf-8",
+        )
+        openssl_stub.chmod(0o755)
+        route_log = self.root / "wizard-routes.log"
+        expected = {
+            1: "vless-reality", 2: "vless-ws", 3: "vless-tcp", 4: "shadowsocks",
+            7: "hysteria2", 8: "tuic", 9: "anytls", 10: "vless-grpc-tls",
+            11: "vmess-tcp", 12: "vmess-tcp-tls", 13: "vmess-ws",
+            14: "vmess-ws-tls", 15: "vmess-grpc-tls", 16: "vless-grpc-reality",
+        }
+        for choice, protocol in expected.items():
+            with self.subTest(choice=choice, protocol=protocol):
+                route_log.write_text("", encoding="utf-8")
+                env = dict(self.env)
+                env.update({
+                    "TEST_CHOICE": str(choice),
+                    "TEST_ROUTE_LOG": str(route_log),
+                    "TEST_WIZARD_CORE": str(wizard_core),
+                })
+                body = r'''
+                    require_core() { return 0; }
+                    prompt() {
+                        local variable=$1
+                        case "$variable" in
+                            choice) printf -v "$variable" '%s' "$TEST_CHOICE" ;;
+                            tag) printf -v "$variable" '%s' "route-$TEST_CHOICE" ;;
+                            port) printf -v "$variable" '%s' "$((20000 + TEST_CHOICE))" ;;
+                            extra)
+                                case "$TEST_CHOICE" in
+                                    2|13|14) printf -v "$variable" '%s' '/route-ws' ;;
+                                    10|15|16) printf -v "$variable" '%s' 'RouteGrpc' ;;
+                                    *) printf -v "$variable" '%s' '' ;;
+                                esac ;;
+                            tls_name) printf -v "$variable" '%s' 'example.com' ;;
+                            certificate) printf -v "$variable" '%s' '/tmp/route-cert.pem' ;;
+                            tls_key) printf -v "$variable" '%s' '/tmp/route-key.pem' ;;
+                            server) printf -v "$variable" '%s' '' ;;
+                            *) printf -v "$variable" '%s' '' ;;
+                        esac
+                    }
+                    generate_inbound() { printf '%s\n' "$1" >> "$TEST_ROUTE_LOG"; printf '{"type":"direct","tag":"route"}\n'; }
+                    add_managed_inbound() { return 0; }
+                    atomic_copy() { return 0; }
+                    show_client() { return 0; }
+                    CORE_BIN="$TEST_WIZARD_CORE"
+                    export CORE_BIN
+                    add_wizard_locked
+                '''
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; ' + body, "wizard-route", str(SCRIPT)],
+                    env=env, text=True, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(route_log.read_text(encoding="utf-8").strip(), protocol)
+
+    def test_tls_wizard_persists_config_metadata_and_client_export(self) -> None:
+        certificate, private_key = self.tls_material()
+        integration_core = self.root / "integration-core"
+        integration_core.write_text(
+            MOCK_CORE.replace(
+                "args = sys.argv[1:]\n",
+                "args = sys.argv[1:]\n"
+                "if args[:2] == ['generate', 'uuid']:\n"
+                "    print('b7efdc96-87aa-4910-81b4-374b2eecc737')\n"
+                "    sys.exit(0)\n"
+                "if args[:2] == ['generate', 'rand']:\n"
+                "    print('integration-password')\n"
+                "    sys.exit(0)\n",
+            ),
+            encoding="utf-8",
+        )
+        integration_core.chmod(0o755)
+        env = dict(self.env)
+        env["TEST_WIZARD_CORE"] = str(integration_core)
+        body = r'''
+            require_core() { return 0; }
+            prompt() {
+                local variable=$1
+                case "$variable" in
+                    choice) printf -v "$variable" '%s' 10 ;;
+                    tag) printf -v "$variable" '%s' integration-grpc-tls ;;
+                    port) printf -v "$variable" '%s' 28443 ;;
+                    extra) printf -v "$variable" '%s' IntegrationGrpc ;;
+                    tls_name) printf -v "$variable" '%s' example.com ;;
+                    certificate) printf -v "$variable" '%s' "$TEST_CERTIFICATE" ;;
+                    tls_key) printf -v "$variable" '%s' "$TEST_PRIVATE_KEY" ;;
+                    server) printf -v "$variable" '%s' example.com ;;
+                    *) printf -v "$variable" '%s' '' ;;
+                esac
+            }
+            CORE_BIN="$TEST_WIZARD_CORE"
+            add_wizard_locked
+        '''
+        env["TEST_CERTIFICATE"] = str(certificate)
+        env["TEST_PRIVATE_KEY"] = str(private_key)
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; ' + body, "wizard-integration", str(SCRIPT)],
+            env=env, text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(len(config["inbounds"]), 1)
+        inbound = config["inbounds"][0]
+        self.assertEqual(inbound["tag"], "integration-grpc-tls")
+        self.assertEqual(inbound["type"], "vless")
+        self.assertEqual(inbound["transport"], {"type": "grpc", "service_name": "IntegrationGrpc"})
+        self.assertEqual(inbound["tls"]["server_name"], "example.com")
+        self.assertEqual(inbound["tls"]["certificate_path"], str(certificate))
+        self.assertEqual(inbound["tls"]["key_path"], str(private_key))
+        self.assertEqual(inbound["tls"]["alpn"], ["h2"])
+
+        metadata_path = self.state_dir / "clients" / "integration-grpc-tls.json"
+        self.assertTrue(metadata_path.is_file())
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["server"], "example.com")
+        self.assertEqual(metadata["public_key"], "")
+        self.assertEqual(metadata["inbound"], inbound)
+
+        inbound_path = self.root / "saved-inbound.json"
+        dump(inbound_path, inbound)
+        exported = self.shell(
+            'generate_client "$1" "$2"', str(inbound_path), "example.com", check=True,
+        )
+        client = json.loads(exported.stdout)
+        self.assertEqual(client["transport"], {"type": "grpc", "service_name": "IntegrationGrpc"})
+        self.assertTrue(client["tls"]["enabled"])
+        self.assertEqual(client["tls"]["server_name"], "example.com")
+        self.assertEqual(client["tls"]["alpn"], ["h2"])
+        self.assertFalse(client["tls"].get("insecure", False))
 
     def upgrade_fixture(self) -> Path:
         upgrade = self.root / "upgrade-core"
@@ -559,6 +828,341 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(inbound["transport"]["type"], "ws")
         self.assertEqual(inbound["listen_port"], 18443)
 
+    def test_prompt_allows_backspace_delete_and_cursor_editing(self) -> None:
+        import select
+        import termios
+        import time
+
+        cases = (
+            (b"example.xuz\x08\x08yz\n", "example.xyz", ""),
+            (b"example.xuz\x7f\x7fyz\n", "example.xyz", ""),
+            (b"ac\x1b[Db\n", "abc", ""),
+            (b"abxc\x1b[D\x1b[D\x1b[3~\n", "abc", ""),
+            (b"wrong\x15correct\n", "correct", ""),
+            (b"\n", "fallback", "fallback"),
+            (b"path\\name\n", "path\\name", ""),
+            (b"example.xuz\x08\x08yz\n", "example.xyz", "fallback"),
+        )
+        for keys, expected, default in cases:
+            with self.subTest(keys=keys, default=default):
+                master, slave = pty.openpty()
+                attrs = termios.tcgetattr(slave)
+                attrs[6][termios.VERASE] = b"\x7f"
+                termios.tcsetattr(slave, termios.TCSANOW, attrs)
+                env = dict(self.env, TERM="xterm", INPUTRC="/dev/null")
+                process = subprocess.Popen(
+                    ["bash", "--noprofile", "--norc", "-c",
+                     'source "$1"; prompt answer EDIT "$2" && printf "%s" "$answer"',
+                     "prompt-edit", str(SCRIPT), default],
+                    env=env, stdin=slave, stdout=subprocess.PIPE, stderr=slave,
+                )
+                os.close(slave)
+                try:
+                    seen = b""
+                    deadline = time.monotonic() + 5
+                    while b"EDIT" not in seen and time.monotonic() < deadline:
+                        ready, _, _ = select.select([master], [], [], 0.1)
+                        if ready:
+                            seen += os.read(master, 4096)
+                    self.assertIn(b"EDIT", seen, "Prompt did not become ready")
+                    os.write(master, keys)
+                    stdout, _ = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0)
+                    self.assertEqual(stdout.decode(), expected)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+                    if process.stdout:
+                        process.stdout.close()
+                    os.close(master)
+
+    def test_config_list_displays_complete_links_and_continues_past_missing_metadata(self) -> None:
+        import base64
+        from urllib.parse import parse_qs, urlsplit
+
+        ws = self.inbound("ws-node", 18443)
+        ws["transport"]["path"] = "/proxy?one=a&two=b"
+        missing = self.inbound("missing-address", 18444)
+        stale = self.inbound("changed-node", 18445)
+        reality = self.inbound("missing-key", 18446)
+        reality.pop("transport")
+        reality["users"][0]["flow"] = "xtls-rprx-vision"
+        reality["tls"] = {
+            "enabled": True, "server_name": "example.com",
+            "reality": {"enabled": True, "short_id": ["0123456789abcdef"]},
+        }
+        vmess = {
+            "type": "vmess", "tag": "vmess-node", "listen_port": 18447,
+            "users": [{"uuid": ws["users"][0]["uuid"], "alterId": 0}],
+        }
+        ss = {
+            "type": "shadowsocks", "tag": "ss-node", "listen_port": 18448,
+            "method": "2022-blake3-aes-128-gcm", "password": "8JCsPssfgS8tiRwiMlhARg==",
+        }
+        value = dict(self.original)
+        value["inbounds"] = [ws, missing, stale, reality, vmess, ss]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        for inbound in (ws, reality, vmess, ss):
+            dump(client_dir / (inbound["tag"] + ".json"), {
+                "server": "example.com", "public_key": "", "inbound": inbound,
+            })
+        dump(client_dir / "changed-node.json", {
+            "server": "stale.example.com", "public_key": "",
+            "inbound": self.inbound("changed-node", 18445) | {"listen_port": 9999},
+        })
+        before = {path: path.read_bytes() for path in [self.config, *client_dir.glob("*.json")]}
+        result = self.shell(
+            'prompt() { [[ $1 == choice ]] || return 97; printf -v "$1" "%s" 1; }; show_config',
+            check=True,
+        )
+        links = [line for line in result.stdout.splitlines() if line.startswith(("vless://", "vmess://", "ss://"))]
+        self.assertEqual(len(links), 3, result.stdout + result.stderr)
+        parsed = urlsplit(links[0])
+        self.assertEqual(parsed.hostname, "example.com")
+        self.assertEqual(parsed.port, 18443)
+        self.assertEqual(parse_qs(parsed.query)["path"], [ws["transport"]["path"]])
+        self.assertEqual(parsed.fragment, "ws-node")
+        payload = json.loads(base64.b64decode(links[1].removeprefix("vmess://")))
+        self.assertEqual(payload["add"], "example.com")
+        self.assertEqual(payload["port"], "18447")
+        self.assertTrue(links[2].endswith("@example.com:18448#ss-node"))
+        self.assertNotIn("stale.example.com", result.stdout)
+        self.assertNotIn('"outbounds"', result.stdout)
+        self.assertNotIn("[信息] 客户端 outbound JSON", result.stdout)
+        self.assertIn("缺少当前配置的公网", result.stderr)
+        self.assertIn("缺少此 REALITY 入站对应的公钥", result.stderr)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.calls(self.system_log), [])
+
+    def test_empty_config_list_has_no_links_or_prompts(self) -> None:
+        result = self.shell('prompt() { return 97; }; show_config_list', check=True)
+        self.assertIn("暂无入站配置", result.stdout)
+        self.assertNotIn("://", result.stdout)
+
+    def test_full_client_view_still_displays_json_and_link(self) -> None:
+        inbound = self.inbound()
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        result = self.shell('show_client "$1" example.com', inbound["tag"], check=True)
+        self.assertIn("客户端 outbound JSON", result.stdout)
+        self.assertIn('"server": "example.com"', result.stdout)
+        self.assertIn("vless://", result.stdout)
+
+    @property
+    def default_server_file(self) -> Path:
+        return self.state_dir / "default-server"
+
+    def test_default_server_read_write_modify_clear_and_permissions(self) -> None:
+        result = self.shell("read_default_server", check=True)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.default_server_file.exists())
+
+        self.shell('set_default_server "$1"', "global.example", check=True)
+        self.assertEqual(self.default_server_file.read_text(encoding="utf-8"), "global.example\n")
+        self.assertEqual(self.default_server_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.shell("read_default_server", check=True).stdout, "global.example\n")
+
+        self.shell('set_default_server "$1"', "changed.example", check=True)
+        self.assertEqual(self.shell("read_default_server", check=True).stdout, "changed.example\n")
+
+        self.shell('set_default_server -', check=True)
+        self.assertEqual(self.shell("read_default_server", check=True).stdout, "")
+        self.assertFalse(self.default_server_file.exists())
+
+    def test_default_server_rejects_invalid_and_symlink_without_writing(self) -> None:
+        self.shell('set_default_server "$1"', "safe.example", check=True)
+        before = self.default_server_file.read_bytes()
+        for address in ("https://example.com", "example.com:443", "bad..example", "bad host", "127.0.0.1:443"):
+            with self.subTest(address=address):
+                result = self.shell('set_default_server "$1"', address)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.default_server_file.read_bytes(), before)
+
+        invalid = self.default_server_file.with_name("invalid-default-server")
+        invalid.write_text("bad..example\n", encoding="utf-8")
+        result = self.shell('DEFAULT_SERVER_FILE="$1"; read_default_server', str(invalid))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(invalid.read_text(encoding="utf-8"), "bad..example\n")
+
+        target = self.root / "default-target"
+        target.write_text("target.example\n", encoding="utf-8")
+        self.default_server_file.unlink()
+        self.default_server_file.symlink_to(target)
+        result = self.shell("read_default_server", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        result = self.shell('set_default_server "$1"', "new.example")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "target.example\n")
+        self.assertTrue(self.default_server_file.is_symlink())
+
+    def test_server_cli_uses_lock_and_show_config_menu_five_routes(self) -> None:
+        marker = self.core.parent / ".managed"
+        marker.write_text("sing-box-manager-v1\n", encoding="utf-8")
+        result = self.shell(
+            'require_root() { return 0; }; require_systemd() { return 0; }; '
+            'with_lock() { printf "locked\\n"; "$@"; }; SB_ROOT_PREFIX=""; main server "$1"',
+            "cli.example", check=True,
+        )
+        self.assertIn("locked", result.stdout)
+        self.assertEqual(self.shell("read_default_server", check=True).stdout, "cli.example\n")
+
+        result = self.shell(
+            'prompt() { printf -v "$1" "%s" 5; }; '
+            'with_lock() { printf "locked\\n"; "$@"; }; '
+            'set_default_server() { printf "server-route\\n"; }; show_config',
+            check=True,
+        )
+        self.assertIn("locked", result.stdout)
+        self.assertIn("server-route", result.stdout)
+
+    def test_show_client_address_priority_and_hysteria2_sni_fallback(self) -> None:
+        certificate, private_key = self.tls_material("hy2.example")
+        inbound = self.generate_inbound(
+            "hysteria2", "hy2-password", tls_server_name="hy2.example",
+            certificate=certificate, key=private_key,
+        )
+        inbound["tag"] = "hy2-node"
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        metadata_path = self.state_dir / "clients" / "hy2-node.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+
+        dump(metadata_path, {"server": "node.example", "public_key": "", "inbound": inbound})
+        self.shell('set_default_server "$1"', "global.example", check=True)
+        config_before_list = self.config.read_bytes()
+        metadata_before_list = metadata_path.read_bytes()
+        list_result = self.shell("show_config_list", check=True)
+        self.assertIn("hysteria2://", list_result.stdout)
+        self.assertIn("@node.example:18443", list_result.stdout)
+        self.assertEqual(self.config.read_bytes(), config_before_list)
+        self.assertEqual(metadata_path.read_bytes(), metadata_before_list)
+        result = self.shell('show_client "$1"', "hy2-node", check=True)
+        self.assertIn('"server": "node.example"', result.stdout)
+        self.assertIn("@node.example:18443", result.stdout)
+
+        result = self.shell('show_client "$1" "$2"', "hy2-node", "explicit.example", check=True)
+        self.assertIn('"server": "explicit.example"', result.stdout)
+        self.assertIn("@explicit.example:18443", result.stdout)
+
+        metadata_path.unlink()
+        result = self.shell('show_client "$1"', "hy2-node", check=True)
+        self.assertIn('"server": "global.example"', result.stdout)
+        self.assertIn("@global.example:18443", result.stdout)
+
+        self.shell("set_default_server -", check=True)
+        result = self.shell(
+            'prompt() { printf "unexpected prompt\\n" >&2; return 97; }; show_client "$1"',
+            "hy2-node", check=True,
+        )
+        self.assertIn('"server": "hy2.example"', result.stdout)
+        self.assertIn("@hy2.example:18443", result.stdout)
+        metadata_path.write_text(
+            json.dumps({"server": "", "public_key": "", "inbound": inbound}) + "\n",
+            encoding="utf-8",
+        )
+        result = self.shell(
+            'prompt() { printf "unexpected prompt\\n" >&2; return 97; }; show_client "$1"',
+            "hy2-node", check=True,
+        )
+        self.assertIn('"server": "hy2.example"', result.stdout)
+        self.assertIn("@hy2.example:18443", result.stdout)
+        config_before_fallback_list = self.config.read_bytes()
+        metadata_before_fallback_list = metadata_path.read_bytes()
+        list_result = self.shell("show_config_list", check=True)
+        self.assertIn("hysteria2://", list_result.stdout)
+        self.assertIn("@hy2.example:18443", list_result.stdout)
+        self.assertEqual(self.config.read_bytes(), config_before_fallback_list)
+        self.assertEqual(metadata_path.read_bytes(), metadata_before_fallback_list)
+
+    def test_global_default_beats_hysteria2_sni_and_stale_metadata_is_ignored(self) -> None:
+        certificate, private_key = self.tls_material("hy2.example")
+        inbound = self.generate_inbound(
+            "hysteria2", "hy2-password", tls_server_name="hy2.example",
+            certificate=certificate, key=private_key,
+        )
+        inbound["tag"] = "stale-hy2"
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        metadata_path = self.state_dir / "clients" / "stale-hy2.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        stale = dict(inbound)
+        stale["listen_port"] = 29999
+        dump(metadata_path, {"server": "old.example", "public_key": "", "inbound": stale})
+        self.shell('set_default_server "$1"', "global.example", check=True)
+        before = self.config.read_bytes()
+        result = self.shell('show_client "$1"', "stale-hy2", check=True)
+        self.assertIn('"server": "global.example"', result.stdout)
+        self.assertNotIn("old.example", result.stdout)
+        self.assertEqual(self.config.read_bytes(), before)
+
+        ordinary = self.inbound("ordinary-vless", 18444)
+        value["inbounds"] = [ordinary]
+        dump(self.config, value)
+        result = self.shell('show_client "$1"', "ordinary-vless", check=True)
+        self.assertIn('"server": "global.example"', result.stdout)
+        self.assertIn("@global.example:18444", result.stdout)
+
+    def run_wizard_for_server_default(self, choice: str, tls_name: str, expected: str) -> None:
+        wizard_core = self.root / ("wizard-core-" + choice)
+        wizard_core.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ $1 == generate && $2 == uuid ]]; then printf '%s\\n' 'b7efdc96-87aa-4910-81b4-374b2eecc737'; exit 0; fi\n"
+            "if [[ $1 == generate && $2 == rand ]]; then printf '%s\\n' 'wizard-password'; exit 0; fi\n",
+            encoding="utf-8",
+        )
+        wizard_core.chmod(0o755)
+        prompt_log = self.root / ("wizard-defaults-" + choice + ".log")
+        env = dict(self.env, TEST_WIZARD_CHOICE=choice, TEST_TLS_NAME=tls_name, TEST_WIZARD_CORE=str(wizard_core), TEST_PROMPT_LOG=str(prompt_log))
+        body = r'''
+            require_core() { return 0; }
+            prompt() {
+                local variable=$1
+                printf '%s|%s\n' "$variable" "${3-}" >> "$TEST_PROMPT_LOG"
+                case "$variable" in
+                    choice) printf -v "$variable" '%s' "$TEST_WIZARD_CHOICE" ;;
+                    tag) printf -v "$variable" '%s' wizard-default ;;
+                    port) printf -v "$variable" '%s' 29443 ;;
+                    extra) printf -v "$variable" '%s' WizardGrpc ;;
+                    tls_name) printf -v "$variable" '%s' "$TEST_TLS_NAME" ;;
+                    certificate) printf -v "$variable" '%s' /tmp/wizard-cert.pem ;;
+                    tls_key) printf -v "$variable" '%s' /tmp/wizard-key.pem ;;
+                    server) printf -v "$variable" '%s' "${3-}" ;;
+                    *) printf -v "$variable" '%s' '' ;;
+                esac
+            }
+            generate_inbound() { printf '{"type":"direct","tag":"wizard-default"}\n'; }
+            generate_client() { return 0; }
+            add_managed_inbound() { return 0; }
+            atomic_copy() { return 0; }
+            show_client() { return 0; }
+            CORE_BIN="$TEST_WIZARD_CORE"
+            add_wizard_locked
+        '''
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; ' + body, "wizard-default", str(SCRIPT)],
+            env=env, text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        entries = [
+            line.split("|", 1)[1]
+            for line in prompt_log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("server|")
+        ]
+        self.assertEqual(entries[-1], expected)
+
+    def test_wizard_server_defaults_use_global_or_hysteria2_sni(self) -> None:
+        self.shell('set_default_server "$1"', "global.example", check=True)
+        self.run_wizard_for_server_default("7", "hy2.example", "global.example")
+        self.run_wizard_for_server_default("10", "tls.example", "global.example")
+        self.shell("set_default_server -", check=True)
+        self.run_wizard_for_server_default("7", "hy2.example", "hy2.example")
+        self.run_wizard_for_server_default("10", "tls.example", "")
+
     def test_generated_reality_uses_server_side_fields(self) -> None:
         result = self.shell(
             'generate_inbound "$@"', "vless-reality", "reality-node", "18443",
@@ -571,6 +1175,668 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(inbound["tls"]["reality"]["short_id"], ["0123456789abcdef"])
         self.assertIn("private_key", inbound["tls"]["reality"])
         self.assertNotIn("public_key", inbound["tls"]["reality"])
+
+    def test_detect_inbound_template_identifies_all_protocols(self) -> None:
+        certificate, private_key = self.tls_material()
+        protocols = (
+            "vless-reality", "vless-ws", "vless-tcp", "shadowsocks",
+            "hysteria2", "tuic", "anytls", "vless-grpc-tls",
+            "vmess-tcp", "vmess-tcp-tls", "vmess-ws", "vmess-ws-tls",
+            "vmess-grpc-tls", "vless-grpc-reality",
+        )
+        for index, protocol in enumerate(protocols, start=1):
+            with self.subTest(protocol=protocol):
+                inbound = self.edit_protocol_inbound(
+                    protocol, "detect-" + str(index), 21000 + index, certificate, private_key,
+                )
+                path = self.root / ("detect-" + protocol + ".json")
+                dump(path, inbound)
+                result = self.shell('detect_inbound_template "$1"', str(path), check=True)
+                self.assertEqual(result.stdout.strip(), protocol)
+
+    def test_replace_inbound_preserves_order_and_syncs_renamed_metadata(self) -> None:
+        old = self.inbound("old-node", 22001)
+        other = self.inbound("other-node", 22002)
+        value = dict(self.original)
+        value["inbounds"] = [old, other]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        old_metadata = {"server": "old.example", "public_key": "", "inbound": old}
+        other_metadata = {"server": "other.example", "public_key": "", "inbound": other}
+        dump(client_dir / "old-node.json", old_metadata)
+        dump(client_dir / "other-node.json", other_metadata)
+        other_before = (client_dir / "other-node.json").read_bytes()
+
+        candidate = dict(self.inbound("renamed-node", 22003))
+        candidate["unknown_edit_field"] = {"keep": True}
+        candidate_path = self.root / "replace-node.json"
+        dump(candidate_path, candidate)
+        result = self.shell(
+            'replace_inbound_file "$1" "$2" "$3" "$4"',
+            "old-node", str(candidate_path), "node.example", "", check=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual([node["tag"] for node in saved["inbounds"]], ["renamed-node", "other-node"])
+        self.assertEqual(saved["inbounds"][0]["unknown_edit_field"], {"keep": True})
+        self.assertFalse((client_dir / "old-node.json").exists())
+        new_metadata_path = client_dir / "renamed-node.json"
+        self.assertTrue(new_metadata_path.is_file())
+        new_metadata = json.loads(new_metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(new_metadata["server"], "node.example")
+        self.assertEqual(new_metadata["public_key"], "")
+        self.assertEqual(new_metadata["inbound"], candidate)
+        self.assertEqual(new_metadata_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((client_dir / "other-node.json").read_bytes(), other_before)
+        self.assertFalse(any(
+            any(action in call for action in ("start", "stop", "restart", "enable", "disable"))
+            for call in self.calls(self.system_log)
+        ))
+
+    def test_replace_each_protocol_template_succeeds(self) -> None:
+        certificate, private_key = self.tls_material()
+        protocols = (
+            "vless-reality", "vless-ws", "vless-tcp", "shadowsocks",
+            "hysteria2", "tuic", "anytls", "vless-grpc-tls",
+            "vmess-tcp", "vmess-tcp-tls", "vmess-ws", "vmess-ws-tls",
+            "vmess-grpc-tls", "vless-grpc-reality",
+        )
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        for index, protocol in enumerate(protocols, start=1):
+            with self.subTest(protocol=protocol):
+                old_tag, new_tag = "old-" + protocol, "new-" + protocol
+                old = self.edit_protocol_inbound(protocol, old_tag, 22100 + index, certificate, private_key)
+                other = self.inbound("keep-" + protocol, 22200 + index)
+                value = dict(self.original)
+                value["inbounds"] = [old, other]
+                dump(self.config, value)
+                dump(client_dir / (old_tag + ".json"), {
+                    "server": "old.example", "public_key": "", "inbound": old,
+                })
+                candidate = self.edit_protocol_inbound(protocol, new_tag, 22300 + index, certificate, private_key)
+                candidate_path = self.root / ("replace-" + protocol + ".json")
+                dump(candidate_path, candidate)
+                public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" if "reality" in protocol else ""
+                result = self.shell(
+                    'replace_inbound_file "$1" "$2" "" "$3"',
+                    old_tag, str(candidate_path), public_key, check=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                saved = json.loads(self.config.read_text(encoding="utf-8"))
+                self.assertEqual(saved["inbounds"][0]["tag"], new_tag)
+                self.assertEqual(saved["inbounds"][1]["tag"], other["tag"])
+                self.assertFalse((client_dir / (old_tag + ".json")).exists())
+                self.assertTrue((client_dir / (new_tag + ".json")).exists())
+                if REAL_CORE:
+                    checked = subprocess.run(
+                        [REAL_CORE, "check", "-c", str(self.config)],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+
+    def test_replace_rejects_tag_port_and_route_conflicts_without_changes(self) -> None:
+        old = self.inbound("old-node", 22401)
+        other = self.inbound("other-node", 22402)
+        value = dict(self.original)
+        value["inbounds"] = [old, other]
+        value["route"] = {"rules": [{"inbound": ["old-node"]}]}
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "old-node.json", {"server": "old.example", "public_key": "", "inbound": old})
+        before_config = self.config.read_bytes()
+        before_metadata = (client_dir / "old-node.json").read_bytes()
+
+        for candidate_tag, candidate_port in (("other-node", 22403), ("renamed-node", 22402)):
+            with self.subTest(candidate_tag=candidate_tag, candidate_port=candidate_port):
+                candidate = self.inbound(candidate_tag, candidate_port)
+                candidate_path = self.root / ("conflict-" + candidate_tag + ".json")
+                dump(candidate_path, candidate)
+                result = self.shell(
+                    'replace_inbound_file "$1" "$2" "" ""',
+                    "old-node", str(candidate_path),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.config.read_bytes(), before_config)
+                self.assertEqual((client_dir / "old-node.json").read_bytes(), before_metadata)
+                self.assertFalse((client_dir / (candidate_tag + ".json")).exists())
+
+    def test_replace_allows_same_port_when_the_replaced_node_owns_it(self) -> None:
+        old = self.inbound("old-node", 22501)
+        value = dict(self.original)
+        value["inbounds"] = [old]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "old-node.json", {"server": "", "public_key": "", "inbound": old})
+        candidate = self.inbound("renamed-node", 22501)
+        candidate_path = self.root / "same-port.json"
+        dump(candidate_path, candidate)
+        self.env["SB_MOCK_PORT_BUSY"] = "1"
+        result = self.shell(
+            'replace_inbound_file "$1" "$2" "" ""',
+            "old-node", str(candidate_path), check=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(saved["inbounds"][0]["tag"], "renamed-node")
+
+    def test_replace_metadata_write_failure_rolls_back_config_and_metadata(self) -> None:
+        old = self.inbound("old-node", 22601)
+        value = dict(self.original)
+        value["inbounds"] = [old]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "old-node.json", {"server": "old.example", "public_key": "", "inbound": old})
+        candidate = self.inbound("renamed-node", 22602)
+        candidate_path = self.root / "metadata-failure.json"
+        dump(candidate_path, candidate)
+        before_config = self.config.read_bytes()
+        before_metadata = (client_dir / "old-node.json").read_bytes()
+        body = r'''
+            FAIL_METADATA_ONCE=1
+            atomic_copy() {
+                if [[ $FAIL_METADATA_ONCE == 1 && $2 == *"/clients/renamed-node.json" ]]; then
+                    FAIL_METADATA_ONCE=0
+                    return 1
+                fi
+                install -m "${3:-600}" "$1" "$2"
+            }
+            replace_inbound_file "$@"
+        '''
+        result = self.shell(body, "old-node", str(candidate_path), "", "")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual((client_dir / "old-node.json").read_bytes(), before_metadata)
+        self.assertFalse((client_dir / "renamed-node.json").exists())
+
+    def test_replace_restart_failure_rolls_back_config_and_metadata(self) -> None:
+        old = self.inbound("old-node", 22701)
+        value = dict(self.original)
+        value["inbounds"] = [old]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "old-node.json", {"server": "old.example", "public_key": "", "inbound": old})
+        candidate = self.inbound("renamed-node", 22702)
+        candidate_path = self.root / "restart-failure.json"
+        dump(candidate_path, candidate)
+        before_config = self.config.read_bytes()
+        before_metadata = (client_dir / "old-node.json").read_bytes()
+        self.state(active=True, restart_failures=1)
+        result = self.shell(
+            'replace_inbound_file "$1" "$2" "" ""',
+            "old-node", str(candidate_path),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual((client_dir / "old-node.json").read_bytes(), before_metadata)
+        self.assertFalse((client_dir / "renamed-node.json").exists())
+        self.assertTrue(self.state()["active"])
+
+    def test_replace_server_only_metadata_change_does_not_restart(self) -> None:
+        old = self.inbound("old-node", 22801)
+        value = dict(self.original)
+        value["inbounds"] = [old]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "old-node.json", {"server": "old.example", "public_key": "", "inbound": old})
+        candidate_path = self.root / "same-node.json"
+        dump(candidate_path, old)
+        expected_path = self.root / "expected-old.json"
+        dump(expected_path, old)
+        self.state(active=True)
+        result = self.shell(
+            'replace_inbound_file "$1" "$2" "$3" "" "$4"',
+            "old-node", str(candidate_path), "new.example", str(expected_path),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.state()["active"])
+        self.assertFalse(any("restart" in call for call in self.calls(self.system_log)))
+        self.assertEqual(json.loads((client_dir / "old-node.json").read_text())["server"], "new.example")
+
+    def test_replace_expected_old_snapshot_drift_is_rejected_without_changes(self) -> None:
+        old = self.inbound("old-node", 22811)
+        value = dict(self.original)
+        value["inbounds"] = [old]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "old-node.json", {"server": "old.example", "public_key": "", "inbound": old})
+        candidate = self.inbound("renamed-node", 22812)
+        candidate_path = self.root / "snapshot-candidate.json"
+        dump(candidate_path, candidate)
+        expected = dict(old)
+        expected["listen_port"] = 29999
+        expected_path = self.root / "drifted-old.json"
+        dump(expected_path, expected)
+        before_config = self.config.read_bytes()
+        before_metadata = (client_dir / "old-node.json").read_bytes()
+        result = self.shell(
+            'replace_inbound_file "$1" "$2" "" "" "$3"',
+            "old-node", str(candidate_path), str(expected_path),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual((client_dir / "old-node.json").read_bytes(), before_metadata)
+        self.assertFalse((client_dir / "renamed-node.json").exists())
+
+    def run_edit_wizard_with_test_prompts(self, tag: str, certificate: Path, private_key: Path, cancel: bool = False) -> subprocess.CompletedProcess[str]:
+        env = dict(self.env, TEST_CERTIFICATE=str(certificate), TEST_PRIVATE_KEY=str(private_key))
+        if cancel:
+            env["TEST_EDIT_CANCEL"] = "1"
+        body = r'''
+            prompt() {
+                local variable=$1 message=$2 value
+                if [[ $TEST_EDIT_CANCEL == 1 ]]; then
+                    printf -v "$variable" '%s' "$3"
+                    return 0
+                fi
+                case "$message" in
+                    *gRPC*) value=EditedGrpc ;;
+                    *TLS*域名*|*握手域名*) value=edited.example ;;
+                    *REALITY*|*Reality*) value=$3 ;;
+                    *证书*) value=$TEST_CERTIFICATE ;;
+                    *私钥*) value=$TEST_PRIVATE_KEY ;;
+                    *公网*|*服务器*|*连接地址*|*客户端*地址*) value=edited.example ;;
+                    *) value=$3 ;;
+                esac
+                printf -v "$variable" '%s' "$value"
+            }
+            prompt_secret() {
+                local value=$3
+                [[ -n $value ]] || value=edit-secret
+                printf -v "$1" '%s' "$value"
+            }
+            confirm() { [[ -z $TEST_EDIT_CANCEL || $TEST_EDIT_CANCEL == 0 ]]; }
+            edit_wizard_locked "$1"
+        '''
+        return subprocess.run(
+            ["bash", "-c", 'source "$1"; shift; ' + body, "edit-wizard", str(SCRIPT), tag],
+            env=env, text=True, capture_output=True, timeout=20,
+        )
+
+    def test_edit_wizard_tls_updates_config_and_metadata(self) -> None:
+        certificate, private_key = self.tls_material("example.com")
+        original_certificate = self.root / "original-cert.pem"
+        original_private_key = self.root / "original-key.pem"
+        shutil.copy2(certificate, original_certificate)
+        shutil.copy2(private_key, original_private_key)
+        edited_certificate, edited_private_key = self.tls_material("edited.example")
+        inbound = self.edit_protocol_inbound(
+            "vless-grpc-tls", "tls-edit", 22901, original_certificate, original_private_key,
+        )
+        inbound["unknown_edit_field"] = {"keep": True}
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "tls-edit.json", {"server": "old.example", "public_key": "", "inbound": inbound})
+        result = self.run_edit_wizard_with_test_prompts("tls-edit", edited_certificate, edited_private_key)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+        self.assertEqual(saved["tag"], "tls-edit")
+        self.assertEqual(saved["transport"]["service_name"], "EditedGrpc")
+        self.assertEqual(saved["tls"]["server_name"], "edited.example")
+        self.assertEqual(saved["unknown_edit_field"], {"keep": True})
+        metadata = json.loads((client_dir / "tls-edit.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["server"], "edited.example")
+        self.assertEqual(metadata["inbound"], saved)
+
+    def test_edit_wizard_reality_updates_handshake_and_metadata(self) -> None:
+        inbound = self.edit_protocol_inbound("vless-reality", "reality-edit", 22902)
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "reality-edit.json", {
+            "server": "old.example", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "inbound": inbound,
+        })
+        result = self.run_edit_wizard_with_test_prompts(
+            "reality-edit", self.root / "unused-cert.pem", self.root / "unused-key.pem",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+        self.assertEqual(saved["tls"]["server_name"], "edited.example")
+        self.assertEqual(saved["tls"]["reality"]["handshake"]["server"], "edited.example")
+        self.assertEqual(saved["users"][0]["flow"], "xtls-rprx-vision")
+        metadata = json.loads((client_dir / "reality-edit.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["inbound"], saved)
+
+    def test_edit_wizard_cancel_does_not_write_config_or_metadata(self) -> None:
+        certificate, private_key = self.tls_material()
+        inbound = self.edit_protocol_inbound("vless-grpc-tls", "cancel-edit", 22903, certificate, private_key)
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "cancel-edit.json", {"server": "old.example", "public_key": "", "inbound": inbound})
+        before_config = self.config.read_bytes()
+        before_metadata = (client_dir / "cancel-edit.json").read_bytes()
+        result = self.run_edit_wizard_with_test_prompts("cancel-edit", certificate, private_key, cancel=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual((client_dir / "cancel-edit.json").read_bytes(), before_metadata)
+
+    def test_prompt_secret_does_not_echo_input_or_default_and_preserves_empty_default(self) -> None:
+        import select
+        import time
+
+        def run_secret(keys: bytes, default: str) -> tuple[str, str]:
+            result_path = self.root / "prompt-secret-result"
+            master, slave = pty.openpty()
+            process = subprocess.Popen(
+                ["bash", "--noprofile", "--norc", "-c",
+                 'source "$1"; prompt_secret answer SECRET "$2" && printf "%s" "$answer" > "$3"',
+                 "prompt-secret", str(SCRIPT), default, str(result_path)],
+                env=dict(self.env, TERM="xterm", INPUTRC="/dev/null"),
+                stdin=slave, stdout=subprocess.PIPE, stderr=slave,
+            )
+            os.close(slave)
+            transcript = b""
+            try:
+                deadline = time.monotonic() + 5
+                while b"SECRET" not in transcript and time.monotonic() < deadline:
+                    ready, _, _ = select.select([master], [], [], 0.1)
+                    if ready:
+                        transcript += os.read(master, 4096)
+                self.assertIn(b"SECRET", transcript)
+                os.write(master, keys)
+                stdout, _ = process.communicate(timeout=5)
+                transcript += stdout
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select([master], [], [], 0.05)
+                    if not ready:
+                        continue
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    transcript += chunk
+                self.assertEqual(process.returncode, 0)
+                return transcript.decode(errors="replace"), result_path.read_text(encoding="utf-8")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                if process.stdout:
+                    process.stdout.close()
+                os.close(master)
+
+        transcript, value = run_secret(b"typed-secret\n", "default-secret")
+        self.assertEqual(value, "typed-secret")
+        self.assertNotIn("typed-secret", transcript)
+        self.assertNotIn("default-secret", transcript)
+
+        transcript, value = run_secret(b"typed-secrex\x7ft\n", "default-secret")
+        self.assertEqual(value, "typed-secret")
+        self.assertNotIn("typed-secret", transcript)
+        self.assertNotIn("default-secret", transcript)
+
+        transcript, value = run_secret(b"\n", "default-secret")
+        self.assertEqual(value, "default-secret")
+        self.assertNotIn("default-secret", transcript)
+
+        transcript, value = run_secret(b"@new\n", "default-secret")
+        self.assertEqual(value, "@new")
+        self.assertNotIn("@new", transcript)
+
+    def test_edit_cli_and_show_config_menu_six_route_to_edit_wizard(self) -> None:
+        marker = self.core.parent / ".managed"
+        marker.write_text("sing-box-manager-v1\n", encoding="utf-8")
+        result = self.shell(
+            'require_root() { return 0; }; require_systemd() { return 0; }; '
+            'edit_wizard_locked() { printf "edit:%s\\n" "$1"; }; '
+            'SB_ROOT_PREFIX=""; main edit "$1"',
+            "node-to-edit", check=True,
+        )
+        self.assertIn("edit:node-to-edit", result.stdout)
+        result = self.shell(
+            'prompt() { printf -v "$1" "%s" 6; }; '
+            'edit_wizard_locked() { printf "edit:%s\\n" "$1"; }; '
+            'show_config',
+            check=True,
+        )
+        self.assertIn("edit:", result.stdout)
+
+    def test_generated_vless_grpc_reality_has_no_vision_flow(self) -> None:
+        inbound = self.generate_inbound(
+            "vless-grpc-reality", "b7efdc96-87aa-4910-81b4-374b2eecc737", "GrpcReality",
+            "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw", "0123456789abcdef",
+            "www.example.com",
+        )
+        self.assertEqual(inbound["type"], "vless")
+        self.assertEqual(inbound["transport"], {"type": "grpc", "service_name": "GrpcReality"})
+        self.assertNotIn("flow", inbound["users"][0])
+        self.assertTrue(inbound["tls"]["reality"]["enabled"])
+        self.assertEqual(inbound["tls"]["reality"]["short_id"], ["0123456789abcdef"])
+        self.assertEqual(inbound["tls"]["alpn"], ["h2"])
+
+    def test_extended_protocol_templates_have_expected_server_fields(self) -> None:
+        certificate, private_key = self.tls_material()
+        uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
+        cases = {
+            "hysteria2": ("hy-password", "", {}, "h3"),
+            "tuic": (uuid, "", {"uuid": uuid, "password": "tuic-password"}, "h3"),
+            "anytls": ("anytls-password", "", {}, None),
+            "vless-grpc-tls": (uuid, "GrpcService", {"uuid": uuid}, "h2"),
+            "vmess-tcp": (uuid, "", {"uuid": uuid}, None),
+            "vmess-tcp-tls": (uuid, "", {"uuid": uuid}, None),
+            "vmess-ws": (uuid, "/vmess", {"uuid": uuid}, None),
+            "vmess-ws-tls": (uuid, "/vmess-tls", {"uuid": uuid}, None),
+            "vmess-grpc-tls": (uuid, "VmessGrpc", {"uuid": uuid}, "h2"),
+        }
+        for protocol, (credential, extra, user, alpn) in cases.items():
+            with self.subTest(protocol=protocol):
+                tls = protocol.endswith("-tls") or protocol in {"hysteria2", "tuic", "anytls"}
+                inbound = self.generate_inbound(
+                    protocol, credential, extra, tls_server_name="example.com" if tls else "",
+                    certificate=certificate if tls else None, key=private_key if tls else None,
+                    tuic_password="tuic-password" if protocol == "tuic" else "",
+                )
+                expected_type = "hysteria2" if protocol == "hysteria2" else protocol.split("-", 1)[0]
+                self.assertEqual(inbound["type"], expected_type)
+                self.assertEqual(inbound["listen_port"], 18443)
+                self.assertEqual(inbound["listen"], "::")
+                if protocol == "hysteria2":
+                    self.assertEqual(inbound["users"][0]["password"], credential)
+                elif protocol == "tuic":
+                    self.assertEqual(inbound["users"], [user])
+                elif protocol == "anytls":
+                    self.assertEqual(inbound["users"][0]["password"], credential)
+                else:
+                    self.assertEqual(inbound["users"][0]["uuid"], uuid)
+                if "ws" in protocol:
+                    self.assertEqual(inbound["transport"], {"type": "ws", "path": extra})
+                if "grpc" in protocol:
+                    self.assertEqual(inbound["transport"]["type"], "grpc")
+                    self.assertEqual(inbound["transport"]["service_name"], extra)
+                if tls:
+                    self.assertTrue(inbound["tls"]["enabled"])
+                    self.assertEqual(inbound["tls"]["server_name"], "example.com")
+                    self.assertNotIn("insecure", inbound["tls"])
+                    if alpn:
+                        self.assertEqual(inbound["tls"]["alpn"], [alpn])
+
+    def test_extended_protocol_template_validation_rejects_unsafe_inputs(self) -> None:
+        certificate, private_key = self.tls_material()
+        uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
+        invalid = [
+            ("vless-grpc-tls", uuid, "", "missing gRPC service name"),
+            ("vmess-ws", uuid, "vmess", "WebSocket path must start with slash"),
+            ("vmess-grpc-tls", uuid, "grpc service", "gRPC service name contains spaces"),
+        ]
+        for protocol, credential, extra, reason in invalid:
+            with self.subTest(reason=reason):
+                args = (protocol, "invalid", "18443", credential, extra, "", "", "example.com", str(certificate), str(private_key), "")
+                result = self.shell('generate_inbound "$@"', *args)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        missing = self.shell(
+            'generate_inbound "$@"', "vmess-tcp-tls", "missing-cert", "18443", uuid,
+            "", "", "", "example.com", str(self.root / "no-cert.pem"), str(private_key), "",
+        )
+        self.assertNotEqual(missing.returncode, 0)
+
+        other_key = self.root / "other-key.pem"
+        subprocess.run(
+            ["openssl", "genrsa", "-out", str(other_key), "2048"],
+            capture_output=True, text=True, check=True, timeout=20,
+        )
+        mismatch = self.shell(
+            'generate_inbound "$@"', "vmess-tcp-tls", "mismatch", "18443", uuid,
+            "", "", "", "example.com", str(certificate), str(other_key), "",
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+
+        reality_grpc = self.shell(
+            'generate_inbound "$@"', "vless-grpc-reality-vision", "reality-grpc", "18443", uuid,
+            "GrpcService", "", "0123456789abcdef", "example.com", "", "", "",
+        )
+        self.assertNotEqual(reality_grpc.returncode, 0)
+
+    def test_extended_client_exports_preserve_transport_tls_and_credentials(self) -> None:
+        certificate, private_key = self.tls_material()
+        uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
+        cases = {
+            "hysteria2": ("hy-password", "", "h3"),
+            "tuic": (uuid, "", "h3"),
+            "anytls": ("anytls-password", "", None),
+            "vless-grpc-tls": (uuid, "GrpcService", "h2"),
+            "vmess-tcp": (uuid, "", None),
+            "vmess-tcp-tls": (uuid, "", None),
+            "vmess-ws": (uuid, "/vmess", None),
+            "vmess-ws-tls": (uuid, "/vmess-tls", None),
+            "vmess-grpc-tls": (uuid, "VmessGrpc", "h2"),
+        }
+        for protocol, (credential, extra, alpn) in cases.items():
+            with self.subTest(protocol=protocol):
+                tls = protocol.endswith("-tls") or protocol in {"hysteria2", "tuic", "anytls"}
+                inbound = self.generate_inbound(
+                    protocol, credential, extra, tls_server_name="example.com" if tls else "",
+                    certificate=certificate if tls else None, key=private_key if tls else None,
+                    tuic_password="tuic-password" if protocol == "tuic" else "",
+                )
+                source = self.root / (protocol + "-source.json")
+                dump(source, inbound)
+                result = self.shell(
+                    'generate_client "$1" "example.com"', str(source), check=True,
+                )
+                client = json.loads(result.stdout)
+                self.assertEqual(client["server"], "example.com")
+                self.assertEqual(client["server_port"], 18443)
+                self.assertEqual(client["type"], inbound["type"])
+                if protocol == "tuic":
+                    self.assertEqual(client["uuid"], uuid)
+                    self.assertEqual(client["password"], "tuic-password")
+                elif protocol in {"hysteria2", "anytls"}:
+                    self.assertEqual(client["password"], credential)
+                else:
+                    self.assertEqual(client["uuid"], uuid)
+                if "transport" in inbound:
+                    self.assertEqual(client["transport"], inbound["transport"])
+                if tls:
+                    self.assertTrue(client["tls"]["enabled"])
+                    self.assertEqual(client["tls"]["server_name"], "example.com")
+                    self.assertFalse(client["tls"].get("insecure", False))
+                    self.assertNotIn("certificate_path", client["tls"])
+                    self.assertNotIn("key_path", client["tls"])
+                    if alpn:
+                        self.assertEqual(client["tls"]["alpn"], [alpn])
+
+    def test_extended_client_export_rejects_tls_without_verifiable_material(self) -> None:
+        inbound = {
+            "type": "vmess", "tag": "imported", "listen": "::", "listen_port": 18443,
+            "users": [{"uuid": "b7efdc96-87aa-4910-81b4-374b2eecc737"}],
+            "tls": {"enabled": True, "server_name": "example.com", "certificate_path": "/missing.pem", "key_path": "/missing.key"},
+        }
+        path = self.root / "unverifiable-tls.json"
+        dump(path, inbound)
+        result = self.shell('generate_client "$1" "example.com"', str(path))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_vless_grpc_reality_client_export_keeps_reality_without_flow(self) -> None:
+        inbound = self.generate_inbound(
+            "vless-grpc-reality", "b7efdc96-87aa-4910-81b4-374b2eecc737", "GrpcReality",
+            "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw", "0123456789abcdef",
+            "www.example.com",
+        )
+        source = self.root / "vless-grpc-reality-source.json"
+        dump(source, inbound)
+        result = self.shell(
+            'generate_client "$1" "example.com" "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"',
+            str(source), check=True,
+        )
+        client = json.loads(result.stdout)
+        self.assertEqual(client["transport"], {"type": "grpc", "service_name": "GrpcReality"})
+        self.assertTrue(client["tls"]["reality"]["enabled"])
+        self.assertEqual(client["tls"]["alpn"], ["h2"])
+        self.assertNotIn("flow", client)
+        self.assertNotIn("private_key", json.dumps(client))
+
+    def test_extended_client_links_encode_credentials_and_vmess_json(self) -> None:
+        certificate, private_key = self.tls_material()
+        uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
+        cases = {
+            "hysteria2": ("hy-password", "", "hysteria2://"),
+            "tuic": (uuid, "", "tuic://"),
+            "anytls": ("anytls-password", "", "anytls://"),
+            "vless-grpc-tls": (uuid, "GrpcService", "vless://"),
+            "vless-grpc-reality": (uuid, "GrpcReality", "vless://"),
+            "vmess-tcp": (uuid, "", "vmess://"),
+            "vmess-tcp-tls": (uuid, "", "vmess://"),
+            "vmess-ws": (uuid, "/vmess", "vmess://"),
+            "vmess-ws-tls": (uuid, "/vmess-tls", "vmess://"),
+            "vmess-grpc-tls": (uuid, "VmessGrpc", "vmess://"),
+        }
+        for protocol, (credential, extra, prefix) in cases.items():
+            with self.subTest(protocol=protocol):
+                tls = protocol.endswith("-tls") or protocol in {"hysteria2", "tuic", "anytls"}
+                if protocol == "vless-grpc-reality":
+                    inbound = self.generate_inbound(
+                        protocol, credential, extra,
+                        "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw", "0123456789abcdef",
+                        "www.example.com",
+                    )
+                else:
+                    inbound = self.generate_inbound(
+                        protocol, credential, extra, tls_server_name="example.com" if tls else "",
+                        certificate=certificate if tls else None, key=private_key if tls else None,
+                        tuic_password="tuic-password" if protocol == "tuic" else "",
+                    )
+                source = self.root / (protocol + "-link-source.json")
+                dump(source, inbound)
+                outbound = self.shell(
+                    'generate_client "$1" "example.com" "$2"', str(source),
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", check=True,
+                )
+                outbound_path = self.root / (protocol + "-outbound.json")
+                outbound_path.write_text(outbound.stdout, encoding="utf-8")
+                link = self.shell('client_link "$1" "friendly name"', str(outbound_path), check=True).stdout.strip()
+                self.assertTrue(link.startswith(prefix), link)
+                self.assertNotIn("server-key.pem", link)
+                if protocol == "vmess-tcp":
+                    import base64
+                    payload = base64.urlsafe_b64decode(link.removeprefix("vmess://") + "===")
+                    value = json.loads(payload)
+                    self.assertEqual(value["id"], uuid)
+                    self.assertEqual(value["add"], "example.com")
+                    self.assertEqual(value["port"], "18443")
+                if protocol == "vless-grpc-reality":
+                    self.assertIn("type=grpc", link)
+                    self.assertIn("security=reality", link)
+                    self.assertIn("serviceName=GrpcReality", link)
+                    self.assertNotIn("flow=", link)
 
     def test_client_export_rejects_unrepresentable_imported_inbounds(self) -> None:
         tls = self.inbound()
@@ -616,18 +1882,38 @@ class ManagerTest(unittest.TestCase):
 
     @unittest.skipUnless(REAL_CORE, "set SB_TEST_CORE for real-core validation")
     def test_real_core_accepts_all_generated_inbounds(self) -> None:
+        certificate, private_key = self.tls_material()
+        uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
         protocols = {
-            "vless-tcp": ("b7efdc96-87aa-4910-81b4-374b2eecc737", "", "", ""),
-            "vless-ws": ("b7efdc96-87aa-4910-81b4-374b2eecc737", "/vless", "", ""),
+            "vless-tcp": (uuid, "", "", "", "", None, None, ""),
+            "vless-ws": (uuid, "/vless", "", "", "", None, None, ""),
             "vless-reality": (
-                "b7efdc96-87aa-4910-81b4-374b2eecc737", "www.example.com",
-                "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw", "0123456789abcdef",
+                uuid, "www.example.com", "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw",
+                "0123456789abcdef", "", None, None, "",
             ),
-            "shadowsocks": ("8JCsPssfgS8tiRwiMlhARg==", "", "", ""),
+            "vless-grpc-reality": (
+                uuid, "GrpcReality", "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw",
+                "0123456789abcdef", "www.example.com", None, None, "",
+            ),
+            "shadowsocks": ("8JCsPssfgS8tiRwiMlhARg==", "", "", "", "", None, None, ""),
+            "hysteria2": ("hy-password", "", "", "", "example.com", certificate, private_key, ""),
+            "tuic": (uuid, "", "", "", "example.com", certificate, private_key, "tuic-password"),
+            "anytls": ("anytls-password", "", "", "", "example.com", certificate, private_key, ""),
+            "vless-grpc-tls": (uuid, "GrpcService", "", "", "example.com", certificate, private_key, ""),
+            "vmess-tcp": (uuid, "", "", "", "", None, None, ""),
+            "vmess-tcp-tls": (uuid, "", "", "", "example.com", certificate, private_key, ""),
+            "vmess-ws": (uuid, "/vmess", "", "", "", None, None, ""),
+            "vmess-ws-tls": (uuid, "/vmess-tls", "", "", "example.com", certificate, private_key, ""),
+            "vmess-grpc-tls": (uuid, "VmessGrpc", "", "", "example.com", certificate, private_key, ""),
         }
         for protocol, fields in protocols.items():
             with self.subTest(protocol=protocol):
-                result = self.shell('generate_inbound "$@"', protocol, "real-test", "18443", *fields, check=True)
+                credential, extra, private, short_id, tls_name, cert, key, tuic_password = fields
+                result = self.shell(
+                    'generate_inbound "$@"', protocol, "real-test", "18443", credential,
+                    extra, private, short_id, tls_name, str(cert or ""), str(key or ""), tuic_password,
+                    check=True,
+                )
                 value = dict(self.original)
                 value["inbounds"] = [json.loads(result.stdout)]
                 path = self.root / (protocol + ".json")

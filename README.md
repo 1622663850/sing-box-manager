@@ -14,8 +14,11 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 6 | 禁用 | 立即停止服务，同时关闭开机自启 |
 | 7 | 查看日志 | 显示最近 100 行服务日志 |
 | 8 | 添加配置 | 协议向导、导入单个入站或导入完整 JSON |
-| 9 | 查看配置 | 配置列表、完整 JSON、客户端信息、配置检查 |
+| 9 | 查看配置 | 配置列表及完整分享链接、完整 JSON、客户端信息、配置检查 |
 | 10 | 更新 sing-box | 独立更新已安装的核心，保留现有配置，失败时尝试回滚 |
+| 11 | 修改配置 | 编辑已有节点，校验并备份，按需重启，失败时恢复配置和连接信息 |
+| 12 | 删除配置 | 确认后删除节点及连接信息，阻止删除仍被引用的节点，失败回滚 |
+| 13 | 配置维护 | 成套备份、列表、恢复、批量客户端导出、只读诊断 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -70,12 +73,28 @@ sudo sing-box
 
 执行 `sudo sing-box add` 或选择菜单 8：
 
-1. **VLESS + REALITY + Vision**：自动生成 UUID、密钥及 short ID；填写握手域名和监听端口。
+向导输入支持 Backspace、Delete、左右光标编辑；输错整行可按 Ctrl+U 清空，直接回车使用提示中的默认值。
+
+1. **VLESS + TCP + REALITY + Vision**：自动生成 UUID、密钥及 short ID；填写握手域名和监听端口。
 2. **VLESS + WebSocket，无 TLS**：自动生成 UUID；填写端口和 WS 路径。
 3. **VLESS TCP，无 TLS**：自动生成 UUID；填写监听端口。
 4. **Shadowsocks 2022**：使用 `2022-blake3-aes-128-gcm`，自动生成随机密钥。
 5. **导入单个 inbound JSON**：追加至现有 `.inbounds`，保留其他配置；检查名称、端口冲突。
 6. **导入完整 JSON**：交互确认后替换当前主配置，保留旧配置备份。
+7. **Hysteria 2**：自动生成密码，使用 UDP 和 TLS。
+8. **TUIC**：自动生成 UUID 和密码，使用 UDP 和 TLS。
+9. **AnyTLS**：自动生成密码，使用 TCP 和 TLS。
+10. **VLESS + gRPC + TLS**：自动生成 UUID，填写 gRPC 服务名及证书信息。
+11. **VMess + TCP**：自动生成 UUID，使用 AEAD（alterId 为 0），不额外启用 TLS。
+12. **VMess + TCP + TLS**。
+13. **VMess + WebSocket**：填写 WS 路径，不额外启用 TLS。
+14. **VMess + WebSocket + TLS**。
+15. **VMess + gRPC + TLS**：填写 gRPC 服务名。
+16. **VLESS + gRPC + REALITY**：填写 gRPC 服务名及支持 TLS 1.3 / HTTP/2 的握手域名；自动生成 UUID、密钥及 short ID，**不启用 Vision**。
+
+普通 TLS 模板需要已有的证书域名/IP、服务器上的证书（建议完整证书链）及无口令私钥绝对路径。证书文件可使用 `.pem`、`.cer`、`.crt` 扩展名，私钥通常使用 `.key` 扩展名；证书和私钥的文件内容都必须为 PEM 格式，扩展名不代表实际编码格式。向导检查文件可读性、证书有效期、域名/IP 匹配和密钥配对，随后使用真实核心校验完整配置；失败时不写入配置。客户端导出默认验证证书，不设置 `insecure`。使用自签证书或私有 CA 时，须在客户端另外配置可信证书；分享链接不会包含证书或私钥，也不能代替证书信任配置。证书签发和续期仍由用户管理。
+
+Vision 只用于此处的 TCP + REALITY 模板；gRPC + REALITY 不设置 `flow`。gRPC 服务名须为 1–128 位字母、数字、点、短横线或下划线，并以字母或数字开头，两端须一致。
 
 文件导入使用严格 JSON，不接受注释或 JSONC。单入站导入文件应是包含 `type`、`tag`、`listen_port` 的一个对象，完整配置应是完整对象。相对文件路径按服务工作目录 `/var/lib/sing-box-manager` 解析，证书等文件建议使用绝对路径。
 
@@ -90,13 +109,63 @@ sudo sing-box import /root/config.json
 sudo sing-box validate
 ```
 
-客户端导出用于本脚本四种向导支持的配置结构。其他导入配置不保证能导出；不支持的结构应使用原有客户端配置。导入的 REALITY 节点若没有对应公钥元数据，将拒绝生成不完整客户端信息。导出的 JSON 是 **outbound 对象**，应放入客户端完整配置的 `outbounds` 数组。
+客户端导出支持上述协议向导生成的配置，提供 sing-box outbound JSON 和分享链接（VMess 为 Base64 JSON 链接）。不同客户端对协议及链接格式的支持有差异，以生成的 sing-box JSON 为准。其他导入配置不保证能导出；超出模板的 TLS、传输或认证设置会被拒绝导出。导入的 REALITY 节点若没有对应公钥元数据，将拒绝生成不完整客户端信息。导出的 JSON 是 **outbound 对象**，应放入客户端完整配置的 `outbounds` 数组。
+
+“查看配置 → 1. 配置列表和完整分享链接”会按配置名称显示可整行复制的分享链接，供其他客户端导入。地址优先级为：命令显式传入的地址 → 单个配置保存的地址 → 全局默认地址 → Hysteria 2 当前配置的 `tls.server_name`。因此 Hysteria 2 没有单独填写公网 IP/域名时，可直接用证书域名生成链接；这个域名需解析到实际服务器。REALITY 仍需配置对应的公钥，缺失或过期的连接元数据不会被复用。分享链接含连接凭据，请妥善保管。
+
+通过“查看配置 → 5. 设置默认公网 IP/域名”统一设置一次，已有和新增配置在未指定独立连接地址时都可使用；不修改服务端监听配置，无需重启服务。也可直接运行：
+
+```bash
+sudo sing-box server example.com     # 设置默认域名，也可以填写公网 IP
+sudo sing-box server                 # 交互设置，回车保留当前值
+sudo sing-box server -               # 清除全局默认地址
+```
+
+新增配置时默认显示全局地址；未设置全局地址的 Hysteria 2 显示证书域名作为默认值。选项 3 临时输入的地址不会修改已保存的连接信息。
+
+## 修改已有配置
+
+主菜单选择 **11. 修改配置**，或“查看配置 → 6. 修改配置”，也可运行：
+
+```bash
+sudo sing-box edit                 # 列出配置并选择名称
+sudo sing-box edit my-node         # 直接编辑指定节点
+```
+
+支持所有 14 种当前向导模板，按原协议显示相关字段：名称、监听端口、UUID/密码、WebSocket 路径、gRPC 服务名、TLS 域名和证书/私钥路径、REALITY 握手域名、密钥重新生成、short ID，以及客户端连接地址。回车保留原值；UUID、密码和 short ID 输入不回显，输入 `@new` 可重新生成。REALITY 私钥不直接显示，通过选择“重新生成”同步更新密钥对。客户端地址输入 `-` 可清除节点独立地址，恢复使用全局默认地址或 Hy2 的 SNI 回退。
+
+保存前会确认并校验完整配置。名称或端口与其他节点冲突时拒绝保存；沿用自身端口不会被误判为冲突。仅修改客户端地址不会重启服务；服务端配置改变时，运行中的服务会自动重启，原本停止的服务保持停止。配置和连接元数据一起备份，写入或重启失败时尝试恢复，更新成功后配置列表中的分享链接同步变化。
+
+编辑保留其他节点、节点顺序及未编辑字段，不切换协议类型。原名称被路由或其他配置引用时拒绝直接改名；复杂、多用户或超出向导范围的导入配置请使用完整 JSON 导入。取消编辑不写入配置。修改端口、认证或传输参数后，请重新导入分享链接，并按需调整云安全规则。
 
 服务正在运行时，配置保存成功后自动重启；新配置启动失败会尝试恢复旧配置和服务。服务原本停止时，保存配置不会自动启动。
 
+## 删除、备份恢复、批量导出与诊断
+
+v1.4.0 增加主菜单 **12/13**，也可从“查看配置 → 7/8”进入。命令示例：
+
+```bash
+sudo sing-box delete my-node                   # 确认后删除单个节点
+sudo sing-box backup                           # 输出新建成套备份的绝对路径
+sudo sing-box backups                          # 列出成套备份
+sudo sing-box restore /root/my-backup.json      # 确认后恢复本面板成套备份
+sudo sing-box export links /root/nodes.txt      # 一行一个完整分享链接
+sudo sing-box export base64 /root/nodes.b64     # Base64 编码的链接集合
+sudo sing-box export json /root/outbounds.json # {"outbounds":[...]}，保留节点名称
+sudo sing-box diagnose                         # 只读诊断，发现问题返回非零
+```
+
+删除仅移除指定节点，保留其他节点和顺序；若节点名称被路由或其他配置引用则拒绝操作。删除最后一个节点后配置仍可存在，但不再提供代理入站。删除和恢复都要求终端确认，运行中的服务在配置改变时会短暂重启。
+
+**成套备份**为权限 `600` 的 JSON，位于 `/var/lib/sing-box-manager/backups/bundle-*.json`，包含完整服务端配置、全部节点连接元数据和默认连接地址。新增、删除、恢复操作会先生成一致备份；写入、重启或中断失败时恢复原配置与连接信息。备份含认证信息和 REALITY 私钥，不能公开上传。它**不包含外部 TLS 证书/私钥文件、核心二进制、systemd unit、云规则或定时任务**：跨机恢复必须另行安全保留证书文件并放回原路径，先安装兼容核心。旧版自动保存的单个配置 JSON 仍使用 `sing-box import` 导入，不等同于成套恢复；不会自动删除旧备份。
+
+批量导出默认采用各节点独立地址、全局地址以及 Hy2 SNI 的已有优先级，任何节点无法导出时整个操作失败，不生成缺少节点的文件。输出必须为尚不存在的绝对路径，文件权限为 `600`，不会覆盖已有文件。JSON 是 **outbound 集合**，需要合并到客户端配置，不是完整可直接启动的客户端文件；Base64 是静态链接集合，不创建公网订阅服务，客户端是否支持这种文件格式需另行确认。
+
+只读诊断聚合版本、核心配置校验、运行状态、各节点 TCP/UDP 本机监听、TLS 域名/有效期/密钥配对、14 天到期提醒、系统 CA 证书链验证及客户端导出检查。诊断不打印节点密码、UUID、私钥或分享链接，不自动修改防火墙。系统 CA 验证失败可能是缺中间证书，也可能是自签/私有 CA；不会把这种情况直接判为服务不可用。本机监听不能证明云安全规则已放通，也不能代替真实客户端测试。
+
 ### 网络配置
 
-- 在云安全组和服务器防火墙放行所选监听端口。VLESS 模板使用 TCP，Shadowsocks 模板使用 TCP 和 UDP；脚本不自动修改防火墙。
+- 在云安全组和服务器防火墙放行所选监听端口。VLESS、VMess、AnyTLS 使用 TCP，Hysteria 2 和 TUIC 使用 UDP，Shadowsocks 使用 TCP 和 UDP；脚本不自动修改防火墙。同端口的 TCP/UDP 共用仍按原有保守冲突检查拒绝，请为各节点选择不同端口。
 - WS / TCP 的“无 TLS”模板不提供传输层加密，可用于已有安全隧道或由反向代理提供 TLS 的部署；客户端必须与实际部署一致。
 - REALITY 握手域名由使用者选择，需从服务器访问并适合 TLS 1.3 握手；配置检查不能代替实际连接验证。
 - Shadowsocks 2022 客户端与服务器需保持实际时钟同步，不要求使用相同的显示时区。
@@ -162,7 +231,7 @@ sudo sing-box remove-panel    # 核心已卸载后，移除面板命令
 
 **更新核心：**选择菜单 **10. 更新 sing-box**，或运行 `sudo sing-box update`。可以附加正式版本号，例如 `sudo sing-box update 1.14.3`；指定较旧版本会切换到该版本。更新会检查现有配置与新核心的兼容性，保留原运行状态及开机自启设置，失败时尝试恢复旧核心和服务文件。尚未安装核心时，更新选项会提示先安装。
 
-**更新面板脚本：**重新执行上面的“下载、安装面板并打开菜单”命令即可。已安装旧版面板的用户，需要先更新面板脚本，才能看到新增的菜单 10。菜单 1 仅用于首次安装，已存在核心时会提示改用更新选项。
+**更新面板脚本：**重新执行上面的“下载、安装面板并打开菜单”命令即可。已安装旧版面板的用户，需要先更新面板脚本并重新打开菜单，才能看到新入口。菜单 1 仅用于首次安装，已存在核心时会提示改用更新选项。
 
 ## 验证与限制
 
@@ -175,13 +244,30 @@ python3 -m unittest discover -s tests -v
 SB_TEST_CORE=/absolute/path/to/sing-box python3 -m unittest discover -s tests -v
 # 用真实客户端和服务端核心测试本机回环代理转发：
 python3 tests/smoke_core.py --core /absolute/path/to/sing-box
+# 可选：需要 root + systemd，创建独立临时服务验证真实管理操作，完成后自动清理：
+sudo python3 tests/smoke_management.py --core /absolute/path/to/sing-box
 ```
 
-面板 v1.0.1 已完成 Bash 语法检查、ShellCheck 和 37 项回归测试，回归中使用官方核心 v1.14.3（amd64）检查配置，新增测试覆盖安装与更新分离、未安装时拒绝更新、指定版本传递及菜单 10 的实际调用。首次发布还完成了 VLESS TCP、VLESS WS、Shadowsocks 2022 的真实核心回环转发。REALITY 只完成服务端和客户端配置检查，未进行公网握手验证。仓库的 GitHub Actions 工作流包含静态检查、回归和回环测试；系统服务启停与回滚使用模拟 systemctl 验证。
+测试覆盖安装/更新/卸载和服务命令、14 种协议生成与编辑、客户端分享链接、TLS 检查、默认地址、文件权限、锁竞争、冲突保护和失败恢复。`tests/test_management.py` 补充成套备份、恢复、删除、批量导出、诊断、元数据事务失败与 TERM 中断恢复；离线回归用模拟的 systemctl 验证故障路径。
+
+真实核心回环测试覆盖全部 14 种模板的 HTTP 转发；TCP REALITY Vision 与 gRPC REALITY 使用本地 TLS 1.3 目标验证握手。Hysteria 2、TUIC、Shadowsocks 2022 还通过 SOCKS5 UDP ASSOCIATE 向本机 UDP echo 目标转发并验证精确回包。TLS 客户端显式信任临时测试证书，不使用 `insecure`。
+
+可选的 `smoke_management.py` 创建随机命名的 `sing-box-manager-smoke-*.service`，用真实核心验证新增、修改、删除和恢复后的重启、HTTP 转发，检查三种导出格式的一致性与诊断只读行为；只操作临时配置及临时 unit，不触碰生产服务。测试需要 Python 3、Bash、jq、OpenSSL，以及相应测试所需的 systemd/ss。仓库 GitHub Actions 工作流执行 Bash/ShellCheck、离线回归、真实核心协议回环测试；本轮修复静态检查问题，保留针对 trap 间接调用的局部注释。
 
 离线服务模拟和 `sing-box check` 不能证明服务器网络、目标域名、防火墙及客户端端到端连通性。真机部署后应检查服务日志，并用实际客户端验证连接。支持范围之外的发行版和初始化系统不作兼容承诺。
 
 ## 参考与许可证
+
+2026-10-23 对照同类开源项目，优先补齐单机终端管理的日常缺口：
+
+| 对照功能 | 官方项目证据 | 本项目处理 |
+|---|---|---|
+| 节点增改查删 | [233boy/sing-box](https://github.com/233boy/sing-box/blob/main/README.md) 的 `del` / `ddel` | 增加带引用保护的单节点删除 |
+| 可恢复备份 | [3x-ui 备份恢复文档](https://docs.sanaei.dev/docs/operations/backup-restore/) | 增加配置和客户端元数据成套备份、恢复前备份和失败回滚 |
+| 批量导出/订阅 | [S-UI](https://github.com/alireza0/s-ui/blob/main/README.md) 的 link/json/clash 订阅 | 增加静态 links/base64/outbound JSON 导出，暂不托管 HTTP 订阅 |
+| 调试与状态检查 | [233boy/sing-box](https://github.com/233boy/sing-box/blob/main/README.md) 的 `debug` / `test` | 增加不显示连接凭据的本机诊断 |
+
+暂未纳入：自动 ACME 管理、二维码、多用户流量配额/到期、Web 面板和托管订阅。自动证书管理需要明确现有 acme.sh 的所有权、挑战端口与 DNS 凭据；流量配额需要持久统计和调度，不能仅增加字段。[官方 V2Ray API](https://sing-box.sagernet.org/configuration/experimental/v2ray-api/) 还存在构建能力限制。3x-ui 使用 Xray，仅作管理体验对照，不混用其协议配置。以上功能独立实现，没有复制对照项目代码。
 
 - [sing-box 官方安装与服务管理](https://sing-box.sagernet.org/installation/package-manager/)
 - [sing-box 官方配置文档](https://sing-box.sagernet.org/configuration/)

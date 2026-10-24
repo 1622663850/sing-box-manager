@@ -19,7 +19,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq shellcheck
+          sudo apt-get install -y jq shellcheck openssl
       - name: Bash syntax and static analysis
         run: |
           bash -n sing-box-manager.sh

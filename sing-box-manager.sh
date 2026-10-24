@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.0.1"
+SB_MANAGER_VERSION="1.4.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -13,6 +13,7 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 STATE_DIR="${SB_ROOT_PREFIX}/var/lib/sing-box-manager"
 BACKUP_DIR="$STATE_DIR/backups"
 CLIENT_DIR="$STATE_DIR/clients"
+DEFAULT_SERVER_FILE="$STATE_DIR/default-server"
 UNIT_FILE="${SB_ROOT_PREFIX}/etc/systemd/system/sing-box.service"
 MANAGED_MARKER="$LIB_DIR/.managed"
 SERVICE="sing-box.service"
@@ -29,10 +30,10 @@ require_root() {
 
 require_systemd() {
     [[ $(uname -s) == Linux ]] || { fail "仅支持 Linux。"; return 1; }
-    have systemctl && [[ -d /run/systemd/system ]] || {
+    if ! have systemctl || [[ ! -d /run/systemd/system ]]; then
         fail "需要正在运行的 systemd；不支持 OpenRC/Alpine、OpenWrt 和未启用 systemd 的容器。"
         return 1
-    }
+    fi
 }
 
 is_managed() {
@@ -48,7 +49,7 @@ require_core() {
 safe_paths() {
     local path
     for path in "$LIB_DIR" "$STATE_DIR" "$CONFIG_DIR" "$CLIENT_DIR" "$BACKUP_DIR" \
-        "$CORE_BIN" "$CONFIG_FILE" "$WRAPPER" "$UNIT_FILE" "$MANAGED_MARKER"; do
+        "$CORE_BIN" "$CONFIG_FILE" "$WRAPPER" "$UNIT_FILE" "$MANAGED_MARKER" "$DEFAULT_SERVER_FILE"; do
         [[ ! -L "$path" ]] || { fail "拒绝操作符号链接：$path"; return 1; }
     done
 }
@@ -132,12 +133,44 @@ valid_port() {
 
 valid_tag() { [[ ${1:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]]; }
 valid_host() {
-    # Hosts only, never host:port or a URL. IPv6 is supplied without brackets.
-    [[ -n ${1:-} && ${#1} -le 253 ]] || return 1
-    if [[ $1 == *:* ]]; then
-        [[ $1 =~ ^[a-fA-F0-9:]+$ && $1 == *:*:* ]]
+    local host=${1:-} part count=0 compressed=0 tail
+    local -a parts
+    [[ -n $host && ${#host} -le 253 ]] || return 1
+    if [[ $host == *:* ]]; then
+        # IPv4-mapped addresses consume two IPv6 groups.
+        if [[ $host == *.* ]]; then
+            tail=${host##*:}
+            [[ $tail =~ ^[0-9.]+$ ]] && valid_host "$tail" || return 1
+            host="${host%:*}:0:0"
+        fi
+        [[ $host =~ ^[a-fA-F0-9:]+$ && $host != *:::* ]] || return 1
+        [[ $host != :* || $host == ::* ]] && [[ $host != *: || $host == *:: ]] || return 1
+        if [[ $host == *::* ]]; then
+            tail=${host#*::}
+            [[ $tail != *::* ]] || return 1
+            compressed=1
+        else
+            [[ $host != :* && $host != *: ]] || return 1
+        fi
+        IFS=: read -r -a parts <<< "$host"
+        for part in "${parts[@]}"; do
+            [[ -n $part ]] || continue
+            [[ ${#part} -le 4 ]] || return 1
+            count=$((count + 1))
+        done
+        if [[ $compressed -eq 1 ]]; then ((count < 8)); else ((count == 8)); fi
+    elif [[ $host =~ ^[0-9.]+$ ]]; then
+        [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+        IFS=. read -r -a parts <<< "$host"
+        for part in "${parts[@]}"; do
+            [[ ${#part} -le 3 && ( $part == 0 || $part != 0* ) ]] && ((10#$part <= 255)) || return 1
+        done
     else
-        [[ $1 =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ && $1 != *..* ]]
+        [[ $host != .* && $host != *. && $host != *..* ]] || return 1
+        IFS=. read -r -a parts <<< "$host"
+        for part in "${parts[@]}"; do
+            [[ ${#part} -le 63 && $part =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+        done
     fi
 }
 
@@ -180,11 +213,33 @@ atomic_copy() {
 
 commit_config() (
     umask 077
-    local candidate=$1 active=0 old_exists=0 snapshot backup
+    local candidate=$1 active=0 old_exists=0 snapshot backup="" transaction=0
     safe_paths || exit 1
     install -d -m 700 "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR" || exit 1
     snapshot=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX") || exit 1
-    trap 'rm -f -- "$snapshot"' EXIT
+    # shellcheck disable=SC2317,SC2329 # Called by the EXIT trap.
+    rollback_config() {
+        local result=$? restored=1
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            warn "配置提交未完成，正在回滚。"
+            if [[ $old_exists -eq 1 ]]; then
+                atomic_copy "$backup" "$CONFIG_FILE" || restored=0
+                if [[ $active -eq 1 && $restored -eq 1 ]]; then restart_checked || restored=0; fi
+            else
+                rm -f -- "$CONFIG_FILE" || restored=0
+                systemctl stop "$SERVICE" || restored=0
+            fi
+            if [[ $restored -eq 1 ]]; then warn "已恢复原配置。"
+            else fail "自动恢复失败，请检查备份：$backup"; fi
+            result=1
+        fi
+        rm -f -- "$snapshot"
+        exit "$result"
+    }
+    trap rollback_config EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     cp -- "$candidate" "$snapshot" || exit 1
     validate_config "$snapshot" || { fail "配置检查未通过，现有配置未修改。"; exit 1; }
     service_is_active && active=1
@@ -193,22 +248,10 @@ commit_config() (
         backup=$(mktemp "$BACKUP_DIR/config-$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || exit 1
         install -m 600 "$CONFIG_FILE" "$backup" || exit 1
     fi
+    transaction=1
     chmod 600 "$snapshot" && mv -f -- "$snapshot" "$CONFIG_FILE" || exit 1
-    if [[ $active -eq 1 ]] && ! restart_checked; then
-        warn "新配置启动失败，正在回滚。"
-        if [[ $old_exists -eq 1 ]]; then
-            atomic_copy "$backup" "$CONFIG_FILE" || { fail "回滚文件失败，备份位于 $backup"; exit 1; }
-            if ! restart_checked; then
-                fail "已恢复旧配置，但服务未恢复。请执行 sing-box log 并检查。"
-                exit 1
-            fi
-        else
-            rm -f -- "$CONFIG_FILE"
-            systemctl stop "$SERVICE" || true
-        fi
-        fail "新配置未生效，已恢复原配置。"
-        exit 1
-    fi
+    if [[ $active -eq 1 ]]; then restart_checked || exit 1; fi
+    transaction=0
     [[ $old_exists -eq 0 ]] || info "旧配置已备份：$backup"
     if [[ $active -eq 1 ]]; then
         info "配置已保存，服务已重新启动。"
@@ -247,42 +290,95 @@ import_config() {
     commit_config "$1"
 }
 
+validate_tls_files() {
+    local name=$1 certificate=$2 key=$3 cert_public key_public start match_option=-checkhost
+    valid_host "$name" || { fail "TLS 证书域名/IP 无效。"; return 1; }
+    [[ $certificate == /* && -f $certificate && -r $certificate &&
+       $key == /* && -f $key && -r $key ]] || {
+        fail "请提供可读的证书和私钥文件绝对路径。"; return 1;
+    }
+    [[ $name != *:* && ! $name =~ ^[0-9.]+$ ]] || match_option=-checkip
+    if ! openssl x509 -in "$certificate" -noout -checkend 0 >/dev/null 2>&1 ||
+       ! openssl x509 -in "$certificate" -noout "$match_option" "$name" >/dev/null 2>&1; then
+        fail "证书无效、已过期或不匹配 TLS 域名/IP。"; return 1
+    fi
+    start=$(openssl x509 -in "$certificate" -noout -startdate 2>/dev/null) || return 1
+    start=$(date -d "${start#notBefore=}" +%s 2>/dev/null) || return 1
+    [[ $start -le $(date +%s) ]] || { fail "证书尚未生效，请检查证书起始日期和服务器时间。"; return 1; }
+    cert_public=$(openssl x509 -in "$certificate" -pubkey -noout 2>/dev/null) || return 1
+    key_public=$(openssl pkey -in "$key" -passin pass: -pubout 2>/dev/null) || {
+        fail "私钥无效或需要口令；服务需要可直接读取的私钥。"; return 1;
+    }
+    [[ -n $cert_public && $cert_public == "$key_public" ]] || {
+        fail "证书与私钥不匹配。"; return 1;
+    }
+}
+
 generate_inbound() {
     local protocol=$1 tag=$2 port=$3 credential=${4:-} extra=${5:-} private_key=${6:-} short_id=${7:-}
+    local tls_name=${8:-} certificate=${9:-} tls_key=${10:-} password=${11:-} type transport="" security=""
     if ! valid_tag "$tag" || ! valid_port "$port"; then fail "无效的 tag 或端口。"; return 1; fi
     port=$((10#$port))
     case "$protocol" in
-        vless-tcp|vless-ws|vless-reality)
-            [[ $credential =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || {
-                fail "UUID 格式错误。"; return 1;
-            }
-            if [[ $protocol == vless-ws && $extra != /* ]]; then
-                fail "WebSocket 路径必须以 / 开头。"; return 1
-            fi
-            if [[ $protocol == vless-reality ]]; then
-                valid_host "$extra" && [[ $private_key =~ ^[a-zA-Z0-9_-]{43}$ ]] && \
-                    [[ $short_id =~ ^([[:xdigit:]]{2}){1,8}$ ]] || {
-                    fail "REALITY 的域名、私钥或 short_id 无效。"; return 1;
-                }
-            fi
-            jq -n --arg protocol "$protocol" --arg tag "$tag" --argjson port "$port" \
-                --arg uuid "$credential" --arg extra "$extra" --arg key "$private_key" --arg sid "$short_id" '
-                {type:"vless",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid}]}
-                | if $protocol == "vless-ws" then .transport = {type:"ws",path:$extra}
-                  elif $protocol == "vless-reality" then
-                    .users[0].flow = "xtls-rprx-vision"
-                    | .tls = {enabled:true,server_name:$extra,reality:{enabled:true,
-                        handshake:{server:$extra,server_port:443},private_key:$key,short_id:[$sid]}}
-                  else . end'
-            ;;
-        shadowsocks)
-            [[ -n $credential ]] || { fail "密码不能为空。"; return 1; }
-            jq -n --arg tag "$tag" --argjson port "$port" --arg password "$credential" \
-                '{type:"shadowsocks",tag:$tag,listen:"::",listen_port:$port,
-                  method:"2022-blake3-aes-128-gcm",password:$password}'
-            ;;
+        vless-tcp) type=vless ;;
+        vless-ws) type=vless; transport=ws ;;
+        vless-reality) type=vless; security=reality; tls_name=$extra ;;
+        vless-grpc-reality) type=vless; transport=grpc; security=reality ;;
+        vless-grpc-tls) type=vless; transport=grpc; security=tls ;;
+        vmess-tcp) type=vmess ;;
+        vmess-tcp-tls) type=vmess; security=tls ;;
+        vmess-ws) type=vmess; transport=ws ;;
+        vmess-ws-tls) type=vmess; transport=ws; security=tls ;;
+        vmess-grpc-tls) type=vmess; transport=grpc; security=tls ;;
+        hysteria2|tuic|anytls) type=$protocol; security=tls ;;
+        shadowsocks) type=shadowsocks ;;
+        vless-grpc-reality-vision)
+            fail "Vision 不支持 gRPC 传输，请使用 TCP + REALITY + Vision。"; return 1 ;;
         *) fail "不支持的生成模板：$protocol"; return 1 ;;
     esac
+    case "$type" in
+        vless|vmess|tuic)
+            [[ $credential =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || {
+                fail "UUID 格式错误。"; return 1;
+            } ;;
+        *) [[ -n $credential ]] || { fail "密码不能为空。"; return 1; } ;;
+    esac
+    [[ $type != tuic || -n $password ]] || { fail "TUIC 密码不能为空。"; return 1; }
+    if [[ $transport == ws && $extra != /* ]]; then
+        fail "WebSocket 路径必须以 / 开头。"; return 1
+    fi
+    if [[ $transport == grpc && ! $extra =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]]; then
+        fail "gRPC 服务名须为 1–128 位字母、数字、点、短横线或下划线，且以字母或数字开头。"; return 1
+    fi
+    if [[ $security == reality ]]; then
+        if ! valid_host "$tls_name" || [[ ! $private_key =~ ^[a-zA-Z0-9_-]{43}$ ||
+            ! $short_id =~ ^([[:xdigit:]]{2}){1,8}$ ]]; then
+            fail "REALITY 的域名、私钥或 short_id 无效。"; return 1
+        fi
+    elif [[ $security == tls ]]; then
+        validate_tls_files "$tls_name" "$certificate" "$tls_key" || return
+    fi
+    jq -n --arg type "$type" --arg tag "$tag" --argjson port "$port" --arg credential "$credential" \
+        --arg transport "$transport" --arg extra "$extra" --arg security "$security" --arg name "$tls_name" \
+        --arg key "$private_key" --arg sid "$short_id" --arg cert "$certificate" --arg tlskey "$tls_key" \
+        --arg password "$password" '
+        {type:$type,tag:$tag,listen:"::",listen_port:$port}
+        | if $type == "vless" or $type == "vmess" then .users=[{uuid:$credential}]
+          elif $type == "tuic" then .users=[{uuid:$credential,password:$password}] | .congestion_control="cubic"
+          elif $type == "shadowsocks" then .method="2022-blake3-aes-128-gcm" | .password=$credential
+          else .users=[{password:$credential}] end
+        | if $type == "vmess" then .users[0].alterId=0 else . end
+        | if $transport == "ws" then .transport={type:"ws",path:$extra}
+          elif $transport == "grpc" then .transport={type:"grpc",service_name:$extra} else . end
+        | if $security == "reality" then
+            (if $transport == "" then .users[0].flow="xtls-rprx-vision" else . end)
+            | .tls={enabled:true,server_name:$name,reality:{enabled:true,
+                handshake:{server:$name,server_port:443},private_key:$key,short_id:[$sid]}}
+          elif $security == "tls" then
+            .tls={enabled:true,server_name:$name,certificate_path:$cert,key_path:$tlskey}
+          else . end
+        | if $transport == "grpc" then .tls.alpn=["h2"]
+          elif $type == "hysteria2" or $type == "tuic" then .tls.alpn=["h3"] else . end'
 }
 
 service_action() {
@@ -329,7 +425,7 @@ detect_arch() {
 
 download_core() {
     local destination=$1 requested=${2:-latest} arch release tag asset url digest version
-    arch=$(detect_arch) || return
+    arch=$(detect_arch "$(uname -m)") || return
     if [[ $requested == latest ]]; then
         release=https://api.github.com/repos/SagerNet/sing-box/releases/latest
     else
@@ -419,7 +515,7 @@ install_core_locked() (
     work=$(mktemp -d "$STATE_DIR/install.XXXXXX") || exit 1
     local transaction=0
     # One cleanup path handles command errors, SIGINT/SIGTERM and failed health checks.
-    # shellcheck disable=SC2329 # Invoked by EXIT/INT/TERM traps below.
+    # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
     rollback_install() {
         local result=$? rollback_ok=1
         trap - EXIT INT TERM
@@ -560,57 +656,370 @@ prompt() {
     local variable=$1 message=$2 default=${3:-} input
     [[ -t 0 ]] || { fail "交互添加需要终端；批量操作可用 add-file/import 命令。"; return 1; }
     if [[ -n $default ]]; then
-        read -r -p "$message [$default]: " input || return 1
+        read -e -r -p "$message [$default]: " input || return 1
     else
-        read -r -p "$message: " input || return 1
+        read -e -r -p "$message: " input || return 1
     fi
     printf -v "$variable" '%s' "${input:-$default}"
 }
+
+read_default_server() {
+    local server
+    [[ -e $DEFAULT_SERVER_FILE || -L $DEFAULT_SERVER_FILE ]] || return 0
+    [[ -f $DEFAULT_SERVER_FILE && ! -L $DEFAULT_SERVER_FILE ]] || {
+        fail "默认连接地址文件无效或为符号链接。"; return 1;
+    }
+    server=$(cat "$DEFAULT_SERVER_FILE") || return
+    valid_host "$server" || { fail "默认连接地址格式无效，请重新设置。"; return 1; }
+    printf '%s\n' "$server"
+}
+
+prompt_secret() {
+    local variable=$1 message=$2 default=${3:-} input
+    [[ -t 0 ]] || { fail "修改认证信息需要交互终端。"; return 1; }
+    IFS= read -e -r -s -p "$message: " input || { printf '\n' >&2; return 1; }
+    printf '\n' >&2
+    printf -v "$variable" '%s' "${input:-$default}"
+}
+
+detect_inbound_template() {
+    jq -er '
+      if .type == "shadowsocks" and .method == "2022-blake3-aes-128-gcm" and .users == null then "shadowsocks"
+      elif (.users | length) != 1 then error("single-user templates only")
+      elif .type == "hysteria2" or .type == "tuic" or .type == "anytls" then
+        if .tls.enabled == true then .type else error("TLS required") end
+      elif .type == "vless" then
+        if .tls.reality.enabled == true then
+          if .transport == null and .users[0].flow == "xtls-rprx-vision" then "vless-reality"
+          elif .transport.type == "grpc" and (.users[0].flow // "") == "" then "vless-grpc-reality"
+          else error("unsupported REALITY transport/flow") end
+        elif (.users[0].flow // "") != "" then error("unsupported flow")
+        elif .transport.type == "grpc" and .tls.enabled == true then "vless-grpc-tls"
+        elif .tls.enabled != true and .transport.type == "ws" then "vless-ws"
+        elif .tls.enabled != true and .transport == null then "vless-tcp"
+        else error("unsupported VLESS template") end
+      elif .type == "vmess" and (.users[0].alterId // 0) == 0 then
+        (if .transport == null then "vmess-tcp"
+         elif .transport.type == "ws" then "vmess-ws"
+         elif .transport.type == "grpc" and .tls.enabled == true then "vmess-grpc"
+         else error("unsupported VMess transport") end)
+        + (if .tls.enabled == true then "-tls" else "" end)
+      else error("unsupported template") end' "$1" 2>/dev/null || {
+        fail "该配置不属于当前支持的单用户向导模板，请通过完整 JSON 导入修改。"; return 1;
+    }
+}
+
+replace_inbound_file() (
+    umask 077
+    local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
+    local tag port old_port work snapshot old_metadata new_metadata effective backup=""
+    local transaction=0 old_metadata_exists=0 active=0 changed=0
+    require_core && safe_paths || exit 1
+    valid_tag "$old_tag" || { fail "原配置名称无效。"; exit 1; }
+    jq -e 'type == "object" and (.tag|type == "string") and (.listen_port|type == "number")' "$file" >/dev/null || exit 1
+    tag=$(jq -r .tag "$file") && port=$(jq -r .listen_port "$file") || exit 1
+    if ! valid_tag "$tag" || ! valid_port "$port"; then fail "名称或端口无效。"; exit 1; fi
+    [[ -z $server ]] || valid_host "$server" || { fail "客户端连接地址无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/edit-save.XXXXXX") || exit 1
+    # The outer command holds manager.lock across config and metadata changes.
+    # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
+    rollback_edit() {
+        local result=$? rollback_ok=1
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            if ! cmp -s "$backup/config.json" "$CONFIG_FILE"; then
+                atomic_copy "$backup/config.json" "$CONFIG_FILE" 600 || rollback_ok=0
+                if [[ $active -eq 1 ]]; then restart_checked || rollback_ok=0
+                else systemctl stop "$SERVICE" || rollback_ok=0; fi
+            elif [[ $active -eq 1 ]] && ! service_is_active; then
+                restart_checked || rollback_ok=0
+            fi
+            if [[ $old_metadata_exists -eq 1 ]]; then
+                if ! cmp -s "$backup/metadata.json" "$old_metadata"; then
+                    atomic_copy "$backup/metadata.json" "$old_metadata" 600 || rollback_ok=0
+                fi
+            else
+                rm -f -- "$old_metadata" || rollback_ok=0
+            fi
+            [[ $tag == "$old_tag" ]] || rm -f -- "$new_metadata" || rollback_ok=0
+            if [[ $rollback_ok -eq 1 ]]; then warn "修改失败，已恢复原配置及连接信息。"
+            else warn "自动恢复未完全成功，请使用备份检查恢复：$backup"; fi
+            result=1
+        fi
+        rm -rf -- "$work"
+        exit "$result"
+    }
+    trap rollback_edit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    snapshot="$work/original.json"
+    cp -- "$CONFIG_FILE" "$snapshot" || exit 1
+    jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
+        "$snapshot" >"$work/old-inbound.json" || exit 1
+    if [[ -n $expected && $(jq -Sc . "$expected") != "$(jq -Sc . "$work/old-inbound.json")" ]]; then
+        fail "选中的配置在编辑期间已被修改，请重新打开编辑。"; exit 1
+    fi
+    [[ $(detect_inbound_template "$file") == "$(detect_inbound_template "$work/old-inbound.json")" ]] || {
+        fail "修改配置不切换协议类型，请分别添加所需协议。"; exit 1;
+    }
+    detect_inbound_template "$file" >/dev/null || exit 1
+    if jq -e --arg old "$old_tag" --arg tag "$tag" --argjson port "$port" \
+        'any(.inbounds[]?; .tag != $old and (.tag==$tag or .listen_port==$port))' "$snapshot" >/dev/null; then
+        fail "其他配置已使用该名称或端口。"; exit 1
+    fi
+    if [[ $tag != "$old_tag" ]] && jq -e --arg old "$old_tag" \
+        'del(.inbounds[] | select(.tag==$old)) | any(.. | strings; .==$old)' "$snapshot" >/dev/null; then
+        fail "原名称被路由或其他配置引用，请保留名称或通过完整 JSON 同步修改引用。"; exit 1
+    fi
+    old_port=$(jq -r .listen_port "$work/old-inbound.json") || exit 1
+    if [[ $port != "$old_port" ]] && have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then
+        fail "端口 $port 正被其他服务占用。"; exit 1
+    fi
+    old_metadata="$CLIENT_DIR/$old_tag.json"
+    new_metadata="$CLIENT_DIR/$tag.json"
+    [[ ! -L $old_metadata && ! -L $new_metadata ]] || { fail "拒绝操作连接信息符号链接。"; exit 1; }
+    [[ ! -e $old_metadata || -f $old_metadata ]] || { fail "原连接信息不是普通文件。"; exit 1; }
+    [[ $tag == "$old_tag" || ! -e $new_metadata ]] || { fail "新名称已有连接信息文件，请使用其他名称。"; exit 1; }
+    effective=$server
+    [[ -n $effective ]] || effective=$(read_default_server) || exit 1
+    if [[ -z $effective && $(jq -r .type "$file") == hysteria2 ]]; then effective=$(jq -r '.tls.server_name // ""' "$file"); fi
+    generate_client "$file" "${effective:-example.invalid}" "$public_key" >"$work/client-check.json" || exit 1
+    jq --arg old "$old_tag" --slurpfile node "$file" \
+        '.inbounds |= map(if .tag==$old then $node[0] else . end)' "$snapshot" >"$work/candidate.json" || exit 1
+    validate_config "$work/candidate.json" || exit 1
+    if [[ -f $old_metadata ]]; then
+        old_metadata_exists=1
+        jq -e 'type == "object"' "$old_metadata" >/dev/null || exit 1
+        cp -- "$old_metadata" "$work/metadata-before.json" || exit 1
+    else printf '{}\n' >"$work/metadata-before.json"; fi
+    jq --arg server "$server" --arg key "$public_key" --slurpfile node "$file" \
+        '.server=$server | .public_key=$key | .inbound=$node[0]' "$work/metadata-before.json" >"$work/metadata.json" || exit 1
+    [[ $(jq -Sc . "$snapshot") == "$(jq -Sc . "$work/candidate.json")" ]] || changed=1
+    if [[ $changed -eq 0 && $old_metadata_exists -eq 1 &&
+          $(jq -Sc . "$work/metadata-before.json") == "$(jq -Sc . "$work/metadata.json")" ]]; then
+        info "配置没有变化。"; exit 0
+    fi
+    cmp -s "$CONFIG_FILE" "$snapshot" || { fail "配置已被其他程序修改，已取消保存。"; exit 1; }
+    [[ $old_metadata_exists -eq 0 ]] || cmp -s "$old_metadata" "$work/metadata-before.json" || {
+        fail "连接信息已被其他程序修改，已取消保存。"; exit 1;
+    }
+    backup=$(mktemp -d "$BACKUP_DIR/edit-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
+    install -m 600 "$snapshot" "$backup/config.json" || exit 1
+    [[ $old_metadata_exists -eq 0 ]] || install -m 600 "$old_metadata" "$backup/metadata.json" || exit 1
+    service_is_active && active=1
+    install -d -m 700 "$CLIENT_DIR" || exit 1
+    transaction=1
+    atomic_copy "$work/metadata.json" "$new_metadata" 600 || exit 1
+    [[ $changed -eq 0 ]] || commit_config "$work/candidate.json" || exit 1
+    [[ $tag == "$old_tag" ]] || rm -f -- "$old_metadata" || exit 1
+    transaction=0
+    info "已修改 $tag；连接信息已同步。备份：$backup"
+    [[ $port == "$old_port" ]] || info "监听端口已变更，请同步云平台和服务器防火墙规则，并重新导入客户端链接。"
+    [[ $changed -ne 0 ]] || info "仅更新客户端连接信息，未重启服务。"
+)
+
+edit_wizard_locked() (
+    umask 077
+    require_core || exit 1
+    local old_tag=${1:-} tag port protocol work metadata server="" public_key="" credential extra=""
+    local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" rotation pair
+    [[ $# -le 1 ]] || { fail "用法：sing-box edit [配置名称]"; exit 1; }
+    if [[ -z $old_tag ]]; then
+        jq -r '["名称","协议","端口"],(.inbounds[]? | [.tag,.type,.listen_port]) | @tsv' "$CONFIG_FILE"
+        prompt old_tag "请输入要修改的配置名称（0 返回）" || exit 1
+        [[ $old_tag != 0 ]] || exit 0
+    fi
+    valid_tag "$old_tag" || { fail "配置名称无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/edit-wizard.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
+        "$CONFIG_FILE" >"$work/original.json" || exit 1
+    protocol=$(detect_inbound_template "$work/original.json") || exit 1
+    tag=$old_tag
+    port=$(jq -r .listen_port "$work/original.json")
+    credential=$(jq -r '.users[0].uuid // .users[0].password // .password // ""' "$work/original.json")
+    password=$(jq -r '.users[0].password // ""' "$work/original.json")
+    extra=$(jq -r '.transport.path // .transport.service_name // ""' "$work/original.json")
+    tls_name=$(jq -r '.tls.server_name // .tls.reality.handshake.server // ""' "$work/original.json")
+    private_key=$(jq -r '.tls.reality.private_key // ""' "$work/original.json")
+    short_id=$(jq -r '.tls.reality.short_id[0] // ""' "$work/original.json")
+    certificate=$(jq -r '.tls.certificate_path // ""' "$work/original.json")
+    tls_key=$(jq -r '.tls.key_path // ""' "$work/original.json")
+    metadata="$CLIENT_DIR/$old_tag.json"
+    [[ ! -L $metadata ]] || { fail "拒绝读取连接信息符号链接。"; exit 1; }
+    if [[ -f $metadata && $(jq -Sc .inbound "$metadata") == "$(jq -Sc . "$work/original.json")" ]]; then
+        server=$(jq -r '.server // ""' "$metadata")
+        public_key=$(jq -r '.public_key // ""' "$metadata")
+    fi
+    info "修改 $old_tag（$protocol）：回车保留原值；认证信息不回显，输入 @new 可重新生成。"
+    prompt tag "配置名称" "$tag" && prompt port "监听端口" "$port" || exit 1
+    if ! valid_tag "$tag" || ! valid_port "$port"; then fail "名称或端口无效。"; exit 1; fi
+    case "$protocol" in
+        vless-*|vmess-*|tuic)
+            prompt_secret credential "UUID（回车保留，@new 重新生成）" "$credential" || exit 1
+            [[ $credential != @new ]] || credential=$("$CORE_BIN" generate uuid) || exit 1 ;;
+        *)
+            prompt_secret credential "密码（回车保留，@new 重新生成）" "$credential" || exit 1
+            [[ $credential != @new ]] || credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
+    esac
+    if [[ $protocol == tuic ]]; then
+        prompt_secret password "TUIC 密码（回车保留，@new 重新生成）" "$password" || exit 1
+        [[ $password != @new ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+    fi
+    case "$protocol" in
+        *-ws|*-ws-tls) prompt extra "WebSocket 路径" "$extra" || exit 1 ;;
+        *-grpc-*) prompt extra "gRPC 服务名" "$extra" || exit 1 ;;
+    esac
+    case "$protocol" in
+        vless-reality|vless-grpc-reality)
+            prompt tls_name "REALITY 握手域名" "$tls_name" || exit 1
+            [[ $protocol != vless-reality ]] || extra=$tls_name
+            prompt rotation "REALITY 密钥：1 保留，2 重新生成" 1 || exit 1
+            case "$rotation" in
+                1)
+                    [[ -n $public_key ]] || prompt_secret public_key "缺少当前密钥对应公钥，请填写原公钥（或退出后选择重新生成）" || exit 1 ;;
+                2)
+                    pair=$("$CORE_BIN" generate reality-keypair) || exit 1
+                    private_key=$(printf '%s\n' "$pair" | sed -n 's/^PrivateKey: *//p')
+                    public_key=$(printf '%s\n' "$pair" | sed -n 's/^PublicKey: *//p') ;;
+                *) fail "无效的密钥操作。"; exit 1 ;;
+            esac
+            prompt_secret short_id "REALITY short ID（回车保留，@new 重新生成）" "$short_id" || exit 1
+            [[ $short_id != @new ]] || short_id=$(openssl rand -hex 8) || exit 1
+            ;;
+        *-tls|hysteria2|tuic|anytls)
+            prompt tls_name "TLS 证书域名/IP（客户端 SNI）" "$tls_name" || exit 1
+            prompt certificate "证书/完整证书链路径（.pem/.cer/.crt，内容须为 PEM；建议 fullchain）" "$certificate" || exit 1
+            prompt tls_key "私钥路径（.key，内容须为 PEM 且无口令）" "$tls_key" || exit 1
+            ;;
+    esac
+    prompt server "客户端连接地址（回车保留，- 清除独立地址并使用默认）" "$server" || exit 1
+    [[ $server != - ]] || server=""
+    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$short_id" \
+        "$tls_name" "$certificate" "$tls_key" "$password" >"$work/generated.json" || exit 1
+    # Overlay only template fields; preserve listen options, user names, TLS ALPN,
+    # and a non-default REALITY handshake port from an imported configuration.
+    jq --slurpfile updated "$work/generated.json" '
+        . as $old | . * $updated[0]
+        | .listen = $old.listen
+        | if $old.users != null then .users=[($old.users[0] * $updated[0].users[0])] else . end
+        | if $old.tls.alpn != null then .tls.alpn=$old.tls.alpn else . end
+        | if $old.tls.reality.handshake.server_port != null then
+            .tls.reality.handshake.server_port=$old.tls.reality.handshake.server_port else . end
+        | if $old.type == "tuic" and $old.congestion_control != null then .congestion_control=$old.congestion_control else . end
+        | if $old.listen == null then del(.listen) else . end' "$work/original.json" >"$work/updated.json" || exit 1
+    info "待保存：$old_tag → $tag，端口 $port。"
+    if ! confirm "保存修改？运行中的服务将按需重启，失败时回滚；修改认证或端口后需重新导入客户端链接。"; then
+        info "已取消，配置未修改。"; exit 0
+    fi
+    replace_inbound_file "$old_tag" "$work/updated.json" "$server" "$public_key" "$work/original.json"
+)
+
+set_default_server() (
+    umask 077
+    local server=${1:-} current work
+    [[ $# -le 1 ]] || { fail "用法：sing-box server [公网 IP/域名|-]"; exit 1; }
+    safe_paths || exit 1
+    if [[ $# -eq 0 ]]; then
+        current=$(read_default_server) || exit 1
+        prompt server "默认连接地址（公网 IP/域名；输入 - 清除）" "$current" || exit 1
+    fi
+    if [[ $server == - ]]; then
+        rm -f -- "$DEFAULT_SERVER_FILE" || exit 1
+        info "已清除默认连接地址。Hysteria 2 未指定地址时仍使用证书域名。"
+        exit 0
+    fi
+    valid_host "$server" || { fail "请输入有效的公网 IP 或域名，不含协议和端口。"; exit 1; }
+    work=$(mktemp "$STATE_DIR/.default-server.XXXXXX") || exit 1
+    trap 'rm -f -- "$work"' EXIT
+    printf '%s\n' "$server" >"$work" || exit 1
+    atomic_copy "$work" "$DEFAULT_SERVER_FILE" 600 || exit 1
+    info "默认连接地址已设置：$server"
+    info "未指定连接地址的配置将使用此地址，已有独立地址优先；无需重启服务。"
+)
 
 generate_client() {
     local inbound=$1 server=$2 public_key=${3:-}
     valid_host "$server" || { fail "服务器地址格式无效。"; return 1; }
     # Import supports all core schemas, but export must never silently drop security options.
     jq -e '
-      if .type == "vless" then
+      def transport_ok:
+        .transport == null or
+        (.transport.type == "ws" and (.transport | keys - ["type","path"] | length == 0)) or
+        (.transport.type == "grpc" and .tls.enabled == true and
+          (.transport.service_name | type == "string" and length > 0) and
+          (.transport | keys - ["type","service_name"] | length == 0));
+      def tls_ok:
+        if .tls.enabled == true then
+          (.tls.server_name | type == "string" and length > 0) and
+          ((.tls.alpn // []) | type == "array" and all(.[]; type == "string")) and
+          (if .tls.reality.enabled == true then
+             .type == "vless" and
+             (.tls | keys - ["enabled","server_name","reality","alpn"] | length == 0) and
+             (.tls.reality | keys - ["enabled","handshake","private_key","short_id"] | length == 0) and
+             (.tls.reality.short_id | length == 1) and
+             ((.transport == null and .users[0].flow == "xtls-rprx-vision") or
+              (.transport.type == "grpc" and (.users[0].flow // "") == ""))
+           else
+             (.tls | keys - ["enabled","server_name","certificate_path","key_path","alpn"] | length == 0)
+           end)
+        else .tls == null or .tls == {enabled:false} end;
+      (.multiplex == null or .multiplex == {enabled:false}) and transport_ok and tls_ok and
+      (if .type == "vless" or .type == "vmess" then
         (.users | length == 1) and
-        ((.transport // {}) | keys - ["type","path"] | length == 0) and
-        (.transport == null or .transport.type == "ws") and
-        (.multiplex == null or .multiplex.enabled == false) and
-        (if .tls.enabled == true then
-            .tls.reality.enabled == true and .transport == null and
-            .users[0].flow == "xtls-rprx-vision" and
-            (.tls.reality.short_id | length == 1)
-         else (.users[0].flow // "") == "" end)
+        (.users[0] | keys - ["name","uuid","flow","alterId"] | length == 0) and
+        (.users[0].uuid | type == "string" and length > 0) and
+        (if .type == "vmess" then (.users[0].alterId // 0) == 0 and .users[0].flow == null
+         elif .tls.reality.enabled != true then (.users[0].flow // "") == "" else true end)
       elif .type == "shadowsocks" then
         .method == "2022-blake3-aes-128-gcm" and .users == null and .destinations == null and
-        (.multiplex == null or .multiplex.enabled == false)
-      else false end' "$inbound" >/dev/null || {
+        .tls == null and .transport == null
+      elif .type == "hysteria2" or .type == "tuic" or .type == "anytls" then
+        (.users | length == 1) and
+        (.users[0] | keys - ["name","uuid","password"] | length == 0) and
+        (.users[0].password | type == "string" and length > 0) and
+        .tls.enabled == true and .transport == null and
+        .obfs == null and .realm == null and .masquerade == null and .padding_scheme == null and
+        (if .type == "tuic" then (.users[0].uuid | type == "string" and length > 0) else true end)
+      else false end)' "$inbound" >/dev/null || {
         fail "该导入配置超出客户端导出模板范围，请按原始配置设置客户端；不会忽略 TLS 或其他安全字段。"
         return 1
     }
     if [[ $(jq -r '.tls.reality.enabled // false' "$inbound") == true && ! $public_key =~ ^[a-zA-Z0-9_-]{43}$ ]]; then
         fail "缺少有效的 REALITY 公钥。"; return 1
     fi
+    if [[ $(jq -r '.tls.enabled // false' "$inbound") == true &&
+          $(jq -r '.tls.reality.enabled // false' "$inbound") != true ]]; then
+        validate_tls_files "$(jq -r '.tls.server_name' "$inbound")" \
+            "$(jq -r '.tls.certificate_path // ""' "$inbound")" \
+            "$(jq -r '.tls.key_path // ""' "$inbound")" || return
+    fi
     jq --arg server "$server" --arg key "$public_key" '
         . as $in | {tag:"proxy",type:.type,server:$server,server_port:.listen_port}
-        | if .type == "vless" then
+        | if .type == "vless" or .type == "vmess" then
             .uuid = $in.users[0].uuid
             | if $in.transport != null then .transport = $in.transport else . end
-            | if $in.tls.reality.enabled == true then
-                .flow = $in.users[0].flow
-                | .tls = {enabled:true,server_name:$in.tls.server_name,
-                    utls:{enabled:true,fingerprint:"chrome"},
-                    reality:{enabled:true,public_key:$key,short_id:$in.tls.reality.short_id[0]}}
-              else . end
+            | if .type == "vmess" then .security="auto" | .alter_id=0
+              elif ($in.users[0].flow // "") != "" then .flow=$in.users[0].flow else . end
           elif .type == "shadowsocks" then .method=$in.method | .password=$in.password
-          else error("no client template for this protocol") end' "$inbound"
+          elif .type == "tuic" then
+            .uuid=$in.users[0].uuid | .password=$in.users[0].password
+            | .congestion_control=($in.congestion_control // "cubic")
+          else .password=$in.users[0].password end
+        | if $in.tls.enabled == true then
+            .tls={enabled:true,server_name:$in.tls.server_name}
+            | if $in.tls.alpn != null then .tls.alpn=$in.tls.alpn else . end
+            | if $in.tls.reality.enabled == true then
+                .tls.utls={enabled:true,fingerprint:"chrome"}
+                | .tls.reality={enabled:true,public_key:$key,short_id:$in.tls.reality.short_id[0]}
+              else . end
+          else . end' "$inbound"
 }
 
 uri_encode() { jq -rn --arg value "$1" '$value|@uri'; }
 
 client_link() {
-    local file=$1 tag=${2:-sing-box} type server port credential transport query sni key sid path method
+    local file=$1 tag=${2:-sing-box} type server port credential transport query sni key sid path method alpn flow
     type=$(jq -r '.type' "$file") && server=$(jq -r '.server' "$file") &&
         port=$(jq -r '.server_port' "$file") || return
     [[ $server != *:* ]] || server="[$server]"
@@ -623,15 +1032,46 @@ client_link() {
                 sni=$(jq -r '.tls.server_name' "$file")
                 key=$(jq -r '.tls.reality.public_key' "$file")
                 sid=$(jq -r '.tls.reality.short_id' "$file")
-                query+="&security=reality&flow=xtls-rprx-vision&fp=chrome&sni=$(uri_encode "$sni")&pbk=$(uri_encode "$key")&sid=$sid"
+                query+="&security=reality&fp=chrome&sni=$(uri_encode "$sni")&pbk=$(uri_encode "$key")&sid=$sid"
+                flow=$(jq -r '.flow // ""' "$file")
+                [[ -z $flow ]] || query+="&flow=$(uri_encode "$flow")"
+            elif [[ $(jq -r '.tls.enabled // false' "$file") == true ]]; then
+                sni=$(jq -r '.tls.server_name' "$file")
+                query+="&security=tls&sni=$(uri_encode "$sni")"
             else
                 query+='&security=none'
-                if [[ $transport == ws ]]; then
-                    path=$(jq -r '.transport.path' "$file")
-                    query+="&path=$(uri_encode "$path")"
-                fi
+            fi
+            alpn=$(jq -r '(.tls.alpn // []) | join(",")' "$file")
+            [[ -z $alpn ]] || query+="&alpn=$(uri_encode "$alpn")"
+            if [[ $transport == ws ]]; then
+                path=$(jq -r '.transport.path' "$file")
+                query+="&path=$(uri_encode "$path")"
+            elif [[ $transport == grpc ]]; then
+                path=$(jq -r '.transport.service_name' "$file")
+                query+="&serviceName=$(uri_encode "$path")&mode=gun"
             fi
             printf 'vless://%s@%s:%s?%s#%s\n' "$credential" "$server" "$port" "$query" "$(uri_encode "$tag")"
+            ;;
+        vmess)
+            printf 'vmess://%s\n' "$(jq -r --arg tag "$tag" '
+                {v:"2",ps:$tag,add:.server,port:(.server_port|tostring),id:.uuid,aid:"0",scy:(.security // "auto"),
+                 net:(.transport.type // "tcp"),type:(if .transport.type == "grpc" then "gun" else "none" end),
+                 host:"",path:(.transport.path // .transport.service_name // ""),
+                 tls:(if .tls.enabled then "tls" else "" end),sni:(.tls.server_name // ""),
+                 alpn:((.tls.alpn // [])|join(","))} | tojson | @base64' "$file")"
+            ;;
+        hysteria2|tuic|anytls)
+            credential=$(jq -r '.password' "$file")
+            sni=$(jq -r '.tls.server_name' "$file")
+            alpn=$(jq -r '(.tls.alpn // []) | join(",")' "$file")
+            query="sni=$(uri_encode "$sni")"
+            [[ -z $alpn ]] || query+="&alpn=$(uri_encode "$alpn")"
+            credential=$(uri_encode "$credential")
+            if [[ $type == tuic ]]; then
+                credential="$(jq -r '.uuid' "$file"):$credential"
+                query+="&congestion_control=$(uri_encode "$(jq -r '.congestion_control // "cubic"' "$file")")&udp_relay_mode=native"
+            fi
+            printf '%s://%s@%s:%s?%s#%s\n' "$type" "$credential" "$server" "$port" "$query" "$(uri_encode "$tag")"
             ;;
         shadowsocks)
             method=$(jq -r '.method' "$file") && credential=$(jq -r '.password' "$file") || return
@@ -646,7 +1086,8 @@ add_wizard_locked() (
     umask 077
     require_core || exit 1
     local choice protocol tag port credential extra="" private_key="" public_key="" short_id="" server="" pair work file
-    printf '\n添加配置\n  1. VLESS + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  0. 返回\n'
+    local tls_name="" certificate="" tls_key="" password="" default_server=""
+    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n  0. 返回\n'
     prompt choice "请选择" 1 || exit 1
     case "$choice" in
         0) exit 0 ;;
@@ -654,6 +1095,16 @@ add_wizard_locked() (
         2) protocol=vless-ws ;;
         3) protocol=vless-tcp ;;
         4) protocol=shadowsocks ;;
+        7) protocol=hysteria2 ;;
+        8) protocol=tuic ;;
+        9) protocol=anytls ;;
+        10) protocol=vless-grpc-tls ;;
+        11) protocol=vmess-tcp ;;
+        12) protocol=vmess-tcp-tls ;;
+        13) protocol=vmess-ws ;;
+        14) protocol=vmess-ws-tls ;;
+        15) protocol=vmess-grpc-tls ;;
+        16) protocol=vless-grpc-reality ;;
         5|6)
             prompt file "请输入服务器上的 JSON 文件绝对路径" || exit 1
             if [[ $choice == 5 ]]; then add_inbound_file "$file"; else
@@ -669,47 +1120,65 @@ add_wizard_locked() (
     prompt port "监听端口" 443 || exit 1
     if ! valid_tag "$tag" || ! valid_port "$port"; then fail "名称或端口无效。"; exit 1; fi
     case "$protocol" in
-        vless-*) credential=$("$CORE_BIN" generate uuid) || exit 1 ;;
-        shadowsocks) credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
+        vless-*|vmess-*|tuic) credential=$("$CORE_BIN" generate uuid) || exit 1 ;;
+        shadowsocks|hysteria2|anytls) credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
     esac
+    [[ $protocol != tuic ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
     case "$protocol" in
-        vless-ws)
-            warn "此模板没有 TLS 加密，适用于已有安全隧道或 TLS 反向代理的场景。"
-            prompt extra "WebSocket 路径" /vless || exit 1
+        vless-ws|vmess-ws|vmess-ws-tls)
+            [[ $protocol == *-tls ]] || warn "此模板未启用 TLS；可配合 TLS 反向代理使用。"
+            prompt extra "WebSocket 路径" "/${protocol%%-*}" || exit 1
             ;;
         vless-tcp) warn "此模板没有 TLS 加密；公网直连可选择 REALITY 模板。" ;;
-        vless-reality)
-            prompt extra "REALITY 握手域名（服务器可访问的 TLS 1.3 站点，不含 https://）" || exit 1
-            valid_host "$extra" || { fail "域名格式无效。"; exit 1; }
+        *-grpc-*) prompt extra "gRPC 服务名（两端须一致）" TunService || exit 1 ;;
+    esac
+    case "$protocol" in
+        vless-reality|vless-grpc-reality)
+            prompt tls_name "REALITY 握手域名（服务器可访问的 TLS 1.3 站点，不含 https://）" || exit 1
+            valid_host "$tls_name" || { fail "域名格式无效。"; exit 1; }
+            if [[ $protocol == vless-reality ]]; then extra=$tls_name; else
+                info "gRPC + REALITY 不启用 Vision；握手目标还须支持 HTTP/2（h2）。"
+            fi
             pair=$("$CORE_BIN" generate reality-keypair) || exit 1
             private_key=$(printf '%s\n' "$pair" | sed -n 's/^PrivateKey: *//p')
             public_key=$(printf '%s\n' "$pair" | sed -n 's/^PublicKey: *//p')
             [[ $public_key =~ ^[a-zA-Z0-9_-]{43}$ ]] || { fail "无法解析 REALITY 密钥。"; exit 1; }
             short_id=$(openssl rand -hex 8) || exit 1
             ;;
+        *-tls|hysteria2|tuic|anytls)
+            info "请准备有效的 TLS 证书及私钥；客户端默认校验证书，不跳过验证。"
+            info "自签证书或私有 CA 需要在客户端另行配置信任；分享链接不包含证书。"
+            prompt tls_name "TLS 证书域名/IP（客户端 SNI）" || exit 1
+            prompt certificate "证书/完整证书链文件绝对路径（支持 .pem、.cer、.crt；文件内容须为 PEM 格式）" || exit 1
+            prompt tls_key "私钥文件绝对路径（.key；文件内容须为 PEM 格式且无口令）" || exit 1
+            ;;
     esac
-    prompt server "客户端连接用的服务器公网 IP/域名（留空则只创建服务端配置）" || exit 1
+    default_server=$(read_default_server) || exit 1
+    if [[ -z $default_server && $protocol == hysteria2 ]]; then default_server=$tls_name; fi
+    if [[ -n $default_server ]]; then
+        prompt server "客户端连接用的 IP/域名（回车使用默认地址）" "$default_server" || exit 1
+    else
+        prompt server "客户端连接用的服务器公网 IP/域名（留空则只创建服务端配置）" || exit 1
+    fi
     [[ -z $server ]] || valid_host "$server" || { fail "服务器地址格式无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/add.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
-    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$short_id" >"$work/inbound.json" || exit 1
-    # Client metadata is separate from server configuration and never loaded by the core.
-    jq -n --arg key "$public_key" --arg server "$server" --slurpfile inbound "$work/inbound.json" \
-        '{server:$server,public_key:$key,inbound:$inbound[0]}' >"$work/metadata.json" || exit 1
-    add_inbound_file "$work/inbound.json" || exit 1
-    install -d -m 700 "$CLIENT_DIR" || exit 1
-    atomic_copy "$work/metadata.json" "$CLIENT_DIR/$tag.json" || {
-        warn "服务端配置已成功保存，但连接信息保存失败；请在查看配置中检查。"; exit 1;
-    }
+    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$short_id" \
+        "$tls_name" "$certificate" "$tls_key" "$password" >"$work/inbound.json" || exit 1
+    [[ -z $server ]] || generate_client "$work/inbound.json" "$server" "$public_key" >/dev/null || exit 1
+    add_managed_inbound "$work/inbound.json" "$server" "$public_key" || exit 1
     info "已添加 $tag，端口 $((10#$port))。请在服务器防火墙和云安全组放行对应端口。"
-    [[ $protocol != shadowsocks ]] || info "Shadowsocks 同时使用 TCP 和 UDP，客户端/服务器需保持时钟同步。"
-    [[ $protocol == shadowsocks ]] || info "该模板监听 TCP。"
+    case "$protocol" in
+        hysteria2|tuic) info "该模板监听 UDP，请放行 UDP 端口。" ;;
+        shadowsocks) info "Shadowsocks 同时使用 TCP 和 UDP，客户端/服务器需保持时钟同步。" ;;
+        *) info "该模板监听 TCP。" ;;
+    esac
     [[ -z $server ]] || show_client "$tag" "$server"
 )
 
 show_client() (
     umask 077
-    local tag=$1 server=${2:-} inbound public_key="" metadata work
+    local tag=$1 server=${2:-} mode=${3:-full} inbound public_key="" metadata work
     require_core || exit 1
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/view.XXXXXX") || exit 1
@@ -719,6 +1188,7 @@ show_client() (
     }
     inbound="$work/inbound.json"
     metadata="$CLIENT_DIR/$tag.json"
+    [[ ! -L $metadata ]] || { fail "拒绝读取符号链接连接信息。"; exit 1; }
     if [[ -f "$metadata" ]]; then
         # Prevent stale exports after manually importing/changing configuration.
         if [[ $(jq -Sc . "$inbound") == "$(jq -Sc .inbound "$metadata")" ]]; then
@@ -726,30 +1196,321 @@ show_client() (
             public_key=$(jq -r '.public_key // ""' "$metadata")
         fi
     fi
+    [[ -n $server ]] || server=$(read_default_server) || exit 1
+    if [[ -z $server && $(jq -r '.type' "$inbound") == hysteria2 ]]; then
+        server=$(jq -r '.tls.server_name // ""' "$inbound") || exit 1
+    fi
+    if [[ -z $server && $mode != full ]]; then
+        fail "缺少当前配置的公网 IP/域名，请使用选项 5 设置默认地址，或选项 3 输入地址导出链接。"
+        exit 1
+    fi
     [[ -n $server ]] || prompt server "服务器公网 IP 或域名" || exit 1
     if [[ $(jq -r '.tls.reality.enabled // false' "$inbound") == true && -z $public_key ]]; then
         fail "缺少此 REALITY 入站对应的公钥。请使用原始公钥；不会输出不完整的客户端配置。"
         exit 1
     fi
     generate_client "$inbound" "$server" "$public_key" >"$work/outbound.json" || exit 1
-    info "客户端 outbound JSON（包含连接凭据）："
-    cat "$work/outbound.json"
-    info "分享链接："
+    if [[ $mode == json-only ]]; then
+        jq --arg tag "$tag" '.tag=$tag' "$work/outbound.json"
+        exit $?
+    fi
+    if [[ $mode != link-only ]]; then
+        info "客户端 outbound JSON（包含连接凭据）："
+        cat "$work/outbound.json"
+        info "分享链接："
+    fi
     client_link "$work/outbound.json" "$tag"
 )
+
+snapshot_bundle() (
+    umask 077
+    safe_paths && require_core || exit 1
+    local work file tag server
+    work=$(mktemp -d "$STATE_DIR/snapshot.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    printf '{}\n' >"$work/clients.json"
+    if [[ -d $CLIENT_DIR ]]; then
+        for file in "$CLIENT_DIR"/* "$CLIENT_DIR"/.[!.]* "$CLIENT_DIR"/..?*; do
+            [[ -e $file || -L $file ]] || continue
+            tag=${file##*/}; tag=${tag%.json}
+            if [[ $file != *.json || ! -f $file || -L $file ]] || ! valid_tag "$tag"; then
+                fail "连接信息目录包含不支持的文件或符号链接。"; exit 1;
+            fi
+            jq -e 'type == "object"' "$file" >/dev/null || exit 1
+            jq --arg tag "$tag" --slurpfile meta "$file" '.[$tag]=$meta[0]' "$work/clients.json" >"$work/next.json" || exit 1
+            mv -- "$work/next.json" "$work/clients.json" || exit 1
+        done
+    fi
+    server=$(read_default_server) || exit 1
+    jq -n --slurpfile config "$CONFIG_FILE" --slurpfile clients "$work/clients.json" --arg server "$server" \
+        '{format:"sing-box-manager-backup-v1",config:$config[0],clients:$clients[0],
+          default_server:(if $server=="" then null else $server end)}'
+)
+
+create_backup() (
+    umask 077
+    safe_paths || exit 1
+    install -d -m 700 "$BACKUP_DIR" || exit 1
+    local file
+    file=$(mktemp "$BACKUP_DIR/bundle-$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || exit 1
+    if ! snapshot_bundle >"$file"; then rm -f -- "$file"; exit 1; fi
+    printf '%s\n' "$file"
+)
+
+validate_bundle() {
+    local file=$1 tag server
+    [[ -f $file && ! -L $file ]] || { fail "备份必须为普通 JSON 文件，不能是符号链接。"; return 1; }
+    jq -e '.format=="sing-box-manager-backup-v1" and (.config|type=="object") and
+      (.clients|type=="object") and (.default_server==null or (.default_server|type=="string")) and
+      all(.clients[]; type=="object") and
+      all(.clients|keys[]; test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$") and (contains("\n")|not))' "$file" >/dev/null || { fail "备份格式无效。"; return 1; }
+    while IFS= read -r tag; do
+        valid_tag "$tag" || { fail "备份中的节点名称无效。"; return 1; }
+    done < <(jq -r '.clients|keys[]' "$file")
+    server=$(jq -r '.default_server // ""' "$file") || return
+    [[ -z $server ]] || valid_host "$server" || { fail "备份中的默认地址无效。"; return 1; }
+}
+
+apply_bundle() (
+    umask 077
+    local file=$1 work backup="" tag server active=0 transaction=0 had_clients=0
+    require_core && safe_paths && validate_bundle "$file" || exit 1
+    work=$(mktemp -d "$STATE_DIR/restore.XXXXXX") || exit 1
+    # shellcheck disable=SC2317,SC2329 # Called by the EXIT trap.
+    rollback_bundle() {
+        local result=$? restored=1
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            if ! cmp -s "$work/config-before.json" "$CONFIG_FILE"; then
+                atomic_copy "$work/config-before.json" "$CONFIG_FILE" || restored=0
+                if [[ $active -eq 1 && $restored -eq 1 ]]; then restart_checked || restored=0; fi
+            elif [[ $active -eq 1 ]] && ! service_is_active; then restart_checked || restored=0; fi
+            # Inspect the actual rename result: a signal may arrive before a flag assignment.
+            if [[ -d $work/clients-before ]]; then
+                rm -rf -- "$CLIENT_DIR" && mv -- "$work/clients-before" "$CLIENT_DIR" || restored=0
+            elif [[ $had_clients -eq 0 && ! -d $work/clients ]]; then
+                rm -rf -- "$CLIENT_DIR" || restored=0
+            fi
+            if [[ -f $work/default-before ]]; then atomic_copy "$work/default-before" "$DEFAULT_SERVER_FILE" || restored=0
+            else rm -f -- "$DEFAULT_SERVER_FILE" || restored=0; fi
+            if [[ $restored -eq 1 ]]; then warn "操作未完成，已恢复原配置和连接信息。"
+            else warn "恢复未完全成功，请使用备份：$backup；临时文件：$work"; fi
+            result=1
+        fi
+        [[ $restored -eq 0 ]] || rm -rf -- "$work"
+        exit "$result"
+    }
+    trap rollback_bundle EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    cp -- "$file" "$work/bundle.json" || exit 1
+    validate_bundle "$work/bundle.json" || exit 1
+    jq .config "$work/bundle.json" >"$work/config.json" || exit 1
+    validate_config "$work/config.json" || exit 1
+    mkdir -m 700 "$work/clients" || exit 1
+    while IFS= read -r tag; do
+        jq --arg tag "$tag" '.clients[$tag]' "$work/bundle.json" >"$work/clients/$tag.json" || exit 1
+    done < <(jq -r '.clients|keys[]' "$work/bundle.json")
+    server=$(jq -r '.default_server // ""' "$work/bundle.json") || exit 1
+    printf '%s\n' "$server" >"$work/default-server"
+    backup=$(create_backup) || exit 1
+    cp -- "$CONFIG_FILE" "$work/config-before.json" || exit 1
+    [[ ! -e $DEFAULT_SERVER_FILE ]] || cp -- "$DEFAULT_SERVER_FILE" "$work/default-before" || exit 1
+    [[ ! -d $CLIENT_DIR ]] || had_clients=1
+    service_is_active && active=1
+    transaction=1
+    if [[ $had_clients -eq 1 ]]; then mv -- "$CLIENT_DIR" "$work/clients-before" || exit 1; fi
+    mv -- "$work/clients" "$CLIENT_DIR" || exit 1
+    if [[ -n $server ]]; then atomic_copy "$work/default-server" "$DEFAULT_SERVER_FILE" || exit 1
+    else rm -f -- "$DEFAULT_SERVER_FILE" || exit 1; fi
+    if [[ $(jq -Sc . "$CONFIG_FILE") != "$(jq -Sc . "$work/config.json")" ]]; then
+        commit_config "$work/config.json" || exit 1
+    fi
+    transaction=0
+    info "配置及连接信息已保存。操作前备份：$backup"
+)
+
+restore_backup() {
+    [[ $# -eq 1 ]] || { fail "用法：sing-box restore /path/bundle.json"; return 1; }
+    validate_bundle "$1" || return
+    info "恢复配置、全部连接信息和默认地址；证书文件须已在原路径，运行中的服务可能短暂重启。"
+    confirm "使用此备份替换当前配置？（恢复前自动备份）" || return
+    apply_bundle "$1"
+}
+
+delete_inbound() (
+    local tag=${1:-} work
+    require_core && safe_paths || exit 1
+    if [[ -z $tag ]]; then
+        jq -r '.inbounds[]? | [.tag,.type,.listen_port] | @tsv' "$CONFIG_FILE"
+        prompt tag "要删除的配置名称（0 返回）" || exit 1
+        [[ $tag != 0 ]] || exit 0
+    fi
+    valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
+    jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | length==1' "$CONFIG_FILE" >/dev/null || {
+        fail "配置不存在或名称重复。"; exit 1;
+    }
+    if jq -e --arg tag "$tag" 'del(.inbounds[] | select(.tag==$tag)) | any(..|strings; .==$tag)' "$CONFIG_FILE" >/dev/null; then
+        fail "节点被路由或其他配置引用，请先通过完整 JSON 导入调整引用。"; exit 1
+    fi
+    confirm "删除节点 $tag 及其连接信息？（自动备份，其他节点保留）" || exit 1
+    umask 077
+    work=$(mktemp -d "$STATE_DIR/delete.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before.json" || exit 1
+    jq --arg tag "$tag" '.config.inbounds |= map(select(.tag!=$tag)) | del(.clients[$tag])' \
+        "$work/before.json" >"$work/after.json" || exit 1
+    apply_bundle "$work/after.json" || exit 1
+    info "已删除 $tag。客户端中的旧节点需要自行移除。"
+)
+
+add_managed_inbound() (
+    umask 077
+    local file=$1 server=${2:-} public_key=${3:-} work tag port
+    require_core && safe_paths || exit 1
+    tag=$(jq -er .tag "$file") && port=$(jq -er .listen_port "$file") || exit 1
+    valid_tag "$tag" && valid_port "$port" || exit 1
+    [[ -z $server ]] || valid_host "$server" || exit 1
+    if jq -e --arg tag "$tag" --argjson port "$port" 'any(.inbounds[]?; .tag==$tag or .listen_port==$port)' "$CONFIG_FILE" >/dev/null; then
+        fail "现有配置已使用该 tag 或端口。"; exit 1
+    fi
+    if have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then fail "端口已被占用。"; exit 1; fi
+    work=$(mktemp -d "$STATE_DIR/add-save.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before.json" || exit 1
+    jq --arg tag "$tag" --arg server "$server" --arg key "$public_key" --slurpfile node "$file" \
+        '.config.inbounds += [$node[0]] | .clients[$tag]={server:$server,public_key:$key,inbound:$node[0]}' \
+        "$work/before.json" >"$work/after.json" || exit 1
+    apply_bundle "$work/after.json"
+)
+
+list_backups() {
+    local file
+    info "成套备份（配置、连接信息、默认地址；不包含证书/私钥文件、核心或服务文件）："
+    for file in "$BACKUP_DIR"/bundle-*.json; do
+        [[ -f $file && ! -L $file ]] || continue
+        printf '%s\n' "$file"
+    done
+}
+
+export_clients() (
+    umask 077
+    local format=${1:-} target=${2:-} work tag tmp=""
+    require_core && safe_paths || exit 1
+    case "$format" in links|base64|json) ;; *) fail "格式须为 links、base64 或 json。"; exit 1;; esac
+    [[ $target == /* && ! -e $target && ! -L $target && -d $(dirname -- "$target") ]] || {
+        fail "请提供尚不存在的绝对文件路径；不会覆盖已有文件。"; exit 1;
+    }
+    work=$(mktemp -d "$STATE_DIR/export.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"; [[ -z $tmp ]] || rm -f -- "$tmp"' EXIT
+    : >"$work/nodes"
+    jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null || { fail "没有可导出的节点。"; exit 1; }
+    while IFS= read -r tag; do
+        if [[ $format == json ]]; then
+            show_client "$tag" "" json-only >>"$work/nodes" || exit 1
+        else show_client "$tag" "" link-only >>"$work/nodes" || exit 1; fi
+    done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+    case "$format" in
+        links) cp -- "$work/nodes" "$work/result" ;;
+        base64) base64 -w 0 "$work/nodes" >"$work/result" ;;
+        json) jq -s '{outbounds:.}' "$work/nodes" >"$work/result" ;;
+    esac || exit 1
+    tmp=$(mktemp "${target}.tmp.XXXXXX") || exit 1
+    install -m 600 "$work/result" "$tmp" && ln -- "$tmp" "$target" || exit 1
+    info "已导出至 $target（含连接凭据，权限 600）。JSON 是 outbound 集合，需合并到客户端配置。"
+)
+
+diagnose() (
+    local work node tag type port proto cert key name days issue=0
+    require_core && safe_paths || exit 1
+    umask 077
+    work=$(mktemp -d "$STATE_DIR/diagnose.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    printf '面板版本：%s\n' "$SB_MANAGER_VERSION"
+    show_status
+    if validate_config "$CONFIG_FILE" >"$work/check.log" 2>&1; then info "核心配置校验通过。"
+    else warn "核心配置校验失败；详情请在本机运行 sing-box validate（错误可能含敏感字段）。"; issue=1; fi
+    if ! service_is_active; then warn "服务未运行。"; issue=1; fi
+    while IFS= read -r node; do
+        printf '%s\n' "$node" >"$work/inbound.json"
+        tag=$(jq -r '.tag' "$work/inbound.json"); type=$(jq -r '.type' "$work/inbound.json")
+        port=$(jq -r '.listen_port // empty' "$work/inbound.json")
+        printf '\n节点：%s  协议：%s  端口：%s\n' "$tag" "$type" "${port:-无}"
+        case "$type" in hysteria2|tuic) proto=u;; shadowsocks) proto=tu;; vless|vmess|anytls) proto=t;; *) proto="";; esac
+        if [[ -n $proto ]] && valid_port "$port"; then
+            for name in t u; do
+                [[ $proto == *"$name"* ]] || continue
+                if ss -H -ln"$name" "sport = :$port" >"$work/listen" 2>/dev/null && [[ -s $work/listen ]]; then
+                    info "$([[ $name == t ]] && printf TCP || printf UDP) $port 存在本机监听（不等于公网可达）。"
+                else warn "缺少 $([[ $name == t ]] && printf TCP || printf UDP) $port 本机监听。"; issue=1; fi
+            done
+        fi
+        if jq -e '.tls.enabled==true and .tls.reality.enabled!=true' "$work/inbound.json" >/dev/null; then
+            cert=$(jq -r '.tls.certificate_path // ""' "$work/inbound.json")
+            key=$(jq -r '.tls.key_path // ""' "$work/inbound.json")
+            name=$(jq -r '.tls.server_name // ""' "$work/inbound.json")
+            if validate_tls_files "$name" "$cert" "$key" >"$work/tls.log" 2>&1; then
+                info "TLS 域名、有效期、证书与私钥配对检查通过。"
+                days=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null)
+                printf '%s\n' "$days"
+                if ! openssl x509 -in "$cert" -noout -checkend 1209600 >/dev/null 2>&1; then warn "证书将在 14 天内到期，请检查续期任务。"; issue=1; fi
+                if ! openssl verify -purpose sslserver -untrusted "$cert" "$cert" >/dev/null 2>&1; then
+                    warn "系统 CA 无法验证证书链：可能缺少中间证书，或使用自签/私有 CA；请使用 fullchain 并检查客户端信任。"; issue=1
+                fi
+            else warn "TLS 文件、有效期、域名或密钥配对检查失败；请检查节点证书设置。"; issue=1; fi
+        fi
+        if show_client "$tag" "" link-only >"$work/client" 2>"$work/client-error"; then info "客户端链接生成检查通过（不显示凭据）。"
+        else warn "客户端链接不能生成，请检查连接地址、公钥元数据或模板支持范围。"; issue=1; fi
+    done < <(jq -c '.inbounds[]?' "$CONFIG_FILE")
+    info "此检查不探测公网，不修改防火墙；云平台入站规则、DNS 解析及实际客户端连接需分别验证。"
+    exit "$issue"
+)
+
+management_menu() {
+    local choice file format=""
+    printf '\n配置维护\n  1. 创建成套备份\n  2. 查看成套备份\n  3. 恢复成套备份\n  4. 批量导出客户端\n  5. 只读诊断\n  0. 返回\n'
+    prompt choice "请选择" 1 || return
+    case "$choice" in
+        0) return 0;;
+        1) with_lock create_backup;;
+        2) list_backups;;
+        3) list_backups; prompt file "成套备份 JSON 绝对路径" && with_lock restore_backup "$file";;
+        4) prompt format "导出格式（links/base64/json）" links && prompt file "输出文件绝对路径（不能已存在）" && with_lock export_clients "$format" "$file";;
+        5) with_lock diagnose;;
+        *) fail "无效选项。";;
+    esac
+}
+
+show_config_list() {
+    local tag
+    jq -r '["名称","协议","监听地址","端口"],
+        (.inbounds[]? | [.tag,.type,(.listen // "-"),(.listen_port // "-")]) | @tsv' "$CONFIG_FILE" || return
+    if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null; then
+        info "暂无入站配置。"
+        return 0
+    fi
+    info "以下分享链接包含连接凭据，可复制整行导入客户端："
+    while IFS= read -r tag; do
+        printf '\n[%s]\n' "$tag"
+        show_client "$tag" "" link-only || warn "此配置暂时无法生成分享链接，其他配置仍会继续显示。"
+    done < <(jq -r '.inbounds[]?.tag' "$CONFIG_FILE")
+}
 
 show_config() {
     require_core || return
     local choice selected_tag=""
-    printf '\n查看配置\n  1. 配置列表\n  2. 完整服务端 JSON（包含密码/私钥）\n  3. 客户端 outbound JSON 和分享链接\n  4. 检查当前配置\n  0. 返回\n'
+    printf '\n查看配置\n  1. 配置列表和完整分享链接\n  2. 完整服务端 JSON（包含密码/私钥）\n  3. 客户端 outbound JSON 和分享链接\n  4. 检查当前配置\n  5. 设置默认公网 IP/域名\n  6. 修改配置\n  7. 删除配置\n  8. 备份、恢复、批量导出和诊断\n  0. 返回\n'
     prompt choice "请选择" 1 || return
     case "$choice" in
         0) return 0 ;;
-        1) jq -r '["名称","协议","监听地址","端口"],
-               (.inbounds[]? | [.tag,.type,(.listen // "-"),(.listen_port // "-")]) | @tsv' "$CONFIG_FILE" ;;
+        1) show_config_list ;;
         2) jq . "$CONFIG_FILE" ;;
         3) prompt selected_tag "配置名称" && show_client "$selected_tag" ;;
         4) validate_config "$CONFIG_FILE" ;;
+        5) with_lock set_default_server ;;
+        6) with_lock edit_wizard_locked ;;
+        7) with_lock delete_inbound ;;
+        8) management_menu ;;
         *) fail "无效选项。" ;;
     esac
 }
@@ -777,8 +1538,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-10]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-13]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -790,8 +1551,11 @@ menu() {
             8) with_lock add_wizard_locked || true ;;
             9) show_config || true ;;
             10) update_core || true ;;
+            11) with_lock edit_wizard_locked || true ;;
+            12) with_lock delete_inbound || true ;;
+            13) management_menu || true ;;
             0) return 0 ;;
-            *) warn "请输入 0–10。" ;;
+            *) warn "请输入 0–13。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -815,10 +1579,18 @@ sing-box 中文终端管理面板
   sing-box status                 查看状态
   sing-box log [--follow]         最近 100 行日志 / 持续查看
   sing-box add                    添加配置向导
+  sing-box edit [TAG]             修改已有配置；回车保留原值，保存前确认
+  sing-box delete [TAG]           删除节点（确认、备份、引用保护和失败回滚）
+  sing-box backup                 创建配置、连接信息、默认地址成套备份
+  sing-box backups                列出成套备份
+  sing-box restore FILE           恢复成套备份（需要确认，证书文件须另行保留）
+  sing-box export FORMAT FILE     批量导出 links/base64/json，绝对路径且不覆盖文件
+  sing-box diagnose               只读检查服务、监听、证书和导出；异常返回非零
   sing-box add-file /path/in.json 添加单个 inbound JSON 对象
   sing-box import /path/full.json 导入完整 JSON 配置（需要确认）
   sing-box info                   查看配置菜单
   sing-box client TAG [SERVER]    输出客户端 outbound JSON 与分享链接
+  sing-box server [IP/域名|-]     设置默认连接地址；无参数打开向导，- 清除
   sing-box validate               检查实际服务配置
   sing-box remove-panel           核心卸载后移除面板命令
   sing-box help                   此帮助
@@ -845,7 +1617,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|uninstall|start|restart|enable|disable|stop|status|log|logs|add|add-file|import|info|client|validate|remove-panel) ;;
+        menu|setup|install|update|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -870,6 +1642,17 @@ main() {
         start|restart|enable|disable|stop) with_lock service_action "$command" ;;
         log|logs) show_logs "${1:-}" ;;
         add) with_lock add_wizard_locked ;;
+        edit) with_lock edit_wizard_locked "$@" ;;
+        delete)
+            [[ $# -le 1 ]] || { fail "用法：sing-box delete [TAG]"; return 1; }
+            with_lock delete_inbound "$@" ;;
+        backup) with_lock create_backup ;;
+        backups) list_backups ;;
+        restore) with_lock restore_backup "$@" ;;
+        export)
+            [[ $# -eq 2 ]] || { fail "用法：sing-box export links|base64|json /path/file"; return 1; }
+            with_lock export_clients "$@" ;;
+        diagnose) with_lock diagnose ;;
         add-file)
             [[ $# -eq 1 ]] || { fail "用法：sing-box add-file /path/inbound.json"; return 1; }
             with_lock add_inbound_file "$1"
@@ -879,6 +1662,7 @@ main() {
             validate_config "$1" && confirm "替换当前完整配置？（旧配置会自动备份）" && with_lock import_config "$1"
             ;;
         info) show_config ;;
+        server) with_lock set_default_server "$@" ;;
         client)
             [[ $# -ge 1 && $# -le 2 ]] || { fail "用法：sing-box client TAG [SERVER]"; return 1; }
             show_client "$1" "${2:-}"
