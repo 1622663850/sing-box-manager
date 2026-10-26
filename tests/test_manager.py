@@ -467,6 +467,60 @@ class ManagerTest(unittest.TestCase):
         self.assertFalse(self.state()["enabled"])
         self.assertFalse(self.state()["active"])
 
+    def test_disable_autostart_preserves_running_or_stopped_state_and_files(self) -> None:
+        for active in (True, False):
+            with self.subTest(active=active):
+                self.state(active=active, enabled=True)
+                before = (self.config.read_bytes(), self.core.read_bytes(), self.unit.read_bytes())
+                self.system_log.unlink(missing_ok=True)
+                self.shell("service_action disable-autostart", check=True)
+                self.assertFalse(self.state()["enabled"])
+                self.assertEqual(self.state()["active"], active)
+                self.assertEqual(self.calls(self.system_log), [["disable", "sing-box.service"]])
+                self.assertEqual((self.config.read_bytes(), self.core.read_bytes(), self.unit.read_bytes()), before)
+
+    def test_disable_autostart_handles_missing_core_and_propagates_failure(self) -> None:
+        self.core.unlink()
+        self.config.unlink()
+        self.state(active=True, enabled=True)
+        self.shell("service_action disable-autostart", check=True)
+        self.assertTrue(self.state()["active"])
+        self.assertFalse(self.state()["enabled"])
+        result = self.shell('systemctl() { return 23; }; service_action disable-autostart')
+        self.assertEqual(result.returncode, 23)
+        self.assertNotIn("已关闭开机自启", result.stdout)
+
+    def test_autostart_submenu_routes_enable_disable_return_and_invalid(self) -> None:
+        body = r'''
+prompt() { printf -v "$1" '%s' "$TEST_CHOICE"; }
+with_lock() { printf 'LOCK:%s\n' "$*"; }
+for TEST_CHOICE in 1 2 0; do autostart_menu || exit; done
+TEST_CHOICE=3; if autostart_menu >/dev/null 2>&1; then exit 90; fi
+printf 'INVALID_REJECTED\n'
+'''
+        result = self.shell(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("INVALID_REJECTED", result.stdout)
+        self.assertEqual(result.stdout.count("LOCK:"), 2)
+        self.assertIn("LOCK:service_action enable", result.stdout)
+        self.assertIn("LOCK:service_action disable-autostart", result.stdout)
+
+    def test_disable_autostart_cli_dispatch_and_arguments(self) -> None:
+        body = r'''
+SB_ROOT_PREFIX=""
+require_root() { return 0; }; require_systemd() { return 0; }
+safe_paths() { return 0; }; is_managed() { return 0; }
+with_lock() { printf 'LOCK:%s\n' "$*"; }
+main disable-autostart
+if main disable-autostart extra >/dev/null 2>&1; then exit 90; fi
+printf 'INVALID_REJECTED\n'
+'''
+        result = self.shell(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("INVALID_REJECTED", result.stdout)
+        self.assertEqual(result.stdout.count("LOCK:"), 1)
+        self.assertIn("LOCK:service_action disable-autostart", result.stdout)
+
     def test_stop_and_disable_work_even_when_config_and_core_are_missing(self) -> None:
         self.config.unlink()
         self.core.unlink()

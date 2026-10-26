@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.9.0"
+SB_MANAGER_VERSION="1.10.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -772,6 +772,10 @@ service_action() {
             systemctl enable "$SERVICE" || return
             info "已设置开机自启；当前运行状态不变。"
             ;;
+        disable-autostart)
+            systemctl disable "$SERVICE" || return
+            info "已关闭开机自启；当前运行状态不变。"
+            ;;
         disable)
             systemctl disable --now "$SERVICE" || return
             info "已停止服务并关闭开机自启。"
@@ -781,6 +785,18 @@ service_action() {
             info "已停止服务，开机自启设置保持不变。"
             ;;
         *) fail "未知服务操作：$action"; return 1 ;;
+    esac
+}
+
+autostart_menu() {
+    local choice
+    printf '\n开机自启设置\n  1. 开启开机自启（不立即启动）\n  2. 关闭开机自启（不停止服务）\n  0. 返回\n'
+    prompt choice "请选择自启操作" 0 || return 1
+    case "$choice" in
+        1) with_lock service_action enable ;;
+        2) with_lock service_action disable-autostart ;;
+        0) return 0 ;;
+        *) fail "请输入 0–2。" ;;
     esac
 }
 
@@ -2423,13 +2439,13 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n 16. 关闭 BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n  0. 退出\n\n'
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n 16. 关闭 BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n  0. 退出\n\n'
         read -r -p "请输入选项 [0-17]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
             3) with_lock service_action start || true ;;
-            4) with_lock service_action enable || true ;;
+            4) autostart_menu || true ;;
             5) with_lock service_action restart || true ;;
             6) with_lock service_action disable || true ;;
             7) show_logs || true ;;
@@ -2473,6 +2489,7 @@ sing-box 中文终端管理面板
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
   sing-box enable                 设置开机自启（不改变当前运行状态）
+  sing-box disable-autostart      关闭开机自启（不改变当前运行状态）
   sing-box disable                停止服务并关闭开机自启
   sing-box stop                   仅停止服务
   sing-box status                 查看状态
@@ -2516,7 +2533,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|acme|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2543,6 +2560,9 @@ main() {
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;
         status) show_status ;;
+        disable-autostart)
+            [[ $# -eq 0 ]] || { fail "用法：sing-box disable-autostart"; return 1; }
+            with_lock service_action disable-autostart ;;
         start|restart|enable|disable|stop) with_lock service_action "$command" ;;
         log|logs) show_logs "${1:-}" ;;
         add) with_lock add_wizard_locked ;;

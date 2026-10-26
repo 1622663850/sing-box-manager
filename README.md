@@ -9,7 +9,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 1 | 安装 sing-box | 首次安装官方最新稳定核心；已安装时提示使用更新选项 |
 | 2 | 卸载 sing-box | 停止并禁用服务，删除核心及 unit，保留面板、配置和备份 |
 | 3 | 启动 | 检查配置后启动，并检查服务状态 |
-| 4 | 设置开机自启 | 启用开机启动，当前运行状态不变 |
+| 4 | 开机自启（开启/关闭） | 子菜单选择开启或关闭自启，当前运行状态不变 |
 | 5 | 重新启动 | 检查配置后重启，并检查服务状态 |
 | 6 | 禁用 | 立即停止服务，同时关闭开机自启 |
 | 7 | 查看日志 | 显示最近 100 行服务日志 |
@@ -56,7 +56,7 @@ sudo sing-box
 curl -fL --retry 3 https://raw.githubusercontent.com/1622663850/sing-box-manager/main/sing-box-manager.sh -o sing-box-manager.sh && bash sing-box-manager.sh setup && sing-box
 ```
 
-`setup` 安装或更新面板脚本及必要依赖，核心由菜单 **1** 安装。首次使用顺序：**1 安装核心 → 8 添加配置 → 3 启动 → 4 设置开机自启**。以后输入 `sudo sing-box` 打开菜单，root 用户直接输入 `sing-box`。
+`setup` 安装或更新面板脚本及必要依赖，核心由菜单 **1** 安装。首次使用顺序：**1 安装核心 → 8 添加配置 → 3 启动 → 4 开机自启 → 1 开启**。以后输入 `sudo sing-box` 打开菜单，root 用户直接输入 `sing-box`。
 
 如果提示没有 `curl`，Debian / Ubuntu 可先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`；使用 DNF 的系统可先执行 `sudo dnf install -y curl ca-certificates`。
 
@@ -198,6 +198,7 @@ sudo sing-box acme                # 安装/打开 acme-script 证书管理菜单
 sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
 sudo sing-box enable              # 开机自启，不立即启动
+sudo sing-box disable-autostart   # 只关闭开机自启，不停止当前服务
 sudo sing-box restart             # 重新启动
 sudo sing-box disable             # 停止并关闭开机自启
 sudo sing-box stop                # 仅停止，保留开机自启设置
@@ -206,6 +207,8 @@ sudo sing-box log                 # 最近 100 行日志
 sudo sing-box log --follow        # 持续日志，Ctrl+C 退出
 sudo sing-box help                # 命令帮助
 ```
+
+v1.10.0 起，主菜单 **4. 开机自启（开启/关闭）** 提供 **1 开启、2 关闭、0 返回**。两项操作都保留当前运行状态：开启自启不会立即启动，关闭自启不会停止正在运行的节点。原菜单 **6. 禁用** 和 `sing-box disable` 继续用于停止服务并关闭自启；只关闭自启使用 `sing-box disable-autostart`。
 
 原生命令透传示例：
 
