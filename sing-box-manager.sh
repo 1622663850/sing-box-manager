@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.10.0"
+SB_MANAGER_VERSION="1.10.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -790,14 +790,17 @@ service_action() {
 
 autostart_menu() {
     local choice
-    printf '\n开机自启设置\n  1. 开启开机自启（不立即启动）\n  2. 关闭开机自启（不停止服务）\n  0. 返回\n'
-    prompt choice "请选择自启操作" 0 || return 1
-    case "$choice" in
-        1) with_lock service_action enable ;;
-        2) with_lock service_action disable-autostart ;;
-        0) return 0 ;;
-        *) fail "请输入 0–2。" ;;
-    esac
+    while true; do
+        printf '\n开机自启设置\n  1. 开启开机自启（不立即启动）\n  2. 关闭开机自启（不停止服务）\n  0. 返回\n'
+        prompt choice "请选择自启操作" 0 || return 0
+        case "$choice" in
+            1) with_lock service_action enable ;;
+            2) with_lock service_action disable-autostart ;;
+            0) return 0 ;;
+            *) fail "请输入 0–2。" ;;
+        esac || true
+        read -r -p "按回车键返回开机自启菜单..." choice || return 0
+    done
 }
 
 download_https() {
@@ -1980,17 +1983,20 @@ diagnose() (
 
 management_menu() {
     local choice file format=""
-    printf '\n配置维护\n  1. 创建成套备份\n  2. 查看成套备份\n  3. 恢复成套备份\n  4. 批量导出客户端\n  5. 只读诊断\n  0. 返回\n'
-    prompt choice "请选择" 1 || return
-    case "$choice" in
-        0) return 0;;
-        1) with_lock create_backup;;
-        2) list_backups;;
-        3) list_backups; prompt file "成套备份 JSON 绝对路径" && with_lock restore_backup "$file";;
-        4) prompt format "导出格式（links/base64/json）" links && prompt file "输出文件绝对路径（不能已存在）" && with_lock export_clients "$format" "$file";;
-        5) with_lock diagnose;;
-        *) fail "无效选项。";;
-    esac
+    while true; do
+        printf '\n配置维护\n  1. 创建成套备份\n  2. 查看成套备份\n  3. 恢复成套备份\n  4. 批量导出客户端\n  5. 只读诊断\n  0. 返回\n'
+        prompt choice "请选择" 1 || return 0
+        case "$choice" in
+            0) return 0;;
+            1) with_lock create_backup;;
+            2) list_backups;;
+            3) list_backups; prompt file "成套备份 JSON 绝对路径" && with_lock restore_backup "$file";;
+            4) prompt format "导出格式（links/base64/json）" links && prompt file "输出文件绝对路径（不能已存在）" && with_lock export_clients "$format" "$file";;
+            5) with_lock diagnose;;
+            *) fail "无效选项。";;
+        esac || true
+        read -r -p "按回车键返回配置维护菜单..." choice || return 0
+    done
 }
 
 show_config_list() {
@@ -2011,20 +2017,23 @@ show_config_list() {
 show_config() {
     require_core || return
     local choice selected_tag=""
-    printf '\n查看配置\n  1. 配置列表和完整分享链接\n  2. 完整服务端 JSON（包含密码/私钥）\n  3. 客户端 outbound JSON 和分享链接\n  4. 检查当前配置\n  5. 设置默认公网 IP/域名\n  6. 修改配置\n  7. 删除配置\n  8. 备份、恢复、批量导出和诊断\n  0. 返回\n'
-    prompt choice "请选择" 1 || return
-    case "$choice" in
-        0) return 0 ;;
-        1) show_config_list ;;
-        2) config_jq . ;;
-        3) prompt selected_tag "配置名称" && show_client "$selected_tag" ;;
-        4) validate_config "$CONFIG_FILE" ;;
-        5) with_lock set_default_server ;;
-        6) with_lock edit_wizard_locked ;;
-        7) with_lock delete_inbound ;;
-        8) management_menu ;;
-        *) fail "无效选项。" ;;
-    esac
+    while true; do
+        printf '\n查看配置\n  1. 配置列表和完整分享链接\n  2. 完整服务端 JSON（包含密码/私钥）\n  3. 客户端 outbound JSON 和分享链接\n  4. 检查当前配置\n  5. 设置默认公网 IP/域名\n  6. 修改配置\n  7. 删除配置\n  8. 备份、恢复、批量导出和诊断\n  0. 返回\n'
+        prompt choice "请选择" 1 || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) show_config_list ;;
+            2) config_jq . ;;
+            3) prompt selected_tag "配置名称" && show_client "$selected_tag" ;;
+            4) validate_config "$CONFIG_FILE" ;;
+            5) with_lock set_default_server ;;
+            6) with_lock edit_wizard_locked ;;
+            7) with_lock delete_inbound ;;
+            8) management_menu || true; continue ;;
+            *) fail "无效选项。" ;;
+        esac || true
+        read -r -p "按回车键返回查看配置菜单..." choice || return 0
+    done
 }
 
 show_bbr_status() {
@@ -2445,16 +2454,16 @@ menu() {
             1) install_core || true ;;
             2) uninstall_core || true ;;
             3) with_lock service_action start || true ;;
-            4) autostart_menu || true ;;
+            4) autostart_menu || true; continue ;;
             5) with_lock service_action restart || true ;;
             6) with_lock service_action disable || true ;;
             7) show_logs || true ;;
             8) with_lock add_wizard_locked || true ;;
-            9) show_config || true ;;
+            9) show_config || true; continue ;;
             10) update_core || true ;;
             11) with_lock edit_wizard_locked || true ;;
             12) with_lock delete_inbound || true ;;
-            13) management_menu || true ;;
+            13) management_menu || true; continue ;;
             14)
                 if update_panel; then
                     # update_panel returns after its with_lock subshell has released fd 9.

@@ -163,7 +163,7 @@ class ManagerTest(unittest.TestCase):
     def shell(self, body: str, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             ["bash", "-c", 'source "$1"; shift; wait_healthy() { service_is_active; }; ' + body, "test-manager", str(SCRIPT), *args],
-            env=self.env, text=True, capture_output=True, timeout=20,
+            env=self.env, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=20,
         )
         if check:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -495,7 +495,7 @@ class ManagerTest(unittest.TestCase):
 prompt() { printf -v "$1" '%s' "$TEST_CHOICE"; }
 with_lock() { printf 'LOCK:%s\n' "$*"; }
 for TEST_CHOICE in 1 2 0; do autostart_menu || exit; done
-TEST_CHOICE=3; if autostart_menu >/dev/null 2>&1; then exit 90; fi
+TEST_CHOICE=3; autostart_menu >/dev/null 2>&1 || exit 90
 printf 'INVALID_REJECTED\n'
 '''
         result = self.shell(body)
