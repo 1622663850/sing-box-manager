@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.6.0"
+SB_MANAGER_VERSION="1.7.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -16,6 +16,7 @@ CLIENT_DIR="$STATE_DIR/clients"
 DEFAULT_SERVER_FILE="$STATE_DIR/default-server"
 BBR_SYSCTL_DIR="${SB_ROOT_PREFIX}/etc/sysctl.d"
 BBR_SYSCTL_FILE="$BBR_SYSCTL_DIR/99-sing-box-manager-bbr.conf"
+BBR_RESTORE_FILE="$STATE_DIR/bbr-active"
 UNIT_FILE="${SB_ROOT_PREFIX}/etc/systemd/system/sing-box.service"
 MANAGED_MARKER="$LIB_DIR/.managed"
 SERVICE="sing-box.service"
@@ -1967,11 +1968,48 @@ except (OSError, UnicodeError):
 PY_BBR_PERSISTENCE
 }
 
-enable_bbr_locked() (
+bbr_owned_config() {
+    [[ -f $1 && ! -L $1 && $(head -n 1 "$1") == '# Managed by sing-box-manager: TCP BBR' ]] &&
+        ! grep -Ev '^[[:space:]]*($|[#;]|-?net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*=)' "$1" >/dev/null
+}
+
+bbr_restore_backup() {
+    local name backup
+    [[ -f $BBR_RESTORE_FILE && ! -L $BBR_RESTORE_FILE ]] || {
+        fail "没有本面板开启 BBR 前的恢复记录；不会猜测原算法或覆盖外部设置。"; return 1;
+    }
+    name=$(cat "$BBR_RESTORE_FILE") || return 1
+    [[ $name =~ ^bbr-[0-9]{8}-[0-9]{6}-[a-zA-Z0-9]{6}$ ]] || {
+        fail "BBR 恢复记录格式无效。"; return 1;
+    }
+    backup="$BACKUP_DIR/$name"
+    if [[ ! -d $backup || -L $backup || ! -f $backup/runtime.json || -L $backup/runtime.json ]]; then
+        fail "BBR 开启前备份缺失或无效，已取消恢复。"; return 1
+    fi
+    if ! jq -se 'length == 1 and (.[0] | type == "object" and
+            (.tcp_congestion_control | type == "string" and test("^[a-zA-Z0-9_-]+$")) and
+            (.default_qdisc | type == "string" and test("^[a-zA-Z0-9_-]+$")) and
+            (.config_existed | type == "boolean") and
+            (.config_mode | type == "string" and test("^[0-7]{3,4}$")))' "$backup/runtime.json" >/dev/null 2>&1; then
+        fail "BBR 开启前备份缺失或无效，已取消恢复。"; return 1
+    fi
+    if [[ $(jq -r '.config_existed' "$backup/runtime.json") == true ]]; then
+        bbr_owned_config "$backup/sysctl.conf" || {
+            fail "BBR 开启前的配置文件备份缺失或无效。"; return 1;
+        }
+    fi
+    printf '%s\n' "$backup"
+}
+
+configure_bbr_locked() (
     umask 077
     local old_cc old_qdisc available work backup="" had_file=0 old_mode=644 transaction=0
+    local action=${1:-enable} target_cc=bbr target_qdisc=fq target_file=1 target_mode=644
+    local restore_backup="" had_restore=0
+    [[ $action == enable || $action == disable ]] || exit 1
     safe_paths || exit 1
     [[ ! -L $BBR_SYSCTL_DIR && ! -L $BBR_SYSCTL_FILE &&
+       ! -L $BBR_RESTORE_FILE && ( ! -e $BBR_RESTORE_FILE || -f $BBR_RESTORE_FILE ) &&
        ( ! -e $BBR_SYSCTL_DIR || -d $BBR_SYSCTL_DIR ) &&
        ( ! -e $BBR_SYSCTL_FILE || -f $BBR_SYSCTL_FILE ) ]] || {
         fail "BBR 配置目录或文件无效，拒绝操作符号链接。"; exit 1;
@@ -1985,16 +2023,20 @@ enable_bbr_locked() (
     }
     if [[ -f $BBR_SYSCTL_FILE ]]; then
         had_file=1
-        [[ $(head -n 1 "$BBR_SYSCTL_FILE") == '# Managed by sing-box-manager: TCP BBR' ]] || {
-            fail "发现非本项目管理的同名 BBR 文件，不会覆盖。"; exit 1;
+        bbr_owned_config "$BBR_SYSCTL_FILE" || {
+            fail "BBR 文件不属于本项目或含有其他设置，不会覆盖，请先核对。"; exit 1;
         }
-        if grep -Ev '^[[:space:]]*($|[#;]|-?net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*=)' \
-            "$BBR_SYSCTL_FILE" >/dev/null; then
-            fail "BBR 文件含有其他设置，不会覆盖，请先核对。"; exit 1
-        fi
         old_mode=$(stat -c '%a' "$BBR_SYSCTL_FILE") || exit 1
     fi
-    check_bbr_persistence || exit 1
+    if [[ -f $BBR_RESTORE_FILE ]]; then
+        had_restore=1
+        restore_backup=$(bbr_restore_backup) || exit 1
+    fi
+    if [[ $action == disable ]]; then
+        [[ $had_restore -eq 1 ]] || { bbr_restore_backup >/dev/null; exit 1; }
+    else
+        check_bbr_persistence || exit 1
+    fi
     work=$(mktemp -d "$STATE_DIR/bbr-enable.XXXXXX") || exit 1
     # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
     rollback_bbr() {
@@ -2017,6 +2059,12 @@ enable_bbr_locked() (
             else
                 rm -f -- "$BBR_SYSCTL_FILE" || restored=0
             fi
+            if [[ $had_restore -eq 1 ]]; then
+                atomic_copy "$backup/active-before" "$BBR_RESTORE_FILE" 600 || restored=0
+                cmp -s "$backup/active-before" "$BBR_RESTORE_FILE" || restored=0
+            else
+                rm -f -- "$BBR_RESTORE_FILE" || restored=0
+            fi
             [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == "$old_cc" &&
                $(sysctl -n net.core.default_qdisc 2>/dev/null) == "$old_qdisc" ]] || restored=0
             if [[ $restored -eq 1 ]]; then warn "BBR 设置未完成，已恢复原参数及配置文件。"
@@ -2031,6 +2079,23 @@ enable_bbr_locked() (
     trap 'exit 143' TERM
     printf '# Managed by sing-box-manager: TCP BBR\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >"$work/sysctl.conf"
     [[ $had_file -eq 0 ]] || install -m 600 "$BBR_SYSCTL_FILE" "$work/original.conf" || exit 1
+    if [[ $had_restore -eq 1 ]]; then
+        install -m 600 "$BBR_RESTORE_FILE" "$work/active-before" &&
+            install -m 600 "$restore_backup/runtime.json" "$work/restore-runtime.json" || exit 1
+        if [[ $(jq -r '.config_existed' "$work/restore-runtime.json") == true ]]; then
+            install -m 600 "$restore_backup/sysctl.conf" "$work/restore.conf" || exit 1
+        fi
+    fi
+    if [[ $action == disable ]]; then
+        target_cc=$(jq -r '.tcp_congestion_control' "$work/restore-runtime.json") &&
+            target_qdisc=$(jq -r '.default_qdisc' "$work/restore-runtime.json") &&
+            target_mode=$(jq -r '.config_mode' "$work/restore-runtime.json") || exit 1
+        [[ $(jq -r '.config_existed' "$work/restore-runtime.json") == true ]] || target_file=0
+        if [[ $old_cc != bbr || $old_qdisc != fq ]] || ! cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE"; then
+            fail "当前参数或本面板 BBR 配置已被其他操作修改，拒绝覆盖；请先核对。"; exit 1
+        fi
+        [[ $target_file -eq 0 ]] || cp "$work/restore.conf" "$work/sysctl.conf" || exit 1
+    fi
     bbr_inputs_unchanged() {
         [[ ! -L $BBR_SYSCTL_DIR && ! -L $BBR_SYSCTL_FILE &&
            ( ! -e $BBR_SYSCTL_DIR || -d $BBR_SYSCTL_DIR ) ]] || return 1
@@ -2042,47 +2107,97 @@ enable_bbr_locked() (
         else
             [[ ! -e $BBR_SYSCTL_FILE && ! -L $BBR_SYSCTL_FILE ]] || return 1
         fi
-        check_bbr_persistence
+        [[ ! -L $BBR_RESTORE_FILE ]] || return 1
+        if [[ $had_restore -eq 1 ]]; then
+            cmp -s "$work/active-before" "$BBR_RESTORE_FILE" &&
+                [[ $(bbr_restore_backup) == "$restore_backup" ]] &&
+                cmp -s "$work/restore-runtime.json" "$restore_backup/runtime.json" || return 1
+            if [[ -f $work/restore.conf ]]; then
+                cmp -s "$work/restore.conf" "$restore_backup/sysctl.conf" || return 1
+            fi
+        else
+            [[ ! -e $BBR_RESTORE_FILE ]] || return 1
+        fi
+        [[ $action == disable ]] || check_bbr_persistence
     }
-    if [[ $old_cc == bbr && $old_qdisc == fq ]] && cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE"; then
+    if [[ $action == enable && $old_cc == bbr && $old_qdisc == fq ]] && cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE"; then
         info "TCP BBR 已启用，持久化配置也已就绪，无需修改。"; exit 0
     fi
-    info "将设置整台 VPS 的 TCP 默认拥塞控制为 bbr，默认队列规则为 fq，并写入 $BBR_SYSCTL_FILE。"
+    if [[ $action == disable ]]; then
+        info "将恢复开启前的 TCP 算法 $target_cc、默认队列规则 $target_qdisc，以及原持久化文件状态。"
+        info "开启前备份：$restore_backup；不会把原算法强制改为 cubic。"
+        [[ $target_cc != bbr ]] || warn "开启前已经使用 bbr，恢复后仍为 bbr；本次撤销的是本面板的设置。"
+    else
+        info "将设置整台 VPS 的 TCP 默认拥塞控制为 bbr，默认队列规则为 fq，并写入 $BBR_SYSCTL_FILE。"
+    fi
     info "只影响 TCP；Hy2/TUIC 的 UDP/QUIC 拥塞控制不受此设置直接控制。"
     info "已有连接和监听可能沿用旧算法；本操作不重启服务、不重建现有网卡队列。"
-    confirm "确认启用 TCP BBR？（先备份，失败尝试恢复）" || exit 0
+    if [[ $action == disable ]]; then
+        confirm "确认关闭并恢复开启前的设置？（先备份，失败尝试恢复）" || exit 0
+    else
+        confirm "确认启用 TCP BBR？（先备份，失败尝试恢复）" || exit 0
+    fi
     bbr_inputs_unchanged || { fail "设置在确认期间发生变化或存在冲突，请重新打开 BBR 选项。"; exit 1; }
-    if [[ ! $available =~ (^|[[:space:]])bbr($|[[:space:]]) ]]; then
-        if have modprobe; then modprobe tcp_bbr >/dev/null 2>&1 || true; fi
+    if [[ ! " $available " =~ [[:space:]]${target_cc}[[:space:]] ]]; then
+        if have modprobe; then modprobe "tcp_$target_cc" >/dev/null 2>&1 || true; fi
         available=$(sysctl -n net.ipv4.tcp_available_congestion_control) || exit 1
     fi
-    [[ $available =~ (^|[[:space:]])bbr($|[[:space:]]) ]] || {
-        fail "内核未提供可用的 bbr；模块不存在或加载受限。不会安装内核或修改参数。"; exit 1;
+    [[ " $available " =~ [[:space:]]${target_cc}[[:space:]] ]] || {
+        fail "内核未提供可用的 $target_cc；模块不存在或加载受限。不会安装内核或修改参数。"; exit 1;
     }
-    if [[ $old_qdisc != fq ]] && have modprobe; then modprobe sch_fq >/dev/null 2>&1 || true; fi
+    if [[ $old_qdisc != "$target_qdisc" ]] && have modprobe; then modprobe "sch_$target_qdisc" >/dev/null 2>&1 || true; fi
     bbr_inputs_unchanged || { fail "设置已被其他操作修改，已取消写入。"; exit 1; }
     install -d -m 700 "$BACKUP_DIR" || exit 1
     backup=$(mktemp -d "$BACKUP_DIR/bbr-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
-    jq -n --arg cc "$old_cc" --arg qdisc "$old_qdisc" --argjson existed "$([[ $had_file -eq 1 ]] && printf true || printf false)" \
-        '{tcp_congestion_control:$cc,default_qdisc:$qdisc,config_existed:$existed}' >"$backup/runtime.json" || exit 1
+    jq -n --arg cc "$old_cc" --arg qdisc "$old_qdisc" --arg mode "$old_mode" \
+        --argjson existed "$([[ $had_file -eq 1 ]] && printf true || printf false)" \
+        '{tcp_congestion_control:$cc,default_qdisc:$qdisc,config_existed:$existed,config_mode:$mode}' >"$backup/runtime.json" || exit 1
     [[ $had_file -eq 0 ]] || install -m 600 "$work/original.conf" "$backup/sysctl.conf" || exit 1
+    [[ $had_restore -eq 0 ]] || install -m 600 "$work/active-before" "$backup/active-before" || exit 1
     transaction=1
-    sysctl -w net.core.default_qdisc=fq >/dev/null || exit 1
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null || exit 1
-    [[ -d $BBR_SYSCTL_DIR ]] || install -d -m 755 "$BBR_SYSCTL_DIR" || exit 1
-    atomic_copy "$work/sysctl.conf" "$BBR_SYSCTL_FILE" 644 || exit 1
-    [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr &&
-       $(sysctl -n net.core.default_qdisc) == fq ]] || { fail "内核参数读回校验失败。"; exit 1; }
-    cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE" || exit 1
+    sysctl -w "net.core.default_qdisc=$target_qdisc" >/dev/null || exit 1
+    sysctl -w "net.ipv4.tcp_congestion_control=$target_cc" >/dev/null || exit 1
+    if [[ $target_file -eq 1 ]]; then
+        [[ -d $BBR_SYSCTL_DIR ]] || install -d -m 755 "$BBR_SYSCTL_DIR" || exit 1
+        atomic_copy "$work/sysctl.conf" "$BBR_SYSCTL_FILE" "$target_mode" || exit 1
+        cmp -s "$work/sysctl.conf" "$BBR_SYSCTL_FILE" &&
+            [[ $(stat -c '%a' "$BBR_SYSCTL_FILE") == "$target_mode" ]] || exit 1
+    else
+        rm -f -- "$BBR_SYSCTL_FILE" || exit 1
+        [[ ! -e $BBR_SYSCTL_FILE && ! -L $BBR_SYSCTL_FILE ]] || exit 1
+    fi
+    [[ $(sysctl -n net.ipv4.tcp_congestion_control) == "$target_cc" &&
+       $(sysctl -n net.core.default_qdisc) == "$target_qdisc" ]] || { fail "内核参数读回校验失败。"; exit 1; }
+    if [[ $action == disable ]]; then
+        rm -f -- "$BBR_RESTORE_FILE" || exit 1
+        [[ ! -e $BBR_RESTORE_FILE ]] || exit 1
+    elif [[ $had_restore -eq 0 ]]; then
+        printf '%s\n' "${backup##*/}" >"$work/active"
+        atomic_copy "$work/active" "$BBR_RESTORE_FILE" 600 || exit 1
+        cmp -s "$work/active" "$BBR_RESTORE_FILE" || exit 1
+    fi
     transaction=0
-    info "TCP BBR 已启用并写入持久化配置；操作前备份：$backup"
+    if [[ $action == disable ]]; then
+        info "已恢复开启前的设置：TCP=$target_cc，默认队列=$target_qdisc；操作前备份：$backup"
+    else
+        info "TCP BBR 已启用并写入持久化配置；操作前备份：$backup"
+    fi
     info "如需已有入站监听采用新算法，可自行选择 5.重新启动；重启会短暂中断现有节点连接。"
 )
+
+enable_bbr_locked() { configure_bbr_locked enable; }
+disable_bbr_locked() { configure_bbr_locked disable; }
 
 enable_bbr() {
     [[ $# -eq 0 ]] || { fail "用法：sing-box bbr"; return 1; }
     if ! have sysctl; then install_dependencies || return; fi
     with_lock enable_bbr_locked
+}
+
+disable_bbr() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box bbr-disable"; return 1; }
+    have sysctl || { fail "缺少 sysctl，请重新运行 setup 安装依赖。"; return 1; }
+    with_lock disable_bbr_locked
 }
 
 show_status() {
@@ -2129,8 +2244,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-15]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n 16. 关闭 BBR（恢复开启前设置）\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-16]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -2152,8 +2267,9 @@ menu() {
                 fi
                 ;;
             15) enable_bbr || true ;;
+            16) disable_bbr || true ;;
             0) return 0 ;;
-            *) warn "请输入 0–15。" ;;
+            *) warn "请输入 0–16。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -2171,6 +2287,7 @@ sing-box 中文终端管理面板
   sing-box update [版本号]        更新已安装核心，保留配置；默认官方最新稳定版
   sing-box update-panel           更新面板脚本到 GitHub 最新版，更新前自动备份
   sing-box bbr                    确认后开启系统 TCP BBR，备份并持久化
+  sing-box bbr-disable            确认后恢复本面板开启 BBR 前的参数及配置
   sing-box bbr-status             只读查看 TCP 拥塞控制及默认队列规则
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
@@ -2218,7 +2335,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-status|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2238,6 +2355,7 @@ main() {
             ;;
         update-panel) update_panel "$@" ;;
         bbr) enable_bbr "$@" ;;
+        bbr-disable) disable_bbr "$@" ;;
         bbr-status) show_bbr_status "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;

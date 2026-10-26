@@ -31,6 +31,7 @@ class BbrTest(unittest.TestCase):
         self.bbr_dir = self.root / "etc/sysctl.d"
         self.bbr_dir.mkdir(parents=True, exist_ok=True)
         self.bbr_file = self.bbr_dir / "99-sing-box-manager-bbr.conf"
+        self.restore_file = self.state_dir / "bbr-active"
         self.bbr_state = self.root / "bbr-state.json"
         self.sysctl_log = self.root / "sysctl.jsonl"
         self.modprobe_log = self.root / "modprobe.jsonl"
@@ -146,6 +147,7 @@ class BbrTest(unittest.TestCase):
         values["bbr-file"] = (
             self.bbr_file.read_bytes(), self.bbr_file.stat().st_mode & 0o777
         ) if self.bbr_file.exists() else None
+        values["bbr-restore"] = self.restore_file.read_bytes() if self.restore_file.exists() else None
         return values
 
     def test_status_is_read_only(self) -> None:
@@ -172,12 +174,184 @@ class BbrTest(unittest.TestCase):
             "tcp_congestion_control": "cubic",
             "default_qdisc": "fq_codel",
             "config_existed": False,
+            "config_mode": "644",
         })
         after = self._snapshot_protected()
         for key, value in before.items():
-            if key not in {"sysctl-state", "bbr-file"}:
+            if key not in {"sysctl-state", "bbr-file", "bbr-restore"}:
                 self.assertEqual(after[key], value, key)
         self.assertFalse(self.system_log.exists())
+
+    def _enable_for_restore(self) -> bytes:
+        result = self.shell('confirm() { return 0; }; enable_bbr_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reference = self.restore_file.read_bytes()
+        self.assertEqual(self.restore_file.stat().st_mode & 0o777, 0o600)
+        return reference
+
+    def test_disable_restores_runtime_and_removes_new_persistence(self) -> None:
+        before = self._snapshot_protected()
+        self._enable_for_restore()
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._snapshot_protected(), before)
+        self.assertFalse(self.restore_file.exists())
+        self.assertEqual(len(list((self.state_dir / 'backups').glob('bbr-*/runtime.json'))), 2)
+        self.assertFalse(self.system_log.exists())
+
+    def test_disable_restores_original_file_bytes_and_mode(self) -> None:
+        original = b'# Managed by sing-box-manager: TCP BBR\n# previous setting\nnet.core.default_qdisc=fq_codel\nnet.ipv4.tcp_congestion_control=cubic\n'
+        self.bbr_file.write_bytes(original)
+        self.bbr_file.chmod(0o600)
+        before = self._snapshot_protected()
+        self._enable_for_restore()
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._snapshot_protected(), before)
+
+    def test_disable_preserves_preexisting_bbr_and_unrelated_sysctl(self) -> None:
+        self._bbr_state(tcp_congestion_control='bbr', default_qdisc='cake')
+        external = self.bbr_dir / '50-external.conf'
+        external.write_text('net.ipv4.tcp_congestion_control=bbr\nnet.core.default_qdisc=cake\n')
+        before = self._snapshot_protected()
+        self._enable_for_restore()
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('恢复后仍为 bbr', result.stdout + result.stderr)
+        self.assertEqual(self._snapshot_protected(), before)
+        self.assertEqual(external.read_text(), 'net.ipv4.tcp_congestion_control=bbr\nnet.core.default_qdisc=cake\n')
+
+    def test_cancel_disable_and_repeated_enable_keep_original_reference(self) -> None:
+        reference = self._enable_for_restore()
+        before = self._snapshot_protected()
+        result = self.shell('confirm() { return 1; }; disable_bbr_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._snapshot_protected(), before)
+        self._enable_for_restore()
+        self.assertEqual(self.restore_file.read_bytes(), reference)
+        self.assertEqual(len(list((self.state_dir / 'backups').glob('bbr-*/runtime.json'))), 1)
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked; enable_bbr_locked; disable_bbr_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._bbr_state()['tcp_congestion_control'], 'cubic')
+        self.assertFalse(self.restore_file.exists())
+
+    def test_disable_without_record_refuses_to_guess_including_legacy_files(self) -> None:
+        self._bbr_state(tcp_congestion_control='bbr', default_qdisc='fq')
+        self.bbr_file.write_bytes(self._desired_conf())
+        before = self._snapshot_protected()
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('没有本面板开启 BBR 前的恢复记录', result.stdout + result.stderr)
+        self.assertEqual(self._snapshot_protected(), before)
+
+    def test_disable_failure_restores_enabled_state_and_reference(self) -> None:
+        self._enable_for_restore()
+        before = self._snapshot_protected()
+        for flag in ('fail_write_once', 'fail_cc_once', 'no_effect_once'):
+            with self.subTest(flag=flag):
+                self._bbr_state(**{flag: True})
+                result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._snapshot_protected(), before)
+
+    def test_disable_removal_failure_after_unlink_rolls_back(self) -> None:
+        self._enable_for_restore()
+        before = self._snapshot_protected()
+        for variable in ('BBR_SYSCTL_FILE', 'BBR_RESTORE_FILE'):
+            with self.subTest(variable=variable):
+                body = 'BBR_TEST_FAIL_PATH=$' + variable + r'''
+rm() { command rm "$@"; local result=$?; if [[ ${*: -1} == "$BBR_TEST_FAIL_PATH" ]]; then return 1; fi; return "$result"; }
+confirm() { return 0; }; disable_bbr_locked
+'''
+                result = self.shell(body)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._snapshot_protected(), before)
+
+    def test_disable_term_after_restore_rolls_back(self) -> None:
+        self._enable_for_restore()
+        before = self._snapshot_protected()
+        result = self.shell(r'''
+rm() { command rm "$@"; if [[ ${*: -1} == "$BBR_RESTORE_FILE" ]]; then kill -TERM "$BASHPID"; fi; }
+confirm() { return 0; }; disable_bbr_locked
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._snapshot_protected(), before)
+
+    def test_enable_restore_pointer_write_failure_rolls_back(self) -> None:
+        before = self._snapshot_protected()
+        result = self.shell(r'''
+eval "$(declare -f atomic_copy | sed '1s/^atomic_copy/real_atomic_copy/')"
+atomic_copy() { real_atomic_copy "$@"; if [[ $2 == "$BBR_RESTORE_FILE" ]]; then return 1; fi; }
+confirm() { return 0; }; enable_bbr_locked
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._snapshot_protected(), before)
+
+    def test_disable_rejects_missing_corrupt_or_symlink_backup(self) -> None:
+        reference = self._enable_for_restore()
+        backup = self.state_dir / 'backups' / reference.decode().strip()
+        runtime = backup / 'runtime.json'
+        original = runtime.read_bytes()
+        for bad in (b'{', b'{}', b'{"tcp_congestion_control":"bad value","default_qdisc":"fq","config_existed":false,"config_mode":"644"}'):
+            with self.subTest(bad=bad):
+                runtime.write_bytes(bad)
+                before = self._snapshot_protected()
+                result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._snapshot_protected(), before)
+        runtime.write_bytes(original)
+        self.restore_file.write_text('../outside')
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertNotEqual(result.returncode, 0)
+        self.restore_file.unlink()
+        self.restore_file.symlink_to(runtime)
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertNotEqual(result.returncode, 0)
+        self.restore_file.unlink()
+        self.restore_file.write_bytes(reference)
+        runtime.unlink()
+        result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_disable_confirmation_change_refuses_without_overwrite(self) -> None:
+        self._enable_for_restore()
+        before = self._snapshot_protected()
+        result = self.shell(r'''
+confirm() { printf '# foreign update\n' > "$BBR_SYSCTL_FILE"; return 0; }; disable_bbr_locked
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.bbr_file.read_bytes(), b'# foreign update\n')
+        after = self._snapshot_protected()
+        for key in before:
+            if key != 'bbr-file':
+                self.assertEqual(after[key], before[key])
+
+    def test_disable_rejects_corrupt_original_config_backup(self) -> None:
+        self.bbr_file.write_bytes(b'# Managed by sing-box-manager: TCP BBR\nnet.core.default_qdisc=fq_codel\n')
+        reference = self._enable_for_restore()
+        saved = self.state_dir / 'backups' / reference.decode().strip() / 'sysctl.conf'
+        for bad in (b'# broken\n', b'# Managed by sing-box-manager: TCP BBR\nnet.ipv4.ip_forward=1\n'):
+            with self.subTest(bad=bad):
+                saved.write_bytes(bad)
+                before = self._snapshot_protected()
+                result = self.shell('confirm() { return 0; }; disable_bbr_locked')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._snapshot_protected(), before)
+
+    def test_failed_pointer_rollback_keeps_permanent_original_reference(self) -> None:
+        reference = self._enable_for_restore()
+        result = self.shell(r'''
+eval "$(declare -f atomic_copy | sed '1s/^atomic_copy/real_atomic_copy/')"
+atomic_copy() { if [[ $2 == "$BBR_RESTORE_FILE" ]]; then return 1; fi; real_atomic_copy "$@"; }
+rm() { command rm "$@"; local result=$?; if [[ ${*: -1} == "$BBR_RESTORE_FILE" ]]; then return 1; fi; return "$result"; }
+confirm() { return 0; }; disable_bbr_locked
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('自动恢复未完全成功', result.stdout + result.stderr)
+        saved = list((self.state_dir / 'backups').glob('bbr-*/active-before'))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), reference)
+        self.assertEqual(saved[0].stat().st_mode & 0o777, 0o600)
 
     def test_enable_loads_missing_bbr_module_before_writing(self) -> None:
         self._bbr_state(available="reno cubic")
@@ -387,25 +561,31 @@ safe_paths() { return 0; }
 is_managed() { return 0; }
 with_lock() { printf 'LOCK:%s\n' "$*"; "$@"; }
 enable_bbr_locked() { printf 'BBR_ENABLED\n'; }
+disable_bbr_locked() { printf 'BBR_DISABLED\n'; }
 show_bbr_status() { printf 'BBR_STATUS\n'; }
 main bbr
 main bbr-status
+main bbr-disable
 main bbr extra >/dev/null 2>&1 || printf 'INVALID\n'
+main bbr-disable extra >/dev/null 2>&1 || printf 'INVALID_DISABLE\n'
 '''
         result = self.shell(body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("LOCK:enable_bbr_locked", result.stdout)
         self.assertIn("BBR_STATUS", result.stdout)
+        self.assertIn("LOCK:disable_bbr_locked", result.stdout)
+        self.assertIn("BBR_DISABLED", result.stdout)
+        self.assertIn("INVALID_DISABLE", result.stdout)
         self.assertIn("INVALID", result.stdout)
 
     @unittest.skipUnless(pty is not None, "PTY support is required for menu routing")
     def test_menu_fifteen_calls_bbr(self) -> None:
-        command = 'source "$1"; show_status(){ :; }; enable_bbr(){ printf "BBR_MENU\\n"; }; menu'
+        command = 'source "$1"; show_status(){ :; }; enable_bbr(){ printf "BBR_MENU\\n"; }; disable_bbr(){ printf "BBR_DISABLE_MENU\\n"; }; menu'
         env = self.env.copy()
         pid, fd = pty.fork()
         if pid == 0:
             os.execvpe("bash", ["bash", "-c", command, "bbr-menu", str(fixture.SCRIPT)], env)
-        os.write(fd, b"15\n\n0\n")
+        os.write(fd, b"15\n\n16\n\n0\n")
         chunks: list[bytes] = []
         deadline = time.time() + 5
         status: int | None = None
@@ -427,6 +607,7 @@ main bbr extra >/dev/null 2>&1 || printf 'INVALID\n'
         output = b"".join(chunks).decode("utf-8", errors="replace")
         self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
         self.assertIn("BBR_MENU", output)
+        self.assertIn("BBR_DISABLE_MENU", output)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 13 | 配置维护 | 成套备份、列表、恢复、批量客户端导出、只读诊断 |
 | 14 | 更新面板脚本 | 获取 GitHub 最新脚本，检查并备份旧版后替换，成功后重新载入菜单 |
 | 15 | 开启 TCP BBR | 确认后检查内核能力、备份参数和专属配置，启用并持久化，失败恢复 |
+| 16 | 关闭 BBR（恢复开启前设置） | 使用本面板的开启记录恢复原算法、默认队列及原配置文件状态，失败回滚 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -187,6 +188,7 @@ sudo sing-box update              # 独立更新到官方最新稳定核心
 sudo sing-box update-panel        # 更新本项目面板脚本到 GitHub main 最新版本，自动备份
 sudo sing-box bbr-status          # 只读查看当前 TCP 算法、默认 qdisc 和已注册算法
 sudo sing-box bbr                 # 确认后启用系统 TCP BBR，并写入持久化配置
+sudo sing-box bbr-disable         # 确认后恢复本面板开启 BBR 前的参数及配置
 sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
 sudo sing-box enable              # 开机自启，不立即启动
@@ -233,7 +235,11 @@ sudo sing-box core run -c /root/another-config.json
 
 v1.6.0 起选择主菜单 **15. 开启 TCP BBR**，或执行 `sudo sing-box bbr`。先显示内核及当前参数，确认后才加载所需模块、修改系统设置。只读检查使用 `sudo sing-box bbr-status`。部署或更新面板本身不会自动启用 BBR。
 
-设置仅包含 `net.ipv4.tcp_congestion_control=bbr` 和 `net.core.default_qdisc=fq`，写入 `/etc/sysctl.d/99-sing-box-manager-bbr.conf`（权限 `644`）。不会修改其他 sysctl 文件。更新前将旧参数保存至 `/var/lib/sing-box-manager/backups/bbr-*/runtime.json`，已有本项目专属文件另保存为 `sysctl.conf`，备份权限为 `600`；写入、验证或中断失败时恢复原参数及文件。不支持的内核、模块加载受限、同名文件不属于本项目、符号链接或后续持久配置冲突时拒绝设置。已有持久化设置和运行参数都符合目标时不重复写入或备份。
+v1.7.0 起增加主菜单 **16. 关闭 BBR（恢复开启前设置）**，也可执行 `sudo sing-box bbr-disable`。成功开启时，通过权限为 `600` 的 `/var/lib/sing-box-manager/bbr-active` 关联开启前备份；重复开启不会覆盖原恢复记录。关闭前显示将恢复的 TCP 算法和默认队列，确认后备份当前状态，再恢复开启前的参数；原来没有专属配置文件时删除本面板新建的文件，原来存在时恢复其完整内容及权限。成功后清除活动恢复记录，历史备份保留。关闭失败或中断会恢复到关闭操作前的状态，并保留恢复记录以便重试。
+
+关闭恢复的是开启前的实际状态，不强制改为 CUBIC：如果原来已经使用 BBR，恢复后仍为 BBR，并明确提示。外部工具启用的 BBR、v1.6.0 未关联活动记录的历史操作，以及记录损坏或备份丢失时，不会自动选择某个历史备份或猜测原值；会拒绝恢复并提示人工核对。确认期间记录、备份或当前设置发生变化也会取消操作。不会改动其他工具的 sysctl 文件；恢复原文件状态后，重启时仍按原有系统配置加载，原运行值与原持久配置本身可能并不一致。
+
+设置仅包含 `net.ipv4.tcp_congestion_control=bbr` 和 `net.core.default_qdisc=fq`，写入 `/etc/sysctl.d/99-sing-box-manager-bbr.conf`（权限 `644`）。不会修改其他 sysctl 文件。更新前将旧参数及文件权限保存至 `/var/lib/sing-box-manager/backups/bbr-*/runtime.json`，已有本项目专属文件另保存为 `sysctl.conf`，备份权限为 `600`；写入、验证或中断失败时恢复原参数及文件。不支持的内核、模块加载受限、同名文件不属于本项目、符号链接或后续持久配置冲突时拒绝设置。已有持久化设置和运行参数都符合目标时不重复写入或备份，也不会为旧版或外部设置补造“开启前”记录。
 
 系统会按 `sysctl.d` 同名文件优先级和加载顺序检查覆盖，并另外核对 `/etc/sysctl.conf`，以兼顾 systemd 和 procps；遇到歧义值或冲突会保守拒绝，请先人工核对。确认等待期间如果参数或文件被其他操作改动，也会取消此次设置。脚本不安装或更换内核，不下载第三方加速脚本；需要内核提供 `bbr`，未注册时尝试通过已有 `modprobe` 加载 `tcp_bbr`。失败后可能保留已加载的模块，不会强制卸载可能正在被使用的模块。
 
