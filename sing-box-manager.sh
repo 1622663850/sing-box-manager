@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.8.0"
+SB_MANAGER_VERSION="1.9.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -572,6 +572,94 @@ add_inbound_file() (
 import_config() {
     require_core || return
     commit_config "$1" replace
+}
+
+discover_acme_certificates() {
+    python3 - "$SB_ROOT_PREFIX" <<'PY_ACME_CERTIFICATES'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1] + "/root")
+home = root / ".acme.sh"
+entries, seen = [], set()
+
+def add(label, cert, key):
+    pair = (str(cert), str(key))
+    if (pair not in seen and cert.is_file() and key.is_file() and
+        all(ord(c) >= 32 and ord(c) != 127 for c in "".join(pair))):
+        entries.append({"label": label, "certificate": pair[0], "key": pair[1]})
+        seen.add(pair)
+
+try:
+    add("证书菜单默认部署路径", root / "cert.crt", root / "private.key")
+    if home.is_dir():
+        for directory in sorted(home.iterdir()):
+            if directory.is_dir() and not directory.is_symlink():
+                ecc = directory.name.endswith("_ecc")
+                domain = directory.name[:-4] if ecc else directory.name
+                add("ACME ECC" if ecc else "ACME 标准/RSA", directory / "fullchain.cer", directory / (domain + ".key"))
+    print(json.dumps(entries, ensure_ascii=True))
+except OSError:
+    print("无法读取 ACME 证书目录，请检查目录权限或文件系统。", file=sys.stderr)
+    sys.exit(1)
+PY_ACME_CERTIFICATES
+}
+
+prompt_tls_certificate_files() {
+    local name=$1 current_cert=${2:-} current_key=${3:-} entries entry cert_path key_path tls_choice
+    local -a matches=()
+    valid_host "$name" || { fail "TLS 证书域名/IP 无效。"; return 1; }
+    entries=$(discover_acme_certificates) || return 1
+    while IFS= read -r entry; do
+        cert_path=$(jq -r '.certificate' <<<"$entry") && key_path=$(jq -r '.key' <<<"$entry") || return 1
+        if validate_tls_files "$name" "$cert_path" "$key_path" >/dev/null 2>&1; then matches+=("$entry"); fi
+    done < <(jq -c '.[]' <<<"$entries")
+    if [[ ${#matches[@]} -gt 0 ]]; then
+        printf '\n可用 ACME 证书（匹配 SNI：%s，已检查有效期及密钥配对）\n' "$name"
+        local i=0
+        for entry in "${matches[@]}"; do
+            i=$((i + 1))
+            printf '  %s. %s\n     证书：%s\n     私钥：%s\n' "$i" \
+                "$(jq -r '.label' <<<"$entry")" "$(jq -r '.certificate' <<<"$entry")" "$(jq -r '.key' <<<"$entry")"
+        done
+        printf '  M. 手动输入证书和私钥路径\n'
+        if [[ -n $current_cert && -n $current_key ]]; then
+            printf '  0. 保留当前证书和私钥路径\n'
+            tls_choice=0
+        else
+            printf '  0. 取消本次配置\n'
+            tls_choice=M
+        fi
+        local default_choice=$tls_choice
+        while true; do
+            prompt tls_choice "请选择证书编号（M 手动）" "$default_choice" || return 1
+            case "$tls_choice" in
+                0)
+                    [[ -n $current_cert && -n $current_key ]] || return 1
+                    printf -v certificate '%s' "$current_cert"
+                    printf -v tls_key '%s' "$current_key"
+                    return 0 ;;
+                m|M) break ;;
+                *)
+                    if [[ $tls_choice =~ ^[1-9][0-9]{0,5}$ ]] && (( tls_choice <= ${#matches[@]} )); then
+                        entry=${matches[tls_choice - 1]}
+                        cert_path=$(jq -r '.certificate' <<<"$entry") && key_path=$(jq -r '.key' <<<"$entry") || return 1
+                        validate_tls_files "$name" "$cert_path" "$key_path" || return 1
+                        # Follow prompt's dynamic scope: both wizards own these two variables.
+                        printf -v certificate '%s' "$cert_path"
+                        printf -v tls_key '%s' "$key_path"
+                        info "已自动填写证书及私钥路径。"
+                        return 0
+                    fi
+                    warn "请输入有效的证书编号、M 或 0。" ;;
+            esac
+        done
+    else
+        info "未发现匹配 SNI 且有效的 ACME 证书，请手动填写路径。"
+    fi
+    prompt certificate "证书/完整证书链路径（.pem/.cer/.crt，内容须为 PEM；建议 fullchain）" "$current_cert" &&
+        prompt tls_key "私钥路径（.key，内容须为 PEM 且无口令）" "$current_key"
 }
 
 validate_tls_files() {
@@ -1282,8 +1370,7 @@ edit_wizard_locked() (
             ;;
         *-tls|hysteria2|tuic|anytls)
             prompt tls_name "TLS 证书域名/IP（客户端 SNI）" "$tls_name" || exit 1
-            prompt certificate "证书/完整证书链路径（.pem/.cer/.crt，内容须为 PEM；建议 fullchain）" "$certificate" || exit 1
-            prompt tls_key "私钥路径（.key，内容须为 PEM 且无口令）" "$tls_key" || exit 1
+            prompt_tls_certificate_files "$tls_name" "$certificate" "$tls_key" || exit 1
             ;;
     esac
     prompt server "客户端连接地址（回车保留，- 清除独立地址并使用默认）" "$server" || exit 1
@@ -1542,8 +1629,7 @@ add_wizard_locked() (
             info "请准备有效的 TLS 证书及私钥；客户端默认校验证书，不跳过验证。"
             info "自签证书或私有 CA 需要在客户端另行配置信任；分享链接不包含证书。"
             prompt tls_name "TLS 证书域名/IP（客户端 SNI）" || exit 1
-            prompt certificate "证书/完整证书链文件绝对路径（支持 .pem、.cer、.crt；文件内容须为 PEM 格式）" || exit 1
-            prompt tls_key "私钥文件绝对路径（.key；文件内容须为 PEM 格式且无口令）" || exit 1
+            prompt_tls_certificate_files "$tls_name" || exit 1
             ;;
     esac
     default_server=$(read_default_server) || exit 1
