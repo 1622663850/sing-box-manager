@@ -22,6 +22,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 14 | 更新面板脚本 | 获取 GitHub 最新脚本，检查并备份旧版后替换，成功后重新载入菜单 |
 | 15 | 开启 TCP BBR | 确认后检查内核能力、备份参数和专属配置，启用并持久化，失败恢复 |
 | 16 | 关闭 BBR（恢复开启前设置） | 使用本面板的开启记录恢复原算法、默认队列及原配置文件状态，失败回滚 |
+| 17 | 安装/打开 ACME 证书菜单 | 首次安装 acme-script 菜单，已安装时直接进入；退出后返回本面板 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -189,6 +190,7 @@ sudo sing-box update-panel        # 更新本项目面板脚本到 GitHub main �
 sudo sing-box bbr-status          # 只读查看当前 TCP 算法、默认 qdisc 和已注册算法
 sudo sing-box bbr                 # 确认后启用系统 TCP BBR，并写入持久化配置
 sudo sing-box bbr-disable         # 确认后恢复本面板开启 BBR 前的参数及配置
+sudo sing-box acme                # 安装/打开 acme-script 证书管理菜单
 sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
 sudo sing-box enable              # 开机自启，不立即启动
@@ -230,6 +232,14 @@ sudo sing-box core run -c /root/another-config.json
 | `/var/lib/sing-box-manager/backups/` | 配置、卸载及更新备份 |
 
 配置 JSON、连接元数据、配置备份权限为 `600`，配置和状态目录权限为 `700`。完整配置及连接信息包含凭据；请勿提交真实 UUID、密码、私钥、备份到仓库。日志由 systemd journal 管理。
+
+## ACME 证书菜单
+
+v1.8.0 起选择主菜单 **17. 安装/打开 ACME 证书菜单**，或运行 `sudo sing-box acme`，接入 [1622663850/acme-script](https://github.com/1622663850/acme-script)。首次从该仓库 `main` 分支下载 `acme_cf_token.sh`，校验 GitHub 响应、大小、Git Blob 摘要、项目标识及 Bash 语法，安装至 `/root/acme-script/acme_cf_token.sh`（权限 `700`），然后打开其菜单。再次进入直接使用已安装文件，不重复下载或自动更新。
+
+如果 `/root/acme_cf_token.sh` 已是同一项目且通过检查，则直接使用该文件；其他来源的同名脚本保留不动，在独立目录安装指定项目。专属安装目录中的无效文件或符号链接会拒绝使用及覆盖。下载、检查或首次写入失败时不执行脚本，写入期间失败或中断会清理未完成的安装。
+
+本入口安装的是证书管理**菜单脚本**，不会自动重新安装已有的 `/root/.acme.sh`，也不会自动申请证书、修改续期任务、证书文件或 sing-box 配置。请在证书菜单中选择所需操作；底层 acme.sh 的官方/代理安装及证书申请流程由该项目提供，第三方代理仅在你主动选择时使用。证书菜单作为独立 Bash 进程运行，进入前释放 sing-box 管理锁；从主菜单进入时，退出证书脚本即可返回本面板。当前上游用退出码 `1` 处理菜单 `0`，命令行直接运行 `sing-box acme` 时也保留其退出码。
 
 ## 开启 TCP BBR
 

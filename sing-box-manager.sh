@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.7.0"
+SB_MANAGER_VERSION="1.8.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -17,6 +17,8 @@ DEFAULT_SERVER_FILE="$STATE_DIR/default-server"
 BBR_SYSCTL_DIR="${SB_ROOT_PREFIX}/etc/sysctl.d"
 BBR_SYSCTL_FILE="$BBR_SYSCTL_DIR/99-sing-box-manager-bbr.conf"
 BBR_RESTORE_FILE="$STATE_DIR/bbr-active"
+ACME_MENU_DIR="${SB_ROOT_PREFIX}/root/acme-script"
+ACME_MENU_SCRIPT="$ACME_MENU_DIR/acme_cf_token.sh"
 UNIT_FILE="${SB_ROOT_PREFIX}/etc/systemd/system/sing-box.service"
 MANAGED_MARKER="$LIB_DIR/.managed"
 SERVICE="sing-box.service"
@@ -697,6 +699,35 @@ download_https() {
         --connect-timeout 20 --max-time "${3:-600}" --retry 3 --retry-delay 2 "$1" -o "$2"
 }
 
+decode_github_file() {
+    python3 - "$1" "$2" "$3" <<'PY_GITHUB_FILE'
+import base64
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+def require(condition):
+    if not condition:
+        raise ValueError("invalid GitHub response")
+
+try:
+    entry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    require(entry["type"] == "file" and entry["path"] == sys.argv[3])
+    require(entry["encoding"] == "base64" and type(entry["size"]) is int)
+    require(0 < entry["size"] <= 1048576 and re.fullmatch(r"[a-f0-9]{40}", entry["sha"]))
+    content = base64.b64decode("".join(entry["content"].split()), validate=True)
+    require(len(content) == entry["size"] and b"\0" not in content)
+    digest = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
+    require(digest == entry["sha"])
+    Path(sys.argv[2]).write_bytes(content)
+except Exception:
+    print("GitHub 响应、文件大小或摘要检查失败。", file=sys.stderr)
+    sys.exit(1)
+PY_GITHUB_FILE
+}
+
 detect_arch() {
     case "${1:-$(uname -m)}" in
         x86_64|amd64) printf 'amd64\n' ;;
@@ -810,35 +841,22 @@ update_panel_locked() (
     info "正在从 GitHub 获取最新面板脚本。"
     download_https 'https://api.github.com/repos/1622663850/sing-box-manager/contents/sing-box-manager.sh?ref=main' \
         "$work/source.json" 60 || { fail "面板下载失败，旧版本保留。"; exit 1; }
-    version=$(python3 - "$work/source.json" "$work/panel.sh" <<'PY_PANEL_DOWNLOAD'
-import base64
-import hashlib
-import json
+    decode_github_file "$work/source.json" "$work/panel.sh" sing-box-manager.sh || exit 1
+    version=$(python3 - "$work/panel.sh" <<'PY_PANEL_DOWNLOAD'
 from pathlib import Path
 import re
 import sys
 
-def require(condition):
-    if not condition:
-        raise ValueError("invalid panel response")
-
 try:
-    entry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    require(entry["type"] == "file" and entry["path"] == "sing-box-manager.sh")
-    require(entry["encoding"] == "base64" and type(entry["size"]) is int)
-    require(0 < entry["size"] <= 1048576 and re.fullmatch(r"[a-f0-9]{40}", entry["sha"]))
-    content = base64.b64decode("".join(entry["content"].split()), validate=True)
-    require(len(content) == entry["size"] and b"\0" not in content)
-    digest = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
-    require(digest == entry["sha"])
-    require(content.startswith(b"#!/usr/bin/env bash\n"))
-    require(b"# sing-box-manager: a self-contained Chinese terminal manager." in content.splitlines())
+    content = Path(sys.argv[1]).read_bytes()
     versions = re.findall(rb'^SB_MANAGER_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$', content, re.M)
-    require(len(versions) == 1)
-    Path(sys.argv[2]).write_bytes(content)
+    if (not content.startswith(b"#!/usr/bin/env bash\n") or
+        b"# sing-box-manager: a self-contained Chinese terminal manager." not in content.splitlines() or
+        len(versions) != 1):
+        raise ValueError("invalid panel identity")
     print(versions[0].decode("ascii"))
 except Exception:
-    print("GitHub 面板响应、文件摘要或脚本标识检查失败。", file=sys.stderr)
+    print("面板脚本标识或版本号检查失败。", file=sys.stderr)
     sys.exit(1)
 PY_PANEL_DOWNLOAD
     ) || { fail "下载内容未通过检查，旧版本保留。"; exit 1; }
@@ -2200,6 +2218,79 @@ disable_bbr() {
     with_lock disable_bbr_locked
 }
 
+validate_acme_menu() {
+    [[ -f $1 && ! -L $1 && -s $1 ]] &&
+        [[ $(stat -c '%s' "$1") -le 1048576 ]] &&
+        grep -Fq 'https://github.com/1622663850/acme-script' "$1" &&
+        grep -Eq '^menu[[:space:]]*\([[:space:]]*\)[[:space:]]*\{' "$1" &&
+        bash -n "$1" 9>&-
+}
+
+ensure_acme_menu_locked() (
+    umask 077
+    local script work staged="" transaction=0
+    safe_paths || exit 1
+    [[ ! -L $ACME_MENU_DIR && ( ! -e $ACME_MENU_DIR || -d $ACME_MENU_DIR ) ]] || {
+        fail "ACME 菜单目录无效，拒绝操作符号链接。"; exit 1;
+    }
+    for script in "$ACME_MENU_SCRIPT" "${SB_ROOT_PREFIX}/root/acme_cf_token.sh"; do
+        if [[ -e $script || -L $script ]]; then
+            if validate_acme_menu "$script"; then
+                printf '%s\n' "$script"
+                exit 0
+            fi
+            [[ $script != "$ACME_MENU_SCRIPT" ]] || {
+                fail "现有 ACME 菜单未通过检查，不会覆盖：$script"; exit 1;
+            }
+            warn "发现其他或无效的同名证书脚本，将保留原文件，另行安装指定项目的菜单。"
+        fi
+    done
+    info "首次安装 acme-script 菜单：从 1622663850/acme-script 获取脚本。" >&2
+    info "此步骤只安装菜单；申请证书或安装 acme.sh 请在证书菜单中选择。" >&2
+    work=$(mktemp -d "$STATE_DIR/acme-menu.XXXXXX") || exit 1
+    # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
+    cleanup_acme_menu() {
+        local result=$?
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 && -n $staged && ! -L $ACME_MENU_SCRIPT && $staged -ef $ACME_MENU_SCRIPT ]]; then
+            rm -f -- "$ACME_MENU_SCRIPT" || result=1
+        fi
+        [[ -z $staged ]] || rm -f -- "$staged" || result=1
+        rm -rf -- "$work"
+        exit "$result"
+    }
+    trap cleanup_acme_menu EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    download_https 'https://api.github.com/repos/1622663850/acme-script/contents/acme_cf_token.sh?ref=main' \
+        "$work/source.json" 60 || { fail "ACME 菜单下载失败，请稍后重试。"; exit 1; }
+    if ! decode_github_file "$work/source.json" "$work/acme.sh" acme_cf_token.sh ||
+       ! validate_acme_menu "$work/acme.sh"; then
+        fail "ACME 菜单下载内容未通过检查。"; exit 1
+    fi
+    [[ ! -e $ACME_MENU_SCRIPT && ! -L $ACME_MENU_SCRIPT && ! -L $ACME_MENU_DIR ]] || {
+        fail "ACME 菜单路径已被其他操作修改，请重试。"; exit 1;
+    }
+    [[ -d $ACME_MENU_DIR ]] || install -d -m 700 "$ACME_MENU_DIR" || exit 1
+    staged=$(mktemp "$ACME_MENU_SCRIPT.tmp.XXXXXX") || exit 1
+    install -m 700 "$work/acme.sh" "$staged" || exit 1
+    transaction=1
+    # Publish without replacing a file created by another process during download.
+    ln -T -- "$staged" "$ACME_MENU_SCRIPT" || exit 1
+    cmp -s "$work/acme.sh" "$ACME_MENU_SCRIPT" || exit 1
+    transaction=0
+    printf '%s\n' "$ACME_MENU_SCRIPT"
+)
+
+open_acme_menu() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box acme"; return 1; }
+    local script
+    script=$(with_lock ensure_acme_menu_locked) || return
+    info "正在打开 ACME 证书菜单，退出后返回 sing-box 面板。"
+    # Release the manager lock before handing control to the independent menu.
+    bash "$script" 9>&-
+}
+
 show_status() {
     local active enabled version="未安装"
     local green="" red="" yellow="" dim="" reset=""
@@ -2244,8 +2335,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n 16. 关闭 BBR（恢复开启前设置）\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-16]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 设置开机自启\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n 16. 关闭 BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-17]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -2268,8 +2359,9 @@ menu() {
                 ;;
             15) enable_bbr || true ;;
             16) disable_bbr || true ;;
+            17) open_acme_menu || true ;;
             0) return 0 ;;
-            *) warn "请输入 0–16。" ;;
+            *) warn "请输入 0–17。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -2289,6 +2381,7 @@ sing-box 中文终端管理面板
   sing-box bbr                    确认后开启系统 TCP BBR，备份并持久化
   sing-box bbr-disable            确认后恢复本面板开启 BBR 前的参数及配置
   sing-box bbr-status             只读查看 TCP 拥塞控制及默认队列规则
+  sing-box acme                   安装/打开 acme-script 证书管理菜单
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
   sing-box enable                 设置开机自启（不改变当前运行状态）
@@ -2335,7 +2428,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|acme|uninstall|start|restart|enable|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2357,6 +2450,7 @@ main() {
         bbr) enable_bbr "$@" ;;
         bbr-disable) disable_bbr "$@" ;;
         bbr-status) show_bbr_status "$@" ;;
+        acme) open_acme_menu "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;
