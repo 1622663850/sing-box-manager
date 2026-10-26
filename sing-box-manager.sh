@@ -663,15 +663,17 @@ prompt_tls_certificate_files() {
 }
 
 validate_tls_files() {
-    local name=$1 certificate=$2 key=$3 cert_public key_public start match_option=-checkhost
+    local name=$1 certificate=$2 key=$3 cert_public key_public start identity_match match_option=-checkhost
     valid_host "$name" || { fail "TLS 证书域名/IP 无效。"; return 1; }
     [[ $certificate == /* && -f $certificate && -r $certificate &&
        $key == /* && -f $key && -r $key ]] || {
         fail "请提供可读的证书和私钥文件绝对路径。"; return 1;
     }
     [[ $name != *:* && ! $name =~ ^[0-9.]+$ ]] || match_option=-checkip
+    # Older OpenSSL returns zero even for a negative -checkhost/-checkip result.
     if ! openssl x509 -in "$certificate" -noout -checkend 0 >/dev/null 2>&1 ||
-       ! openssl x509 -in "$certificate" -noout "$match_option" "$name" >/dev/null 2>&1; then
+       ! identity_match=$(LC_ALL=C openssl x509 -in "$certificate" -noout "$match_option" "$name" 2>/dev/null) ||
+       [[ $identity_match != *' does match certificate' ]]; then
         fail "证书无效、已过期或不匹配 TLS 域名/IP。"; return 1
     fi
     start=$(openssl x509 -in "$certificate" -noout -startdate 2>/dev/null) || return 1

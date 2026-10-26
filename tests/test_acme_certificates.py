@@ -228,6 +228,33 @@ certificate=''; tls_key=''; prompt_tls_certificate_files root.example.com '' '';
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"{manual_cert}|{manual_key}", result.stdout)
 
+    def test_tls_identity_validation_does_not_trust_old_openssl_checkhost_exit_code(self) -> None:
+        real_openssl = shutil.which("openssl")
+        if not real_openssl:
+            self.skipTest("openssl is required")
+        cert, key = self._pair(self.root / "identity-cert", "good.example.com")
+        wrapper = self.bin / "openssl"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ ${1:-} == x509 && \" $* \" == *\" -checkhost \"* || \" $* \" == *\" -checkip \"* ]]; then\n"
+            "  \"$REAL_OPENSSL\" \"$@\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exec \"$REAL_OPENSSL\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        self.env["REAL_OPENSSL"] = real_openssl
+        for identity in ("wrong.example.com", "127.0.0.1"):
+            with self.subTest(identity=identity):
+                result = self.shell('validate_tls_files "$1" "$2" "$3"', identity, str(cert), str(key))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.shell(
+            'validate_tls_files "$1" "$2" "$3"',
+            "good.example.com", str(cert), str(key),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_add_routes_all_seven_regular_tls_templates_to_helper(self) -> None:
         log = self.root / "tls-route.log"
         body = r'''
