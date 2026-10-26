@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.10.1"
+SB_MANAGER_VERSION="1.11.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -124,10 +124,20 @@ with_lock() (
 base_config() {
     cat <<'JSON'
 {
-  "log": {"level": "info", "timestamp": true},
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
   "inbounds": [],
-  "outbounds": [{"type": "direct", "tag": "direct"}],
-  "route": {"final": "direct"}
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
 }
 JSON
 }
@@ -211,7 +221,7 @@ config_jq() { json_query "$CONFIG_FILE" "$@"; }
 
 preserve_config_source() {
     have python3 || { fail "保留配置注释需要 Python 3，请重新运行 setup 安装依赖。"; return 1; }
-    python3 - "$1" "$2" <<'PY_JSONC_EDITOR'
+    python3 - "$@" <<'PY_JSONC_EDITOR'
 """Update JSONC values without rewriting untouched source text (stdlib only)."""
 import difflib
 import json
@@ -299,6 +309,8 @@ class Parser:
             else:
                 result.append(child.value)
             comma = self.take(",")[1] if self.peek() == "," else None
+            if comma is not None and self.peek() == close:
+                raise ValueError("trailing comma")
             items.append((key, member_start, child, comma))
             if comma is None:
                 break
@@ -338,6 +350,85 @@ def array_pairs(old, new):
     return pairs
 
 
+def format_source(source):
+    original = Parser(source).parse().value
+    tokens = [(m.group(), m.start(), m.end()) for m in TOKEN.finditer(source) if not m.group().isspace()]
+    newline = "\r\n" if "\r\n" in source else "\n"
+    lines, line, depth = [], "", 0
+
+    def write(text):
+        nonlocal line
+        if not line:
+            line = "  " * depth
+        line += text
+
+    def endline(keep_trailing=False):
+        nonlocal line
+        if line:
+            lines.append(line if keep_trailing else line.rstrip(" \t"))
+        line = ""
+
+    def space():
+        nonlocal line
+        if line and not line.endswith((" ", "\t")):
+            line += " "
+
+    index, last_end, after_comma = 0, 0, False
+    while index < len(tokens):
+        token, start, end = tokens[index]
+        comment = token.startswith(("//", "/*"))
+        gap = source[last_end:start]
+        same_line = "\n" not in gap and "\r" not in gap
+        if after_comma and not (comment and same_line):
+            endline()
+            after_comma = False
+        if comment:
+            inline = bool(line.strip()) and same_line
+            if inline:
+                space()
+            else:
+                endline()
+            write(token)
+            if token.startswith("//"):
+                endline(keep_trailing=True)
+                after_comma = False
+            elif not inline:
+                endline()
+            else:
+                space()
+        elif token in ("{", "["):
+            close = "}" if token == "{" else "]"
+            if index + 1 < len(tokens) and tokens[index + 1][0] == close:
+                write(token + close)
+                last_end = tokens[index + 1][2]
+                index += 2
+                continue
+            write(token)
+            depth += 1
+            endline()
+        elif token in ("}", "]"):
+            depth -= 1
+            endline()
+            write(token)
+        elif token == ",":
+            line = line.rstrip(" \t")
+            write(",")
+            after_comma = True
+        elif token == ":":
+            line = line.rstrip(" \t")
+            write(": ")
+        else:
+            write(token)
+        last_end = end
+        index += 1
+    endline()
+    result = newline.join(lines) + newline
+    result_tokens = [m.group() for m in TOKEN.finditer(result) if not m.group().isspace()]
+    if result_tokens != [t[0] for t in tokens] or signature(Parser(result).parse().value) != signature(original):
+        raise ValueError("formatting changed tokens or configuration values")
+    return result
+
+
 def update(source, candidate):
     root = Parser(source).parse()
     signature(candidate)
@@ -348,11 +439,14 @@ def update(source, candidate):
         line = source[source.rfind("\n", 0, position) + 1:position]
         return re.match(r"[ \t]*", line).group()
 
+    def pretty(value, spacing):
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2).replace("\n", newline + spacing)
+
     def change(node, value):
         if signature(node.value) == signature(value):
             return
         if type(node.value) is not type(value) or node.items is None:
-            edits.append((node.start, node.end, encode(value)))
+            edits.append((node.start, node.end, pretty(value, indent(node.start))))
             return
         is_object = isinstance(value, dict)
         if is_object:
@@ -391,18 +485,20 @@ def update(source, candidate):
             first = position
             while position < len(pairs) and pairs[position] is None:
                 position += 1
-            fresh = [(encode(keys[i]) + ": " if is_object else "") + encode(values[i])
-                     for i in range(first, position)]
             if position < len(pairs):
                 start = node.items[pairs[position]][1]
                 spacing = indent(start)
-                text = ("," + newline + spacing).join(fresh) + "," + newline + spacing
             else:
                 start = node.end - 1
                 closing_indent = indent(start)
                 spacing = indent(node.items[0][1]) if node.items else closing_indent + "  "
                 if spacing == closing_indent:
                     spacing += "  "
+            fresh = [(encode(keys[i]) + ": " if is_object else "") + pretty(values[i], spacing)
+                     for i in range(first, position)]
+            if position < len(pairs):
+                text = ("," + newline + spacing).join(fresh) + "," + newline + spacing
+            else:
                 text = newline + spacing + ("," + newline + spacing).join(fresh)
                 text += newline + closing_indent
             edits.append((start, start, text))
@@ -431,9 +527,12 @@ def main():
     try:
         if len(sys.argv) != 3:
             raise ValueError("arguments")
-        original = Path(sys.argv[1]).read_bytes().decode("utf-8")
-        candidate = json.loads(Path(sys.argv[2]).read_bytes().decode("utf-8"))
-        result = update(original, candidate).encode("utf-8")
+        if sys.argv[1] == "--format":
+            result = format_source(Path(sys.argv[2]).read_bytes().decode("utf-8")).encode("utf-8")
+        else:
+            original = Path(sys.argv[1]).read_bytes().decode("utf-8")
+            candidate = json.loads(Path(sys.argv[2]).read_bytes().decode("utf-8"))
+            result = update(original, candidate).encode("utf-8")
         sys.stdout.buffer.write(result)
     except Exception:
         print("JSONC 更新失败；原文件未修改。", file=sys.stderr)
@@ -445,6 +544,8 @@ if __name__ == "__main__":
     sys.exit(main())
 PY_JSONC_EDITOR
 }
+
+format_config_source() { preserve_config_source --format "$1"; }
 
 validate_config() {
     local file=$1
@@ -572,6 +673,77 @@ add_inbound_file() (
 import_config() {
     require_core || return
     commit_config "$1" replace
+}
+
+format_config_locked() (
+    umask 077
+    local work candidate="" backup="" mode published_inode="" transaction=0
+    safe_paths && require_core || exit 1
+    work=$(mktemp -d "$STATE_DIR/config-format.XXXXXX") || exit 1
+    # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
+    cleanup_config_format() {
+        local result=$? restore_candidate=""
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            if [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE &&
+                  $(stat -c '%d:%i' "$CONFIG_FILE") == "$published_inode" ]] &&
+               cmp -s "$work/formatted.json" "$CONFIG_FILE"; then
+                restore_candidate=$(mktemp "$CONFIG_DIR/.format-restore.XXXXXX") || true
+                if [[ -n $restore_candidate ]]; then
+                    if install -m "$mode" "$backup" "$restore_candidate"; then
+                        mv -fT -- "$restore_candidate" "$CONFIG_FILE" || true
+                    fi
+                    rm -f -- "$restore_candidate"
+                fi
+            fi
+            if [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] && cmp -s "$backup" "$CONFIG_FILE" &&
+               [[ $(stat -c '%a' "$CONFIG_FILE") == "$mode" ]]; then
+                warn "格式化未完成，已恢复原配置；服务未重启。"
+            else
+                warn "格式化恢复未完全成功，请使用备份核对：$backup"
+            fi
+            result=1
+        fi
+        [[ -z $candidate ]] || rm -f -- "$candidate"
+        rm -rf -- "$work"
+        exit "$result"
+    }
+    trap cleanup_config_format EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mode=$(stat -c '%a' "$CONFIG_FILE") || exit 1
+    install -m 600 "$CONFIG_FILE" "$work/original.json" || exit 1
+    format_config_source "$work/original.json" >"$work/formatted.json" || exit 1
+    if ! validate_config "$work/formatted.json" >"$work/check.log" 2>&1; then
+        fail "格式化后的配置未通过核心校验，原文件未修改。"; exit 1
+    fi
+    if cmp -s "$work/original.json" "$work/formatted.json"; then
+        info "配置已采用标准缩进，无需格式化。"; exit 0
+    fi
+    confirm "格式化配置文件？（保留注释和所有配置值，先备份，不重启服务）" || exit 0
+    safe_paths || exit 1
+    if [[ ! -f $CONFIG_FILE ]] || ! cmp -s "$work/original.json" "$CONFIG_FILE" ||
+       [[ $(stat -c '%a' "$CONFIG_FILE") != "$mode" ]]; then
+        fail "配置在确认期间被其他操作修改，已取消格式化。"; exit 1
+    fi
+    install -d -m 700 "$BACKUP_DIR" || exit 1
+    backup=$(mktemp "$BACKUP_DIR/format-$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || exit 1
+    install -m 600 "$work/original.json" "$backup" || exit 1
+    candidate=$(mktemp "$CONFIG_DIR/.format-candidate.XXXXXX") || exit 1
+    install -m "$mode" "$work/formatted.json" "$candidate" || exit 1
+    published_inode=$(stat -c '%d:%i' "$candidate") || exit 1
+    transaction=1
+    mv -fT -- "$candidate" "$CONFIG_FILE" || exit 1
+    cmp -s "$work/formatted.json" "$CONFIG_FILE" &&
+        [[ $(stat -c '%a' "$CONFIG_FILE") == "$mode" ]] || exit 1
+    transaction=0
+    info "配置文件已按 2 空格缩进换行，注释和配置值均保留；服务未重启。"
+    info "原文件备份：$backup"
+)
+
+format_config() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box format-config"; return 1; }
+    with_lock format_config_locked
 }
 
 discover_acme_certificates() {
@@ -2018,7 +2190,7 @@ show_config() {
     require_core || return
     local choice selected_tag=""
     while true; do
-        printf '\n查看配置\n  1. 配置列表和完整分享链接\n  2. 完整服务端 JSON（包含密码/私钥）\n  3. 客户端 outbound JSON 和分享链接\n  4. 检查当前配置\n  5. 设置默认公网 IP/域名\n  6. 修改配置\n  7. 删除配置\n  8. 备份、恢复、批量导出和诊断\n  0. 返回\n'
+        printf '\n查看配置\n  1. 配置列表和完整分享链接\n  2. 完整服务端 JSON（包含密码/私钥）\n  3. 客户端 outbound JSON 和分享链接\n  4. 检查当前配置\n  5. 设置默认公网 IP/域名\n  6. 修改配置\n  7. 删除配置\n  8. 备份、恢复、批量导出和诊断\n  9. 格式化配置文件（保留注释）\n  0. 返回\n'
         prompt choice "请选择" 1 || return 0
         case "$choice" in
             0) return 0 ;;
@@ -2030,6 +2202,7 @@ show_config() {
             6) with_lock edit_wizard_locked ;;
             7) with_lock delete_inbound ;;
             8) management_menu || true; continue ;;
+            9) format_config ;;
             *) fail "无效选项。" ;;
         esac || true
         read -r -p "按回车键返回查看配置菜单..." choice || return 0
@@ -2517,6 +2690,7 @@ sing-box 中文终端管理面板
   sing-box client TAG [SERVER]    输出客户端 outbound JSON 与分享链接
   sing-box server [IP/域名|-]     设置默认连接地址；无参数打开向导，- 清除
   sing-box validate               检查实际服务配置
+  sing-box format-config          格式化配置文件，保留注释和值，备份且不重启服务
   sing-box remove-panel           核心卸载后移除面板命令
   sing-box help                   此帮助
 
@@ -2542,7 +2716,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2601,6 +2775,7 @@ main() {
             show_client "$1" "${2:-}"
             ;;
         validate) require_core && validate_config "$CONFIG_FILE" ;;
+        format-config) format_config "$@" ;;
     esac
 }
 

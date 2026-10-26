@@ -81,6 +81,8 @@ sudo sing-box
 
 v1.10.1 起，“查看配置”“配置维护”和“开机自启”菜单中的操作完成、取消或报错后，按回车仍留在当前子菜单。只有选择 **0** 才返回上一级：“配置维护”从“查看配置”进入时返回“查看配置”，从主菜单进入时返回主菜单；返回上一级无需再额外按回车。
 
+v1.11.0 起，新建配置和新增节点采用 **2 空格缩进、多行 JSON 排版**，方便直接编辑文件。已有文件可通过 **主菜单 9 → 9. 格式化配置文件（保留注释）**，或 `sudo sing-box format-config` 整理。格式化前自动备份原文件，保留 `//`、`/* ... */` 注释、字符串及数字原写法、字段顺序和全部配置值；先通过核心校验，再原子替换文件。只调整空白和缩进，不重启服务，不修改客户端连接信息；失败时恢复原文件，已格式化的文件不重复写入或备份。普通编辑仍保留未修改部分的原有排版，完整导入仍保留导入文件原文。
+
 1. **VLESS + TCP + REALITY + Vision**：自动生成 UUID、密钥及 short ID；填写握手域名和监听端口。
 2. **VLESS + WebSocket，无 TLS**：自动生成 UUID；填写端口和 WS 路径。
 3. **VLESS TCP，无 TLS**：自动生成 UUID；填写监听端口。
@@ -121,6 +123,7 @@ sudo sing-box client my-node example.com
 sudo sing-box add-file /root/inbound.json
 sudo sing-box import /root/config.json
 sudo sing-box validate
+sudo sing-box format-config         # 整理实际配置文件；先备份，保留注释，不重启服务
 ```
 
 客户端导出支持上述协议向导生成的配置，提供 sing-box outbound JSON 和分享链接（VMess 为 Base64 JSON 链接）。不同客户端对协议及链接格式的支持有差异，以生成的 sing-box JSON 为准。其他导入配置不保证能导出；超出模板的 TLS、传输或认证设置会被拒绝导出。导入的 REALITY 节点若没有对应公钥元数据，将拒绝生成不完整客户端信息。导出的 JSON 是 **outbound 对象**，应放入客户端完整配置的 `outbounds` 数组。
