@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.12.1"
+SB_MANAGER_VERSION="1.12.2"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -18,7 +18,7 @@ BBR_SYSCTL_DIR="${SB_ROOT_PREFIX}/etc/sysctl.d"
 BBR_SYSCTL_FILE="$BBR_SYSCTL_DIR/99-sing-box-manager-bbr.conf"
 BBR_RESTORE_FILE="$STATE_DIR/bbr-active"
 ACME_MENU_DIR="${SB_ROOT_PREFIX}/root/acme-script"
-ACME_MENU_SCRIPT="$ACME_MENU_DIR/acme_cf_token.sh"
+ACME_MENU_SCRIPT="$ACME_MENU_DIR/acme_cf_token_menu_v1.sh"
 UNIT_FILE="${SB_ROOT_PREFIX}/etc/systemd/system/sing-box.service"
 MANAGED_MARKER="$LIB_DIR/.managed"
 SERVICE="sing-box.service"
@@ -2549,6 +2549,7 @@ validate_acme_menu() {
     [[ -f $1 && ! -L $1 && -s $1 ]] &&
         [[ $(stat -c '%s' "$1") -le 1048576 ]] &&
         grep -Fq 'https://github.com/1622663850/acme-script' "$1" &&
+        grep -Fxq '# acme-script: persistent-menu-v1' "$1" &&
         grep -Eq '^menu[[:space:]]*\([[:space:]]*\)[[:space:]]*\{' "$1" &&
         bash -n "$1" 9>&-
 }
@@ -2572,7 +2573,7 @@ ensure_acme_menu_locked() (
             warn "发现其他或无效的同名证书脚本，将保留原文件，另行安装指定项目的菜单。"
         fi
     done
-    info "首次安装 acme-script 菜单：从 1622663850/acme-script 获取脚本。" >&2
+    info "正在获取支持取消及失败返回的 ACME 菜单组件（不重装 acme.sh）。" >&2
     info "此步骤只安装菜单；申请证书或安装 acme.sh 请在证书菜单中选择。" >&2
     work=$(mktemp -d "$STATE_DIR/acme-menu.XXXXXX") || exit 1
     # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
@@ -2614,16 +2615,9 @@ open_acme_menu() {
     local script
     script=$(with_lock ensure_acme_menu_locked) || return
     info "正在打开 ACME 证书菜单，退出后返回 sing-box 面板。"
-    # The upstream menu handles one action per process; success stays in ACME.
-    # The manager lock remains released during the external menu and pause.
-    local _acme_pause
-    while true; do
-        if bash "$script" 9>&-; then
-            read -r -p "按回车键返回 ACME 证书菜单..." _acme_pause || return 0
-        else
-            return $?
-        fi
-    done
+    # persistent-menu-v1 returns only on main-menu exit or terminal closure.
+    # Actions run in child shells so their errors cannot exit the ACME menu.
+    bash "$script" 9>&-
 }
 
 show_status() {

@@ -32,7 +32,7 @@ class AcmeMenuTest(unittest.TestCase):
         self.marker.chmod(0o600)
         self.acme_root = self.root / "root"
         self.acme_dir = self.acme_root / "acme-script"
-        self.acme_script = self.acme_dir / "acme_cf_token.sh"
+        self.acme_script = self.acme_dir / "acme_cf_token_menu_v1.sh"
         self.legacy_script = self.acme_root / "acme_cf_token.sh"
         self.acme_state = self.acme_root / ".acme.sh"
         self.acme_state.mkdir(parents=True)
@@ -50,6 +50,7 @@ class AcmeMenuTest(unittest.TestCase):
         if not syntax_ok:
             return (
                 "#!/usr/bin/env bash\n"
+                "# acme-script: persistent-menu-v1\n"
                 "# https://github.com/1622663850/acme-script\n"
                 "menu() { if (; then\n"
             ).encode("utf-8")
@@ -62,6 +63,7 @@ class AcmeMenuTest(unittest.TestCase):
         ) if menu_lock_check else '  printf "ACME_MENU_OK\\n"\n'
         return (
             "#!/usr/bin/env bash\n"
+            "# acme-script: persistent-menu-v1\n"
             "# https://github.com/1622663850/acme-script\n"
             "menu() {\n"
             + check +
@@ -72,6 +74,7 @@ class AcmeMenuTest(unittest.TestCase):
     def _persistent_candidate(self) -> bytes:
         return (
             "#!/usr/bin/env bash\n"
+            "# acme-script: persistent-menu-v1\n"
             "# https://github.com/1622663850/acme-script\n"
             "menu() {\n"
             '  lock="${SB_ROOT_PREFIX}/var/lib/sing-box-manager/manager.lock"\n'
@@ -81,13 +84,18 @@ class AcmeMenuTest(unittest.TestCase):
             '  count_file="${SB_ROOT_PREFIX}/acme-call-count"\n'
             '  count=0; [[ -f "$count_file" ]] && count=$(cat "$count_file")\n'
             '  printf "%s\\n" "$((count + 1))" >"$count_file"\n'
-            '  printf "ACME_MAIN_READY\\n"\n'
-            '  read -r action || exit 0\n'
-            '  case "$action" in\n'
-            '    1) printf "ACME_INSTALL_MODE_PROMPT\\n"; read -r mode || exit 1; install_count=0; [[ -f "${SB_ROOT_PREFIX}/acme-install-count" ]] && install_count=$(cat "${SB_ROOT_PREFIX}/acme-install-count"); printf "%s\\n" "$((install_count + 1))" >"${SB_ROOT_PREFIX}/acme-install-count"; printf "ACME_INSTALL_MODE_%s\\n" "$mode"; exit 0;;\n'
-            '    0) exit 1;;\n'
-            '    *) exit 1;;\n'
-            '  esac\n'
+            '  while true; do\n'
+            '    printf "ACME_MAIN_READY\\n"\n'
+            '    read -r action || return 0\n'
+            '    case "$action" in\n'
+            '      0) return 0;;\n'
+            '      1) ( printf "ACME_INSTALL_MODE_PROMPT\\n"; read -r mode || exit 1; [[ $mode == 0 ]] && printf "ACME_INSTALL_CANCEL\\n" && exit 1; install_count=0; [[ -f "${SB_ROOT_PREFIX}/acme-install-count" ]] && install_count=$(cat "${SB_ROOT_PREFIX}/acme-install-count"); printf "%s\\n" "$((install_count + 1))" >"${SB_ROOT_PREFIX}/acme-install-count"; printf "ACME_INSTALL_MODE_%s\\n" "$mode"; [[ $mode == fail ]] && exit 1; exit 0 ) || true;;\n'
+            '      2) ( printf "ACME_CERT_ACTION\\n"; exit 47 ) || true;;\n'
+            '      99) printf "ACME_INVALID\\n";;\n'
+            '      *) printf "ACME_INVALID\\n";;\n'
+            '    esac\n'
+            '    read -r -p "按回车键返回 ACME 证书菜单..." _ || return 0\n'
+            '  done\n'
             "}\n"
             'if [[ ${BASH_SOURCE[0]} == "$0" ]]; then menu "$@"; fi\n'
         ).encode("utf-8")
@@ -204,6 +212,7 @@ download_https() {
             ("size", self._candidate(), {"size": len(self._candidate()) + 1}),
             ("digest", self._candidate(), {"sha": "0" * 40}),
             ("base64", self._candidate(), {"raw_content": "%%%"}),
+            ("marker", self._candidate().replace(b"# acme-script: persistent-menu-v1", b"# unrelated"), {}),
             ("no-project-url", self._candidate().replace(b"https://github.com/1622663850/acme-script", b"https://example.invalid/acme"), {}),
             ("no-menu", self._candidate().replace(b"menu() {", b"other() {"), {}),
             ("syntax", self._candidate(syntax_ok=False), {}),
@@ -405,7 +414,7 @@ main acme
                 self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
                 self.assertEqual(output.count("ACME_MAIN_READY"), 2, output)
                 self.assertIn(f"ACME_INSTALL_MODE_{mode}", output)
-                self.assertEqual((self.root / "acme-call-count").read_text().strip(), "2")
+                self.assertEqual((self.root / "acme-call-count").read_text().strip(), "1")
                 self.assertEqual((self.root / "acme-install-count").read_text().strip(), "1")
                 self.assertEqual(len(download_log.read_text(encoding="utf-8")), 1)
                 protected_after = self._protected_snapshot()
@@ -414,6 +423,97 @@ main acme
                         self.assertEqual(protected_after[key], value, key)
                 calls = fixture.ManagerTest.calls(self, self.system_log)
                 self.assertFalse(any(any(action in call for action in ("start", "stop", "restart", "enable", "disable")) for call in calls))
+
+    def test_open_acme_menu_eof_returns_without_busy_loop(self) -> None:
+        self._payload(self._persistent_candidate())
+        result = self.shell(self._download_stub() + "open_acme_menu </dev/null")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("ACME_MAIN_READY"), 1)
+        self.assertEqual((self.root / "acme-call-count").read_text().strip(), "1")
+
+    def test_bad_legacy_cache_is_preserved_while_new_version_installs(self) -> None:
+        old = self._candidate().replace(b"# acme-script: persistent-menu-v1", b"# old cache without new marker")
+        self.acme_dir.mkdir(parents=True)
+        old_dedicated = self.acme_dir / "acme_cf_token.sh"
+        old_legacy = self.legacy_script
+        old_dedicated.write_bytes(old)
+        old_legacy.write_bytes(old)
+        old_dedicated.chmod(0o640)
+        old_legacy.chmod(0o600)
+        self._payload(self._candidate())
+        result = self.shell(self._download_stub() + "ensure_acme_menu_locked")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), self.acme_script)
+        self.assertEqual(old_dedicated.read_bytes(), old)
+        self.assertEqual(old_legacy.read_bytes(), old)
+        self.assertEqual(old_dedicated.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(old_legacy.stat().st_mode & 0o777, 0o600)
+        self.assertIn(b"# acme-script: persistent-menu-v1", self.acme_script.read_bytes())
+
+    @unittest.skipUnless(pty is not None, "PTY support is required for ACME menu contract")
+    def test_persistent_external_menu_keeps_all_action_outcomes_in_acme_menu(self) -> None:
+        scenarios = (
+            ("success", "17\n1\n1\n\n0\n\n0\n", "ACME_INSTALL_MODE_1", 2),
+            ("cancel", "17\n0\n\n0\n", "ACME_MAIN_READY", 1),
+            ("install-cancel", "17\n1\n0\n\n0\n\n0\n", "ACME_INSTALL_CANCEL", 2),
+            ("install-failure", "17\n1\nfail\n\n0\n\n0\n", "ACME_INSTALL_MODE_fail", 2),
+            ("certificate-failure", "17\n2\n\n0\n\n0\n", "ACME_CERT_ACTION", 2),
+            ("invalid", "17\n99\n\n0\n\n0\n", "ACME_INVALID", 2),
+        )
+        for name, input_text, expected, ready_count in scenarios:
+            with self.subTest(name=name):
+                if self.acme_script.exists():
+                    self.acme_script.unlink()
+                if self.acme_dir.exists() and not self.acme_dir.is_symlink():
+                    self.acme_dir.rmdir()
+                for marker in (self.root / "acme-call-count", self.root / "acme-install-count"):
+                    if marker.exists():
+                        marker.unlink()
+                self._payload(self._persistent_candidate())
+                download_log = self.root / f"scenario-download-{name}.log"
+                self.env["ACME_DOWNLOAD_LOG"] = str(download_log)
+                command = (
+                    'source "$1"; '
+                    'download_https() { printf x >>"$ACME_DOWNLOAD_LOG"; cp -- "$ACME_FIXTURE" "$2"; }; '
+                    'menu'
+                )
+                env = self.env.copy()
+                pid, fd = pty.fork()
+                if pid == 0:
+                    os.execvpe("bash", ["bash", "-c", command, "acme-contract", str(fixture.SCRIPT)], env)
+                os.write(fd, input_text.encode())
+                chunks: list[bytes] = []
+                deadline = time.time() + 8
+                status: int | None = None
+                while time.time() < deadline:
+                    ready, _, _ = select.select([fd], [], [], 0.2)
+                    if ready:
+                        try:
+                            chunks.append(os.read(fd, 8192))
+                        except OSError:
+                            pass
+                    waited, candidate_status = os.waitpid(pid, os.WNOHANG)
+                    if waited == pid:
+                        status = candidate_status
+                        break
+                if status is None:
+                    os.kill(pid, signal.SIGKILL)
+                    _, status = os.waitpid(pid, 0)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self.fail(f"scenario did not exit: {name}")
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                output = b"".join(chunks).decode("utf-8", errors="replace")
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
+                self.assertIn(expected, output)
+                self.assertEqual(output.count("ACME_MAIN_READY"), ready_count)
+                self.assertEqual((self.root / "acme-call-count").read_text().strip(), "1")
+                self.assertEqual(len(download_log.read_text(encoding="utf-8")), 1)
 
 
 if __name__ == "__main__":
