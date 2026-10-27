@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.11.0"
+SB_MANAGER_VERSION="1.12.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1335,6 +1335,48 @@ prompt() {
     printf -v "$variable" '%s' "${input:-$default}"
 }
 
+select_inbound() {
+    local destination=$1 operation=${2:-操作} snapshot count inbound_selection candidate_tag current
+    # Caller owns tag/old_tag/selected_tag, as with prompt's dynamic assignment.
+    printf -v "$destination" '%s' ""
+    snapshot=$(config_jq -ce '(.inbounds // []) | if type=="array" then . else error("inbounds must be an array") end') || return 1
+    count=$(jq 'length' <<<"$snapshot") || return 1
+    [[ $count -gt 0 ]] || { info "暂无入站配置。"; return 0; }
+    jq -r '["序号","名称","协议","端口"],
+        (to_entries[] | [.key+1,.value.tag,.value.type,(.value.listen_port // "-")])
+        | map(if type=="string" then gsub("[[:cntrl:]]"; "?") else . end) | @tsv' <<<"$snapshot" || return 1
+    info "可输入序号或配置名；纯数字配置名请使用 name:名称。"
+    while true; do
+        prompt inbound_selection "选择要${operation}的配置（0 返回）" 0 || return 1
+        case "$inbound_selection" in
+            0) return 0 ;;
+            name:*) candidate_tag=${inbound_selection#name:} ;;
+            *)
+                if [[ $inbound_selection =~ ^[0-9]+$ ]]; then
+                    if [[ ! $inbound_selection =~ ^[1-9][0-9]{0,5}$ ]] || (( inbound_selection > count )); then
+                        warn "序号无效，请选择 1–$count；纯数字名称请使用 name:名称。"
+                        continue
+                    fi
+                    candidate_tag=$(jq -r --argjson index "$((inbound_selection - 1))" '.[$index].tag' <<<"$snapshot") || return 1
+                else
+                    candidate_tag=$inbound_selection
+                fi ;;
+        esac
+        if ! valid_tag "$candidate_tag" ||
+           ! jq -e --arg tag "$candidate_tag" '[.[] | select(.tag==$tag)] | length==1' <<<"$snapshot" >/dev/null; then
+            warn "配置不存在、名称不支持或名称重复，请重新选择。"
+            continue
+        fi
+        current=$(config_jq -Sc '.inbounds // []') || return 1
+        if [[ $current != "$(jq -Sc . <<<"$snapshot")" ]]; then
+            fail "配置列表已被其他操作修改，请重新进入选择，避免序号对应错误。"; return 1
+        fi
+        printf -v "$destination" '%s' "$candidate_tag"
+        info "已选择配置：$candidate_tag"
+        return 0
+    done
+}
+
 read_default_server() {
     local server
     [[ -e $DEFAULT_SERVER_FILE || -L $DEFAULT_SERVER_FILE ]] || return 0
@@ -1499,9 +1541,8 @@ edit_wizard_locked() (
     local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" rotation pair
     [[ $# -le 1 ]] || { fail "用法：sing-box edit [配置名称]"; exit 1; }
     if [[ -z $old_tag ]]; then
-        config_jq -r '["名称","协议","端口"],(.inbounds[]? | [.tag,.type,.listen_port]) | @tsv' || exit 1
-        prompt old_tag "请输入要修改的配置名称（0 返回）" || exit 1
-        [[ $old_tag != 0 ]] || exit 0
+        select_inbound old_tag "修改" || exit 1
+        [[ -n $old_tag ]] || exit 0
     fi
     valid_tag "$old_tag" || { fail "配置名称无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/edit-wizard.XXXXXX") || exit 1
@@ -2028,9 +2069,8 @@ delete_inbound() (
     local tag=${1:-} work
     require_core && safe_paths || exit 1
     if [[ -z $tag ]]; then
-        config_jq -r '.inbounds[]? | [.tag,.type,.listen_port] | @tsv' || exit 1
-        prompt tag "要删除的配置名称（0 返回）" || exit 1
-        [[ $tag != 0 ]] || exit 0
+        select_inbound tag "删除" || exit 1
+        [[ -n $tag ]] || exit 0
     fi
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
     config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | length==1' >/dev/null || {
@@ -2173,15 +2213,16 @@ management_menu() {
 
 show_config_list() {
     local tag
-    config_jq -r '["名称","协议","监听地址","端口"],
-        (.inbounds[]? | [.tag,.type,(.listen // "-"),(.listen_port // "-")]) | @tsv' || return
+    config_jq -r '["序号","名称","协议","监听地址","端口"],
+        ((.inbounds // []) | to_entries[] | [.key+1,.value.tag,.value.type,(.value.listen // "-"),(.value.listen_port // "-")])
+        | map(if type=="string" then gsub("[[:cntrl:]]"; "?") else . end) | @tsv' || return
     if ! config_jq -e '.inbounds | length > 0' >/dev/null; then
         info "暂无入站配置。"
         return 0
     fi
     info "以下分享链接包含连接凭据，可复制整行导入客户端："
     while IFS= read -r tag; do
-        printf '\n[%s]\n' "$tag"
+        printf '\n[%s]\n' "$(jq -rn --arg tag "$tag" '$tag | gsub("[[:cntrl:]]"; "?")')"
         show_client "$tag" "" link-only || warn "此配置暂时无法生成分享链接，其他配置仍会继续显示。"
     done < <(config_jq -r '.inbounds[]?.tag')
 }
@@ -2196,7 +2237,7 @@ show_config() {
             0) return 0 ;;
             1) show_config_list ;;
             2) config_jq . ;;
-            3) prompt selected_tag "配置名称" && show_client "$selected_tag" ;;
+            3) select_inbound selected_tag "导出客户端" && { [[ -z $selected_tag ]] || show_client "$selected_tag"; } ;;
             4) validate_config "$CONFIG_FILE" ;;
             5) with_lock set_default_server ;;
             6) with_lock edit_wizard_locked ;;
