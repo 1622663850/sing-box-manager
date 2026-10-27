@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.12.0"
+SB_MANAGER_VERSION="1.12.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -2614,8 +2614,16 @@ open_acme_menu() {
     local script
     script=$(with_lock ensure_acme_menu_locked) || return
     info "正在打开 ACME 证书菜单，退出后返回 sing-box 面板。"
-    # Release the manager lock before handing control to the independent menu.
-    bash "$script" 9>&-
+    # The upstream menu handles one action per process; success stays in ACME.
+    # The manager lock remains released during the external menu and pause.
+    local _acme_pause
+    while true; do
+        if bash "$script" 9>&-; then
+            read -r -p "按回车键返回 ACME 证书菜单..." _acme_pause || return 0
+        else
+            return $?
+        fi
+    done
 }
 
 show_status() {

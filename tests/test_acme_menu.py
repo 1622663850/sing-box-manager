@@ -69,6 +69,29 @@ class AcmeMenuTest(unittest.TestCase):
             'if [[ ${BASH_SOURCE[0]} == "$0" ]]; then menu "$@"; fi\n'
         ).encode("utf-8")
 
+    def _persistent_candidate(self) -> bytes:
+        return (
+            "#!/usr/bin/env bash\n"
+            "# https://github.com/1622663850/acme-script\n"
+            "menu() {\n"
+            '  lock="${SB_ROOT_PREFIX}/var/lib/sing-box-manager/manager.lock"\n'
+            '  exec 8>"$lock" || exit 2\n'
+            '  flock -n 8 || exit 2\n'
+            '  [[ ! -e /proc/$$/fd/9 ]] || exit 3\n'
+            '  count_file="${SB_ROOT_PREFIX}/acme-call-count"\n'
+            '  count=0; [[ -f "$count_file" ]] && count=$(cat "$count_file")\n'
+            '  printf "%s\\n" "$((count + 1))" >"$count_file"\n'
+            '  printf "ACME_MAIN_READY\\n"\n'
+            '  read -r action || exit 0\n'
+            '  case "$action" in\n'
+            '    1) printf "ACME_INSTALL_MODE_PROMPT\\n"; read -r mode || exit 1; install_count=0; [[ -f "${SB_ROOT_PREFIX}/acme-install-count" ]] && install_count=$(cat "${SB_ROOT_PREFIX}/acme-install-count"); printf "%s\\n" "$((install_count + 1))" >"${SB_ROOT_PREFIX}/acme-install-count"; printf "ACME_INSTALL_MODE_%s\\n" "$mode"; exit 0;;\n'
+            '    0) exit 1;;\n'
+            '    *) exit 1;;\n'
+            '  esac\n'
+            "}\n"
+            'if [[ ${BASH_SOURCE[0]} == "$0" ]]; then menu "$@"; fi\n'
+        ).encode("utf-8")
+
     def _payload(self, content: bytes, *, size: int | None = None, sha: str | None = None,
                  path: str = "acme_cf_token.sh", encoding: str = "base64", kind: str = "file",
                  raw_content: str | None = None) -> None:
@@ -285,7 +308,7 @@ main acme
 
     @unittest.skipUnless(pty is not None, "PTY support is required for menu routing")
     def test_main_menu_seventeen_opens_downloaded_menu(self) -> None:
-        self._payload(self._candidate(menu_lock_check=True))
+        self._payload(self._persistent_candidate())
         command = (
             'source "$1"; '
             'download_https() { cp -- "$ACME_FIXTURE" "$2"; }; '
@@ -295,7 +318,7 @@ main acme
         pid, fd = pty.fork()
         if pid == 0:
             os.execvpe("bash", ["bash", "-c", command, "acme-menu", str(fixture.SCRIPT)], env)
-        os.write(fd, b"17\n\n0\n")
+        os.write(fd, b"17\n0\n\n0\n")
         chunks: list[bytes] = []
         deadline = time.time() + 5
         status: int | None = None
@@ -324,7 +347,73 @@ main acme
         except OSError:
             pass
         self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
-        self.assertIn("ACME_MENU_OK", output)
+        self.assertIn("ACME_MAIN_READY", output)
+
+    @unittest.skipUnless(pty is not None, "PTY support is required for persistent ACME menu routing")
+    def test_menu_seventeen_reopens_successful_external_menu_for_direct_and_proxy_modes(self) -> None:
+        for mode in ("1", "2"):
+            with self.subTest(mode=mode):
+                if self.acme_script.exists():
+                    self.acme_script.unlink()
+                if self.acme_dir.exists() and not self.acme_dir.is_symlink():
+                    self.acme_dir.rmdir()
+                for marker in (self.root / "acme-call-count", self.root / "acme-install-count"):
+                    if marker.exists():
+                        marker.unlink()
+                protected_before = self._protected_snapshot()
+                candidate = self._persistent_candidate()
+                self._payload(candidate)
+                download_log = self.root / f"acme-download-{mode}.log"
+                self.env["ACME_DOWNLOAD_LOG"] = str(download_log)
+                command = (
+                    'source "$1"; '
+                    'download_https() { printf x >>"$ACME_DOWNLOAD_LOG"; cp -- "$ACME_FIXTURE" "$2"; }; '
+                    'menu'
+                )
+                env = self.env.copy()
+                pid, fd = pty.fork()
+                if pid == 0:
+                    os.execvpe("bash", ["bash", "-c", command, "acme-loop", str(fixture.SCRIPT)], env)
+                os.write(fd, (f"17\n1\n{mode}\n\n0\n\n0\n").encode())
+                chunks: list[bytes] = []
+                deadline = time.time() + 8
+                status: int | None = None
+                while time.time() < deadline:
+                    ready, _, _ = select.select([fd], [], [], 0.2)
+                    if ready:
+                        try:
+                            chunks.append(os.read(fd, 8192))
+                        except OSError:
+                            pass
+                    waited, candidate_status = os.waitpid(pid, os.WNOHANG)
+                    if waited == pid:
+                        status = candidate_status
+                        break
+                if status is None:
+                    os.kill(pid, signal.SIGKILL)
+                    _, status = os.waitpid(pid, 0)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self.fail(f"ACME menu loop did not exit for mode {mode}")
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                output = b"".join(chunks).decode("utf-8", errors="replace")
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
+                self.assertEqual(output.count("ACME_MAIN_READY"), 2, output)
+                self.assertIn(f"ACME_INSTALL_MODE_{mode}", output)
+                self.assertEqual((self.root / "acme-call-count").read_text().strip(), "2")
+                self.assertEqual((self.root / "acme-install-count").read_text().strip(), "1")
+                self.assertEqual(len(download_log.read_text(encoding="utf-8")), 1)
+                protected_after = self._protected_snapshot()
+                for key, value in protected_before.items():
+                    if key != "systemctl":
+                        self.assertEqual(protected_after[key], value, key)
+                calls = fixture.ManagerTest.calls(self, self.system_log)
+                self.assertFalse(any(any(action in call for action in ("start", "stop", "restart", "enable", "disable")) for call in calls))
 
 
 if __name__ == "__main__":
