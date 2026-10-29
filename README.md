@@ -20,8 +20,8 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 12 | 删除配置 | 确认后删除节点及连接信息，阻止删除仍被引用的节点，失败回滚 |
 | 13 | 配置维护 | 成套备份、列表、恢复、批量客户端导出、只读诊断 |
 | 14 | 更新面板脚本 | 获取 GitHub 最新脚本，检查并备份旧版后替换，成功后重新载入菜单 |
-| 15 | 开启 TCP BBR | 确认后检查内核能力、备份参数和专属配置，启用并持久化，失败恢复 |
-| 16 | 关闭 BBR（恢复开启前设置） | 使用本面板的开启记录恢复原算法、默认队列及原配置文件状态，失败回滚 |
+| 15 | BBR 设置（TCP / UDP QUIC） | 分别开启系统 TCP BBR、选择 Hy2/TUIC 节点启用 QUIC BBR，或查看 QUIC 状态 |
+| 16 | 关闭 TCP BBR（恢复开启前设置） | 使用本面板的开启记录恢复原算法、默认队列及原配置文件状态，失败回滚 |
 | 17 | 安装/打开 ACME 证书菜单 | 首次安装 acme-script 菜单，已安装时直接进入；退出后返回本面板 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
@@ -209,6 +209,9 @@ sudo sing-box update-panel        # 更新本项目面板脚本到 GitHub main �
 sudo sing-box bbr-status          # 只读查看当前 TCP 算法、默认 qdisc 和已注册算法
 sudo sing-box bbr                 # 确认后启用系统 TCP BBR，并写入持久化配置
 sudo sing-box bbr-disable         # 确认后恢复本面板开启 BBR 前的参数及配置
+sudo sing-box quic-bbr            # 选择 Hy2/TUIC 节点，确认后备份并启用 QUIC BBR
+sudo sing-box quic-bbr my-hy2      # 直接选择指定名称；数字参数仍是名称
+sudo sing-box quic-bbr-status     # 查看 Hy2/TUIC 的协议内部拥塞控制状态
 sudo sing-box acme                # 安装/打开 acme-script 证书管理菜单
 sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
@@ -265,7 +268,7 @@ v1.8.0 起选择主菜单 **17. 安装/打开 ACME 证书菜单**，或运行 `s
 
 ## 开启 TCP BBR
 
-v1.6.0 起选择主菜单 **15. 开启 TCP BBR**，或执行 `sudo sing-box bbr`。先显示内核及当前参数，确认后才加载所需模块、修改系统设置。只读检查使用 `sudo sing-box bbr-status`。部署或更新面板本身不会自动启用 BBR。
+v1.6.0 起支持系统 TCP BBR；v1.16.0 起从主菜单 **15 → 1. 开启系统 TCP BBR** 进入，也可执行 `sudo sing-box bbr`。先显示内核及当前参数，确认后才加载所需模块、修改系统设置。只读检查使用 `sudo sing-box bbr-status`。部署或更新面板本身不会自动启用 BBR。
 
 v1.7.0 起增加主菜单 **16. 关闭 BBR（恢复开启前设置）**，也可执行 `sudo sing-box bbr-disable`。成功开启时，通过权限为 `600` 的 `/var/lib/sing-box-manager/bbr-active` 关联开启前备份；重复开启不会覆盖原恢复记录。关闭前显示将恢复的 TCP 算法和默认队列，确认后备份当前状态，再恢复开启前的参数；原来没有专属配置文件时删除本面板新建的文件，原来存在时恢复其完整内容及权限。成功后清除活动恢复记录，历史备份保留。关闭失败或中断会恢复到关闭操作前的状态，并保留恢复记录以便重试。
 
@@ -276,6 +279,14 @@ v1.7.0 起增加主菜单 **16. 关闭 BBR（恢复开启前设置）**，也可
 系统会按 `sysctl.d` 同名文件优先级和加载顺序检查覆盖，并另外核对 `/etc/sysctl.conf`，以兼顾 systemd 和 procps；遇到歧义值或冲突会保守拒绝，请先人工核对。确认等待期间如果参数或文件被其他操作改动，也会取消此次设置。脚本不安装或更换内核，不下载第三方加速脚本；需要内核提供 `bbr`，未注册时尝试通过已有 `modprobe` 加载 `tcp_bbr`。失败后可能保留已加载的模块，不会强制卸载可能正在被使用的模块。
 
 这是整台 VPS 的 **TCP 默认设置**，不能替代 Hy2/TUIC 的 UDP/QUIC 内部拥塞控制，也不承诺必然提速。已有连接及监听 socket 可能继续采用旧算法；若需让现有 sing-box 入站监听重新建立，请自行选择菜单 **5. 重新启动**，该操作会短暂中断节点连接。BBR 启用选项不会自动重启服务或重启服务器，不使用 `tc` 重建现有网卡队列；设置默认 qdisc 不等于现有网卡的 qdisc 已被替换。
+
+### UDP / QUIC BBR
+
+UDP 没有通用的系统级 BBR 开关。v1.16.0 起，主菜单 **15 → 2. 开启 UDP/QUIC BBR** 可按序号选择单个 Hy2/TUIC 节点；**15 → 3** 或 `sing-box quic-bbr-status` 查看状态。其他 UDP 协议不通过此选项处理，系统 TCP 参数保持不变。
+
+Hysteria 2 会移除该节点的 `up_mbps`、`down_mbps` 带宽设置，并设置 `ignore_client_bandwidth=true`，要求客户端使用 BBR；参见 [sing-box Hy2 说明](https://sing-box.sagernet.org/configuration/inbound/hysteria2/#ignore_client_bandwidth)。默认 Hy2 未设置带宽时允许 BBR，但客户端提供带宽值时可能协商为 Hysteria/Brutal，此选项明确要求 BBR。TUIC 会设置 `congestion_control="bbr"`，支持的算法及默认值见 [TUIC 说明](https://sing-box.sagernet.org/configuration/inbound/tuic/#congestion_control)。TUIC 导出的客户端 JSON 和分享链接会同步携带 BBR 参数，修改后请重新导入客户端。
+
+操作前确认并生成成套备份，使用原有配置修改事务校验、保留 JSONC 注释、同步连接元数据并在失败时回滚。密码、UUID、端口、TLS、证书路径和 Salamander 保持不变；运行中的 sing-box 会短暂重启，停止状态保持停止；已经启用的节点不重复写入或重启。原来的带宽/拥塞控制值包含在成套备份中，可从主菜单 **13** 恢复，恢复会影响整套配置，请留意其后的节点修改。主菜单 **16** 仅恢复系统 TCP 设置，不改动 QUIC 节点。新增节点和已有节点均不会因更新面板而自动启用此设置。
 
 依据：[Linux TCP 参数](https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html)、[默认 qdisc](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/net.html)、[sysctl.d 优先级](https://www.freedesktop.org/software/systemd/man/latest/sysctl.d.html)。
 

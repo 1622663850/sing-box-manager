@@ -563,9 +563,13 @@ with_lock() { printf 'LOCK:%s\n' "$*"; "$@"; }
 enable_bbr_locked() { printf 'BBR_ENABLED\n'; }
 disable_bbr_locked() { printf 'BBR_DISABLED\n'; }
 show_bbr_status() { printf 'BBR_STATUS\n'; }
+configure_quic_bbr_locked() { printf 'QUIC_BBR:%s\n' "$*"; }
+show_quic_bbr_status() { printf 'QUIC_STATUS\n'; }
 main bbr
 main bbr-status
 main bbr-disable
+main quic-bbr hy2-node
+main quic-bbr-status
 main bbr extra >/dev/null 2>&1 || printf 'INVALID\n'
 main bbr-disable extra >/dev/null 2>&1 || printf 'INVALID_DISABLE\n'
 '''
@@ -575,17 +579,38 @@ main bbr-disable extra >/dev/null 2>&1 || printf 'INVALID_DISABLE\n'
         self.assertIn("BBR_STATUS", result.stdout)
         self.assertIn("LOCK:disable_bbr_locked", result.stdout)
         self.assertIn("BBR_DISABLED", result.stdout)
+        self.assertIn("LOCK:configure_quic_bbr_locked hy2-node", result.stdout)
+        self.assertIn("QUIC_STATUS", result.stdout)
         self.assertIn("INVALID_DISABLE", result.stdout)
         self.assertIn("INVALID", result.stdout)
 
+    def test_bbr_submenu_dispatches_tcp_quic_and_status_actions(self) -> None:
+        body = r'''
+choices=(1 2 3 0)
+choice_index=0
+prompt() { printf -v "$1" '%s' "${choices[$choice_index]}"; choice_index=$((choice_index + 1)); }
+read() { return 0; }
+enable_bbr() { printf 'TCP_MENU\n'; }
+enable_quic_bbr() { printf 'QUIC_MENU\n'; }
+with_lock() { "$@"; }
+configure_quic_bbr_locked() { printf 'QUIC_MENU\n'; }
+show_quic_bbr_status() { printf 'QUIC_STATUS_MENU\n'; }
+bbr_menu
+'''
+        result = self.shell(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("TCP_MENU", result.stdout)
+        self.assertIn("QUIC_MENU", result.stdout)
+        self.assertIn("QUIC_STATUS_MENU", result.stdout)
+
     @unittest.skipUnless(pty is not None, "PTY support is required for menu routing")
     def test_menu_fifteen_calls_bbr(self) -> None:
-        command = 'source "$1"; show_status(){ :; }; enable_bbr(){ printf "BBR_MENU\\n"; }; disable_bbr(){ printf "BBR_DISABLE_MENU\\n"; }; menu'
+        command = 'source "$1"; show_status(){ :; }; bbr_menu(){ printf "BBR_MENU\\n"; }; disable_bbr(){ printf "BBR_DISABLE_MENU\\n"; }; menu'
         env = self.env.copy()
         pid, fd = pty.fork()
         if pid == 0:
             os.execvpe("bash", ["bash", "-c", command, "bbr-menu", str(fixture.SCRIPT)], env)
-        os.write(fd, b"15\n\n16\n\n0\n")
+        os.write(fd, b"15\n16\n\n0\n")
         chunks: list[bytes] = []
         deadline = time.time() + 5
         status: int | None = None

@@ -418,7 +418,9 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
     templates = {
         "hysteria2": ("hy2-password", "", "", "", "localhost", certificate, private_key, ""),
         "hysteria2-salamander": ("hy2-salamander-password", "", "", "", "localhost", certificate, private_key, ""),
+        "hysteria2-bbr": ("hy2-bbr-password", "", "", "", "localhost", certificate, private_key, ""),
         "tuic": (uuid, "", "", "", "localhost", certificate, private_key, "tuic-password"),
+        "tuic-bbr": (uuid, "", "", "", "localhost", certificate, private_key, "tuic-bbr-password"),
         "anytls": ("anytls-password", "", "", "", "localhost", certificate, private_key, ""),
         "vless-grpc-tls": (uuid, "SmokeGrpc", "", "", "localhost", certificate, private_key, ""),
         "vless-ws-tls": (uuid, "/smoke-vless-tls", "", "", "localhost", certificate, private_key, ""),
@@ -432,7 +434,11 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
     }
     with http_target(payload) as target_port:
         for template, fields in templates.items():
-            protocol = "hysteria2" if template == "hysteria2-salamander" else template
+            protocol = {
+                "hysteria2-salamander": "hysteria2",
+                "hysteria2-bbr": "hysteria2",
+                "tuic-bbr": "tuic",
+            }.get(template, template)
             credential, extra, server_private, short_id, server_name, cert, key, password = fields
             server_port, proxy_port = free_port(), free_port()
             while proxy_port == server_port:
@@ -444,6 +450,15 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
             if template == "hysteria2-salamander":
                 generator_args.append("salamander-obfs-password")
             inbound = bash_json(*generator_args)
+            if template in {"hysteria2-bbr", "tuic-bbr"}:
+                inbound_file = work / (template + "-pre-bbr-inbound.json")
+                write_json(inbound_file, inbound)
+                inbound = bash_json(manager, environment, "generate_quic_bbr_inbound", str(inbound_file))
+                if template == "hysteria2-bbr":
+                    if not inbound.get("ignore_client_bandwidth", False) or "up_mbps" in inbound or "down_mbps" in inbound:
+                        raise RuntimeError("hysteria2-bbr: QUIC BBR server fields were not applied")
+                elif inbound.get("congestion_control") != "bbr":
+                    raise RuntimeError("tuic-bbr: QUIC BBR server field was not applied")
             if template == "hysteria2-salamander" and inbound.get("obfs") != {
                 "type": "salamander", "password": "salamander-obfs-password",
             }:
@@ -474,6 +489,8 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
                 "type": "salamander", "password": "salamander-obfs-password",
             }:
                 raise RuntimeError("hysteria2-salamander: client export obfs did not match")
+            if template == "tuic-bbr" and outbound.get("congestion_control") != "bbr":
+                raise RuntimeError("tuic-bbr: client export lost congestion_control=bbr")
             if inbound.get("tls", {}).get("enabled"):
                 # Trust only the temporary certificate; insecure=true is never
                 # used, which keeps this an actual certificate verification.

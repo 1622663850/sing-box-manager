@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.15.0"
+SB_MANAGER_VERSION="1.16.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -2313,6 +2313,89 @@ show_config() {
     done
 }
 
+generate_quic_bbr_inbound() {
+    jq -e '
+      if .type == "hysteria2" then del(.up_mbps,.down_mbps) | .ignore_client_bandwidth=true
+      elif .type == "tuic" then .congestion_control="bbr"
+      else error("QUIC BBR only supports Hysteria 2 and TUIC") end' "$1" || {
+        fail "UDP/QUIC BBR 仅支持 Hysteria 2 和 TUIC 节点。"; return 1;
+    }
+}
+
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
+show_quic_bbr_status() {
+    [[ $# -eq 0 ]] || { fail "用法：sing-box quic-bbr-status"; return 1; }
+    require_core || return
+    printf '\nUDP/QUIC 拥塞控制（独立于系统 TCP BBR）\n序号\t名称\t协议\t状态\n'
+    config_jq -r '
+      def clean: tostring | gsub("[\u0000-\u001f\u007f]"; "?");
+      (.inbounds // []) | to_entries[] | select(.value.type == "hysteria2" or .value.type == "tuic")
+      | .key as $index | .value
+      | [($index+1|tostring),(.tag|clean),.type,
+         (if .type == "tuic" then (.congestion_control // "cubic" | clean)
+          elif (.up_mbps // 0) != 0 or (.down_mbps // 0) != 0 then "带宽限制/Brutal（未强制 BBR）"
+          elif .ignore_client_bandwidth == true then "BBR（强制）"
+          else "自动协商（客户端未设带宽时使用 BBR）" end)] | @tsv'
+}
+
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
+configure_quic_bbr_locked() (
+    umask 077
+    local tag=${1:-} work metadata server="" public_key="" backup
+    [[ $# -le 1 ]] || { fail "用法：sing-box quic-bbr [配置名称]"; exit 1; }
+    require_core && safe_paths || exit 1
+    if [[ -z $tag ]]; then
+        select_inbound tag "开启 UDP/QUIC BBR" || exit 1
+        [[ -n $tag ]] || exit 0
+    fi
+    valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/quic-bbr.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/original.json" || exit 1
+    generate_quic_bbr_inbound "$work/original.json" >"$work/updated.json" || exit 1
+    detect_inbound_template "$work/original.json" >/dev/null || exit 1
+    if [[ $(jq -Sc . "$work/original.json") == "$(jq -Sc . "$work/updated.json")" ]]; then
+        info "$tag 的 UDP/QUIC BBR 已启用，无需修改。"; exit 0
+    fi
+    metadata="$CLIENT_DIR/$tag.json"
+    [[ ! -L $metadata && ( ! -e $metadata || -f $metadata ) ]] || { fail "连接信息文件无效。"; exit 1; }
+    if [[ -f $metadata && $(jq -Sc .inbound "$metadata") == "$(jq -Sc . "$work/original.json")" ]]; then
+        server=$(jq -r '.server // ""' "$metadata") || exit 1
+        public_key=$(jq -r '.public_key // ""' "$metadata") || exit 1
+    fi
+    info "将为 $tag 开启协议内部的 QUIC BBR，不修改系统 TCP 参数。"
+    if [[ $(jq -r .type "$work/original.json") == hysteria2 ]]; then
+        info "Hy2 将移除 up_mbps/down_mbps 带宽设置，并要求客户端使用 BBR；TLS、密码及混淆保持不变。"
+    else
+        info "TUIC 的拥塞控制将设为 bbr；成功后请重新导入客户端链接以同步算法。"
+    fi
+    confirm "确认开启？先备份；运行中的 sing-box 会短暂重启，失败时回滚。" || { info "已取消。"; exit 0; }
+    backup=$(create_backup) || exit 1
+    replace_inbound_file "$tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" || exit 1
+    info "UDP/QUIC BBR 已开启。成套备份：$backup（可从主菜单 13 恢复）。"
+)
+
+enable_quic_bbr() {
+    [[ $# -le 1 ]] || { fail "用法：sing-box quic-bbr [配置名称]"; return 1; }
+    with_lock configure_quic_bbr_locked "$@"
+}
+
+bbr_menu() {
+    local choice
+    while true; do
+        printf '\nBBR 设置\n  1. 开启系统 TCP BBR\n  2. 开启 UDP/QUIC BBR（选择 Hy2/TUIC 节点）\n  3. 查看 UDP/QUIC 拥塞控制状态\n  0. 返回\n'
+        prompt choice "请选择 BBR 操作" 0 || return 0
+        case "$choice" in
+            1) enable_bbr ;;
+            2) enable_quic_bbr ;;
+            3) show_quic_bbr_status ;;
+            0) return 0 ;;
+            *) fail "请输入 0–3。" ;;
+        esac || true
+        read -r -p "按回车键返回 BBR 菜单..." choice || return 0
+    done
+}
+
 show_bbr_status() {
     [[ $# -eq 0 ]] || { fail "用法：sing-box bbr-status"; return 1; }
     have sysctl || { fail "缺少 sysctl，请重新运行 setup 安装依赖。"; return 1; }
@@ -2727,7 +2810,7 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. 开启 TCP BBR\n 16. 关闭 BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n  0. 退出\n\n'
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n  0. 退出\n\n'
         read -r -p "请输入选项 [0-17]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
@@ -2749,7 +2832,7 @@ menu() {
                     exec bash "$WRAPPER" menu
                 fi
                 ;;
-            15) enable_bbr || true ;;
+            15) bbr_menu || true; continue ;;
             16) disable_bbr || true ;;
             17) open_acme_menu || true ;;
             0) return 0 ;;
@@ -2773,6 +2856,8 @@ sing-box 中文终端管理面板
   sing-box bbr                    确认后开启系统 TCP BBR，备份并持久化
   sing-box bbr-disable            确认后恢复本面板开启 BBR 前的参数及配置
   sing-box bbr-status             只读查看 TCP 拥塞控制及默认队列规则
+  sing-box quic-bbr [TAG]         为 Hy2/TUIC 节点启用 QUIC BBR，先备份再按需重启
+  sing-box quic-bbr-status        只读查看 Hy2/TUIC 的 QUIC 拥塞控制状态
   sing-box acme                   安装/打开 acme-script 证书管理菜单
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
@@ -2822,7 +2907,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|format-config|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2844,6 +2929,8 @@ main() {
         bbr) enable_bbr "$@" ;;
         bbr-disable) disable_bbr "$@" ;;
         bbr-status) show_bbr_status "$@" ;;
+        quic-bbr) enable_quic_bbr "$@" ;;
+        quic-bbr-status) show_quic_bbr_status "$@" ;;
         acme) open_acme_menu "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
