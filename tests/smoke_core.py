@@ -421,6 +421,7 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
         "anytls": ("anytls-password", "", "", "", "localhost", certificate, private_key, ""),
         "vless-grpc-tls": (uuid, "SmokeGrpc", "", "", "localhost", certificate, private_key, ""),
         "vless-ws-tls": (uuid, "/smoke-vless-tls", "", "", "localhost", certificate, private_key, ""),
+        "vless-tcp-tls": (uuid, "", "", "", "localhost", certificate, private_key, ""),
         "vless-grpc-reality": (uuid, "SmokeGrpcReality", private_match.group(1), "0123456789abcdef", "localhost", None, None, ""),
         "vmess-tcp": (uuid, "", "", "", "", None, None, ""),
         "vmess-tcp-tls": (uuid, "", "", "", "localhost", certificate, private_key, ""),
