@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.12.2"
+SB_MANAGER_VERSION="1.13.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -868,6 +868,7 @@ generate_inbound() {
     case "$protocol" in
         vless-tcp) type=vless ;;
         vless-ws) type=vless; transport=ws ;;
+        vless-ws-tls) type=vless; transport=ws; security=tls ;;
         vless-reality) type=vless; security=reality; tls_name=$extra ;;
         vless-grpc-reality) type=vless; transport=grpc; security=reality ;;
         vless-grpc-tls) type=vless; transport=grpc; security=tls ;;
@@ -1409,6 +1410,7 @@ detect_inbound_template() {
           else error("unsupported REALITY transport/flow") end
         elif (.users[0].flow // "") != "" then error("unsupported flow")
         elif .transport.type == "grpc" and .tls.enabled == true then "vless-grpc-tls"
+        elif .transport.type == "ws" and .tls.enabled == true then "vless-ws-tls"
         elif .tls.enabled != true and .transport.type == "ws" then "vless-ws"
         elif .tls.enabled != true and .transport == null then "vless-tcp"
         else error("unsupported VLESS template") end
@@ -1801,7 +1803,7 @@ add_wizard_locked() (
     require_core || exit 1
     local choice protocol tag port credential extra="" private_key="" public_key="" short_id="" server="" pair work file
     local tls_name="" certificate="" tls_key="" password="" default_server=""
-    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n  0. 返回\n'
+    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n  0. 返回\n'
     prompt choice "请选择" 1 || exit 1
     case "$choice" in
         0) exit 0 ;;
@@ -1819,6 +1821,7 @@ add_wizard_locked() (
         14) protocol=vmess-ws-tls ;;
         15) protocol=vmess-grpc-tls ;;
         16) protocol=vless-grpc-reality ;;
+        17) protocol=vless-ws-tls ;;
         5|6)
             prompt file "请输入服务器上的 JSON 文件绝对路径" || exit 1
             if [[ $choice == 5 ]]; then add_inbound_file "$file"; else
@@ -1839,7 +1842,7 @@ add_wizard_locked() (
     esac
     [[ $protocol != tuic ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
     case "$protocol" in
-        vless-ws|vmess-ws|vmess-ws-tls)
+        vless-ws|vless-ws-tls|vmess-ws|vmess-ws-tls)
             [[ $protocol == *-tls ]] || warn "此模板未启用 TLS；可配合 TLS 反向代理使用。"
             prompt extra "WebSocket 路径" "/${protocol%%-*}" || exit 1
             ;;

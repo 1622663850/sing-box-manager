@@ -255,7 +255,7 @@ certificate=''; tls_key=''; prompt_tls_certificate_files root.example.com '' '';
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_add_routes_all_seven_regular_tls_templates_to_helper(self) -> None:
+    def test_add_routes_all_eight_regular_tls_templates_to_helper(self) -> None:
         log = self.root / "tls-route.log"
         body = r'''
 require_core() { return 0; }
@@ -263,20 +263,20 @@ prompt() { case "$1" in choice) printf -v "$1" '%s' "$TEST_CHOICE";; tag) printf
 prompt_tls_certificate_files() { printf 'H:%s\n' "$1" >>"$TLS_ROUTE_LOG"; printf -v certificate '%s' "$TLS_CERT"; printf -v tls_key '%s' "$TLS_KEY"; }
 generate_inbound() { printf '{"type":"vless","tag":"%s","listen_port":443,"users":[{"uuid":"b7efdc96-87aa-4910-81b4-374b2eecc737"}]}' "$2"; }
 generate_client() { return 0; }; add_managed_inbound() { return 0; }; show_client() { return 0; }
-for TEST_CHOICE in 7 8 9 10 12 14 15; do add_wizard_locked || exit; done
+for TEST_CHOICE in 7 8 9 10 12 14 15 17; do add_wizard_locked || exit; done
 '''
         self.env["TLS_ROUTE_LOG"] = str(log)
         self.env["TLS_CERT"] = str(self.root_cert)
         self.env["TLS_KEY"] = str(self.root_key)
         result = self.shell(body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 7)
+        self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 8)
 
-    def test_edit_routes_all_seven_regular_tls_templates_to_selector(self) -> None:
+    def test_edit_routes_all_eight_regular_tls_templates_to_selector(self) -> None:
         self._inventory()
         cert = self.acme_root / "example.com_ecc/fullchain.cer"
         key = self.acme_root / "example.com_ecc/example.com.key"
-        protocols = ["hysteria2", "tuic", "anytls", "vless-grpc-tls", "vmess-tcp-tls", "vmess-ws-tls", "vmess-grpc-tls"]
+        protocols = ["hysteria2", "tuic", "anytls", "vless-grpc-tls", "vless-ws-tls", "vmess-tcp-tls", "vmess-ws-tls", "vmess-grpc-tls"]
         nodes = [fixture.ManagerTest.edit_protocol_inbound(self, protocol, f"edit-{index}", 25000 + index, cert, key) for index, protocol in enumerate(protocols)]
         config = dict(self.original)
         config["inbounds"] = nodes
@@ -293,7 +293,7 @@ prompt_secret() { printf -v "$1" '%s' "${3:-}"; }
 prompt_tls_certificate_files() { printf 'H:%s\n' "$1" >>"$TLS_EDIT_LOG"; printf -v certificate '%s' "$TLS_CERT"; printf -v tls_key '%s' "$TLS_KEY"; }
 replace_inbound_file() { printf 'R:%s\n' "$1" >>"$TLS_EDIT_LOG"; return 0; }
 confirm() { return 0; }
-for tag in edit-0 edit-1 edit-2 edit-3 edit-4 edit-5 edit-6; do edit_wizard_locked "$tag" || exit; done
+for tag in edit-0 edit-1 edit-2 edit-3 edit-4 edit-5 edit-6 edit-7; do edit_wizard_locked "$tag" || exit; done
 '''
         self.env["TLS_EDIT_LOG"] = str(route_log)
         self.env["TLS_CERT"] = str(cert)
@@ -301,8 +301,8 @@ for tag in edit-0 edit-1 edit-2 edit-3 edit-4 edit-5 edit-6; do edit_wizard_lock
         result = self.shell(body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = route_log.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(sum(line.startswith("H:") for line in lines), 7)
-        self.assertEqual(sum(line.startswith("R:") for line in lines), 7)
+        self.assertEqual(sum(line.startswith("H:") for line in lines), 8)
+        self.assertEqual(sum(line.startswith("R:") for line in lines), 8)
 
     def test_reality_edit_does_not_call_helper_or_rewrite_jsonc(self) -> None:
         node = {"type":"vless","tag":"reality","listen":"127.0.0.1","listen_port":18443,"users":[{"uuid":"b7efdc96-87aa-4910-81b4-374b2eecc737","flow":"xtls-rprx-vision"}],"tls":{"enabled":True,"server_name":"example.com","reality":{"enabled":True,"handshake":{"server":"example.com","server_port":443},"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","short_id":["0123456789abcdef"]}}}

@@ -278,6 +278,7 @@ class ManagerTest(unittest.TestCase):
         extras = {
             "vless-tcp": "",
             "vless-ws": "/edit-vless",
+            "vless-ws-tls": "/edit-vless-tls",
             "vless-grpc-tls": "EditGrpc",
             "vmess-tcp": "",
             "vmess-tcp-tls": "",
@@ -665,7 +666,7 @@ printf 'INVALID_REJECTED\n'
             (10, "VLESS + gRPC + TLS"), (11, "VMess + TCP"),
             (12, "VMess + TCP + TLS"), (13, "VMess + WebSocket"),
             (14, "VMess + WebSocket + TLS"), (15, "VMess + gRPC + TLS"),
-            (16, "VLESS + gRPC + REALITY"),
+            (16, "VLESS + gRPC + REALITY"), (17, "VLESS + WebSocket + TLS"),
         ):
             with self.subTest(number=number):
                 self.assertRegex(result.stdout, rf"{number}\.\s*{re.escape(label)}")
@@ -700,6 +701,7 @@ printf 'INVALID_REJECTED\n'
             7: "hysteria2", 8: "tuic", 9: "anytls", 10: "vless-grpc-tls",
             11: "vmess-tcp", 12: "vmess-tcp-tls", 13: "vmess-ws",
             14: "vmess-ws-tls", 15: "vmess-grpc-tls", 16: "vless-grpc-reality",
+            17: "vless-ws-tls",
         }
         for choice, protocol in expected.items():
             with self.subTest(choice=choice, protocol=protocol):
@@ -720,7 +722,7 @@ printf 'INVALID_REJECTED\n'
                             port) printf -v "$variable" '%s' "$((20000 + TEST_CHOICE))" ;;
                             extra)
                                 case "$TEST_CHOICE" in
-                                    2|13|14) printf -v "$variable" '%s' '/route-ws' ;;
+                                    2|13|14|17) printf -v "$variable" '%s' '/route-ws' ;;
                                     10|15|16) printf -v "$variable" '%s' 'RouteGrpc' ;;
                                     *) printf -v "$variable" '%s' '' ;;
                                 esac ;;
@@ -1250,7 +1252,7 @@ printf 'INVALID_REJECTED\n'
             "vless-reality", "vless-ws", "vless-tcp", "shadowsocks",
             "hysteria2", "tuic", "anytls", "vless-grpc-tls",
             "vmess-tcp", "vmess-tcp-tls", "vmess-ws", "vmess-ws-tls",
-            "vmess-grpc-tls", "vless-grpc-reality",
+            "vmess-grpc-tls", "vless-grpc-reality", "vless-ws-tls",
         )
         for index, protocol in enumerate(protocols, start=1):
             with self.subTest(protocol=protocol):
@@ -1308,7 +1310,7 @@ printf 'INVALID_REJECTED\n'
             "vless-reality", "vless-ws", "vless-tcp", "shadowsocks",
             "hysteria2", "tuic", "anytls", "vless-grpc-tls",
             "vmess-tcp", "vmess-tcp-tls", "vmess-ws", "vmess-ws-tls",
-            "vmess-grpc-tls", "vless-grpc-reality",
+            "vmess-grpc-tls", "vless-grpc-reality", "vless-ws-tls",
         )
         client_dir = self.state_dir / "clients"
         client_dir.mkdir(parents=True, exist_ok=True)
@@ -1556,6 +1558,63 @@ printf 'INVALID_REJECTED\n'
         self.assertEqual(metadata["server"], "edited.example")
         self.assertEqual(metadata["inbound"], saved)
 
+    def test_edit_wizard_vless_ws_tls_updates_uuid_path_sni_and_metadata(self) -> None:
+        original_certificate, original_private_key = self.tls_material("example.com")
+        original_certificate_copy = self.root / "original-ws-cert.pem"
+        original_private_key_copy = self.root / "original-ws-key.pem"
+        shutil.copy2(original_certificate, original_certificate_copy)
+        shutil.copy2(original_private_key, original_private_key_copy)
+        edited_certificate, edited_private_key = self.tls_material("edited.example")
+        inbound = self.edit_protocol_inbound(
+            "vless-ws-tls", "ws-tls-edit", 22904, original_certificate_copy, original_private_key_copy,
+        )
+        value = dict(self.original)
+        value["inbounds"] = [inbound]
+        dump(self.config, value)
+        client_dir = self.state_dir / "clients"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        dump(client_dir / "ws-tls-edit.json", {
+            "server": "old.example", "public_key": "", "inbound": inbound,
+        })
+        new_uuid = "0325ba41-4946-4ad5-b6b3-476eb50c37cb"
+        env = dict(self.env, TEST_CERTIFICATE=str(edited_certificate), TEST_PRIVATE_KEY=str(edited_private_key))
+        body = r'''
+            prompt() {
+                local variable=$1 message=$2 value=${3-}
+                case "$message" in
+                    *WebSocket*) value=/edited-vless-tls ;;
+                    *TLS*域名*) value=edited.example ;;
+                    *公网*|*服务器*|*连接地址*|*客户端*地址*) value=edited.example ;;
+                esac
+                printf -v "$variable" '%s' "$value"
+            }
+            prompt_secret() {
+                if [[ $2 == *UUID* ]]; then printf -v "$1" '%s' "$TEST_NEW_UUID"; else printf -v "$1" '%s' "${3-}"; fi
+            }
+            prompt_tls_certificate_files() {
+                printf -v certificate '%s' "$TEST_CERTIFICATE"
+                printf -v tls_key '%s' "$TEST_PRIVATE_KEY"
+            }
+            confirm() { return 0; }
+            edit_wizard_locked "$1"
+        '''
+        env["TEST_NEW_UUID"] = new_uuid
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; shift; ' + body, "edit-ws-tls", str(SCRIPT), "ws-tls-edit"],
+            env=env, text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+        self.assertEqual(saved["users"][0]["uuid"], new_uuid)
+        self.assertEqual(saved["transport"], {"type": "ws", "path": "/edited-vless-tls"})
+        self.assertTrue(saved["tls"]["enabled"])
+        self.assertEqual(saved["tls"]["server_name"], "edited.example")
+        self.assertEqual(saved["tls"]["certificate_path"], str(edited_certificate))
+        self.assertEqual(saved["tls"]["key_path"], str(edited_private_key))
+        metadata = json.loads((client_dir / "ws-tls-edit.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["server"], "edited.example")
+        self.assertEqual(metadata["inbound"], saved)
+
     def test_edit_wizard_reality_updates_handshake_and_metadata(self) -> None:
         inbound = self.edit_protocol_inbound("vless-reality", "reality-edit", 22902)
         value = dict(self.original)
@@ -1698,6 +1757,7 @@ printf 'INVALID_REJECTED\n'
             "tuic": (uuid, "", {"uuid": uuid, "password": "tuic-password"}, "h3"),
             "anytls": ("anytls-password", "", {}, None),
             "vless-grpc-tls": (uuid, "GrpcService", {"uuid": uuid}, "h2"),
+            "vless-ws-tls": (uuid, "/vless-tls", {"uuid": uuid}, None),
             "vmess-tcp": (uuid, "", {"uuid": uuid}, None),
             "vmess-tcp-tls": (uuid, "", {"uuid": uuid}, None),
             "vmess-ws": (uuid, "/vmess", {"uuid": uuid}, None),
@@ -1732,6 +1792,8 @@ printf 'INVALID_REJECTED\n'
                 if tls:
                     self.assertTrue(inbound["tls"]["enabled"])
                     self.assertEqual(inbound["tls"]["server_name"], "example.com")
+                    self.assertEqual(inbound["tls"]["certificate_path"], str(certificate))
+                    self.assertEqual(inbound["tls"]["key_path"], str(private_key))
                     self.assertNotIn("insecure", inbound["tls"])
                     if alpn:
                         self.assertEqual(inbound["tls"]["alpn"], [alpn])
@@ -1741,6 +1803,7 @@ printf 'INVALID_REJECTED\n'
         uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
         invalid = [
             ("vless-grpc-tls", uuid, "", "missing gRPC service name"),
+            ("vless-ws-tls", uuid, "vless-tls", "WebSocket TLS path must start with slash"),
             ("vmess-ws", uuid, "vmess", "WebSocket path must start with slash"),
             ("vmess-grpc-tls", uuid, "grpc service", "gRPC service name contains spaces"),
         ]
@@ -1781,6 +1844,7 @@ printf 'INVALID_REJECTED\n'
             "tuic": (uuid, "", "h3"),
             "anytls": ("anytls-password", "", None),
             "vless-grpc-tls": (uuid, "GrpcService", "h2"),
+            "vless-ws-tls": (uuid, "/vless-tls", None),
             "vmess-tcp": (uuid, "", None),
             "vmess-tcp-tls": (uuid, "", None),
             "vmess-ws": (uuid, "/vmess", None),
@@ -1860,6 +1924,7 @@ printf 'INVALID_REJECTED\n'
             "tuic": (uuid, "", "tuic://"),
             "anytls": ("anytls-password", "", "anytls://"),
             "vless-grpc-tls": (uuid, "GrpcService", "vless://"),
+            "vless-ws-tls": (uuid, "/vless-tls", "vless://"),
             "vless-grpc-reality": (uuid, "GrpcReality", "vless://"),
             "vmess-tcp": (uuid, "", "vmess://"),
             "vmess-tcp-tls": (uuid, "", "vmess://"),
@@ -1905,6 +1970,11 @@ printf 'INVALID_REJECTED\n'
                     self.assertIn("security=reality", link)
                     self.assertIn("serviceName=GrpcReality", link)
                     self.assertNotIn("flow=", link)
+                if protocol == "vless-ws-tls":
+                    self.assertIn("type=ws", link)
+                    self.assertIn("security=tls", link)
+                    self.assertIn("sni=example.com", link)
+                    self.assertIn("path=%2Fvless-tls", link)
 
     def test_client_export_rejects_unrepresentable_imported_inbounds(self) -> None:
         tls = self.inbound()
@@ -1968,6 +2038,7 @@ printf 'INVALID_REJECTED\n'
             "tuic": (uuid, "", "", "", "example.com", certificate, private_key, "tuic-password"),
             "anytls": ("anytls-password", "", "", "", "example.com", certificate, private_key, ""),
             "vless-grpc-tls": (uuid, "GrpcService", "", "", "example.com", certificate, private_key, ""),
+            "vless-ws-tls": (uuid, "/vless-tls", "", "", "example.com", certificate, private_key, ""),
             "vmess-tcp": (uuid, "", "", "", "", None, None, ""),
             "vmess-tcp-tls": (uuid, "", "", "", "example.com", certificate, private_key, ""),
             "vmess-ws": (uuid, "/vmess", "", "", "", None, None, ""),
