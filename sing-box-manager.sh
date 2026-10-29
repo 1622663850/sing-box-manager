@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.14.0"
+SB_MANAGER_VERSION="1.15.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -860,9 +860,25 @@ validate_tls_files() {
     }
 }
 
+valid_salamander_password() {
+    local LC_ALL=C
+    [[ ${#1} -ge 4 ]]
+}
+
+validate_obfs_template() {
+    jq -e '
+      .obfs == null or
+      (.type == "hysteria2" and (.obfs | type == "object") and
+       (.obfs | keys - ["type","password"] | length == 0) and
+       .obfs.type == "salamander" and
+       (.obfs.password | type == "string" and utf8bytelength >= 4))' "$1" >/dev/null 2>&1 || {
+        fail "仅支持 Hysteria 2 的 Salamander 混淆，密码须至少 4 字节；不支持的混淆字段不会被忽略。"; return 1;
+    }
+}
+
 generate_inbound() {
     local protocol=$1 tag=$2 port=$3 credential=${4:-} extra=${5:-} private_key=${6:-} short_id=${7:-}
-    local tls_name=${8:-} certificate=${9:-} tls_key=${10:-} password=${11:-} type transport="" security=""
+    local tls_name=${8:-} certificate=${9:-} tls_key=${10:-} password=${11:-} obfs_password=${12:-} type transport="" security=""
     if ! valid_tag "$tag" || ! valid_port "$port"; then fail "无效的 tag 或端口。"; return 1; fi
     port=$((10#$port))
     case "$protocol" in
@@ -892,6 +908,9 @@ generate_inbound() {
         *) [[ -n $credential ]] || { fail "密码不能为空。"; return 1; } ;;
     esac
     [[ $type != tuic || -n $password ]] || { fail "TUIC 密码不能为空。"; return 1; }
+    if [[ -n $obfs_password ]] && { [[ $type != hysteria2 ]] || ! valid_salamander_password "$obfs_password"; }; then
+        fail "Salamander 仅用于 Hysteria 2，混淆密码须至少 4 字节。"; return 1
+    fi
     if [[ $transport == ws && $extra != /* ]]; then
         fail "WebSocket 路径必须以 / 开头。"; return 1
     fi
@@ -909,13 +928,14 @@ generate_inbound() {
     jq -n --arg type "$type" --arg tag "$tag" --argjson port "$port" --arg credential "$credential" \
         --arg transport "$transport" --arg extra "$extra" --arg security "$security" --arg name "$tls_name" \
         --arg key "$private_key" --arg sid "$short_id" --arg cert "$certificate" --arg tlskey "$tls_key" \
-        --arg password "$password" '
+        --arg password "$password" --arg obfs "$obfs_password" '
         {type:$type,tag:$tag,listen:"::",listen_port:$port}
         | if $type == "vless" or $type == "vmess" then .users=[{uuid:$credential}]
           elif $type == "tuic" then .users=[{uuid:$credential,password:$password}] | .congestion_control="cubic"
           elif $type == "shadowsocks" then .method="2022-blake3-aes-128-gcm" | .password=$credential
           else .users=[{password:$credential}] end
         | if $type == "vmess" then .users[0].alterId=0 else . end
+        | if $type == "hysteria2" and $obfs != "" then .obfs={type:"salamander",password:$obfs} else . end
         | if $transport == "ws" then .transport={type:"ws",path:$extra}
           elif $transport == "grpc" then .transport={type:"grpc",service_name:$extra} else . end
         | if $security == "reality" then
@@ -1398,7 +1418,29 @@ prompt_secret() {
     printf -v "$variable" '%s' "${input:-$default}"
 }
 
+prompt_hysteria2_obfs() {
+    local destination=$1 current=${2:-} obfs_choice obfs_default=1 selected_obfs message
+    [[ -z $current ]] || obfs_default=2
+    prompt obfs_choice "Hysteria 2 混淆：1 不启用，2 Salamander，0 取消" "$obfs_default" || return 1
+    case "$obfs_choice" in
+        0) info "已取消混淆设置。"; return 1 ;;
+        1) printf -v "$destination" '%s' ""; return 0 ;;
+        2)
+            if [[ -n $current ]]; then message="Salamander 混淆密码（至少 4 字节；回车保留，@new 重新生成）"
+            else message="Salamander 混淆密码（至少 4 字节；回车或 @new 自动生成）"; fi
+            prompt_secret selected_obfs "$message" "$current" || return 1
+            if [[ -z $selected_obfs || $selected_obfs == @new ]]; then
+                selected_obfs=$("$CORE_BIN" generate rand --base64 16) || return 1
+            fi
+            valid_salamander_password "$selected_obfs" || { fail "Salamander 混淆密码须至少 4 字节。"; return 1; }
+            printf -v "$destination" '%s' "$selected_obfs"
+            ;;
+        *) fail "请输入 0–2。"; return 1 ;;
+    esac
+}
+
 detect_inbound_template() {
+    validate_obfs_template "$1" || return
     jq -er '
       if .type == "shadowsocks" and .method == "2022-blake3-aes-128-gcm" and .users == null then "shadowsocks"
       elif (.users | length) != 1 then error("single-user templates only")
@@ -1542,7 +1584,7 @@ edit_wizard_locked() (
     umask 077
     require_core || exit 1
     local old_tag=${1:-} tag port protocol work metadata server="" public_key="" credential extra=""
-    local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" rotation pair
+    local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" obfs_password="" rotation pair
     [[ $# -le 1 ]] || { fail "用法：sing-box edit [配置名称]"; exit 1; }
     if [[ -z $old_tag ]]; then
         select_inbound old_tag "修改" || exit 1
@@ -1564,6 +1606,10 @@ edit_wizard_locked() (
     short_id=$(jq -r '.tls.reality.short_id[0] // ""' "$work/original.json")
     certificate=$(jq -r '.tls.certificate_path // ""' "$work/original.json")
     tls_key=$(jq -r '.tls.key_path // ""' "$work/original.json")
+    if [[ $protocol == hysteria2 ]]; then
+        obfs_password=$(jq -jr '(.obfs.password // "") + "."' "$work/original.json") || exit 1
+        obfs_password=${obfs_password%.}
+    fi
     metadata="$CLIENT_DIR/$old_tag.json"
     [[ ! -L $metadata ]] || { fail "拒绝读取连接信息符号链接。"; exit 1; }
     if [[ -f $metadata && $(jq -Sc .inbound "$metadata") == "$(jq -Sc . "$work/original.json")" ]]; then
@@ -1585,6 +1631,7 @@ edit_wizard_locked() (
         prompt_secret password "TUIC 密码（回车保留，@new 重新生成）" "$password" || exit 1
         [[ $password != @new ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
     fi
+    [[ $protocol != hysteria2 ]] || prompt_hysteria2_obfs obfs_password "$obfs_password" || exit 1
     case "$protocol" in
         *-ws|*-ws-tls) prompt extra "WebSocket 路径" "$extra" || exit 1 ;;
         *-grpc-*) prompt extra "gRPC 服务名" "$extra" || exit 1 ;;
@@ -1614,7 +1661,7 @@ edit_wizard_locked() (
     prompt server "客户端连接地址（回车保留，- 清除独立地址并使用默认）" "$server" || exit 1
     [[ $server != - ]] || server=""
     generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$short_id" \
-        "$tls_name" "$certificate" "$tls_key" "$password" >"$work/generated.json" || exit 1
+        "$tls_name" "$certificate" "$tls_key" "$password" "$obfs_password" >"$work/generated.json" || exit 1
     # Overlay only template fields; preserve listen options, user names, TLS ALPN,
     # and a non-default REALITY handshake port from an imported configuration.
     jq --slurpfile updated "$work/generated.json" '
@@ -1625,6 +1672,9 @@ edit_wizard_locked() (
         | if $old.tls.reality.handshake.server_port != null then
             .tls.reality.handshake.server_port=$old.tls.reality.handshake.server_port else . end
         | if $old.type == "tuic" and $old.congestion_control != null then .congestion_control=$old.congestion_control else . end
+        | if $old.type == "hysteria2" then
+            if $updated[0].obfs == null then del(.obfs) else .obfs=$updated[0].obfs end
+          else . end
         | if $old.listen == null then del(.listen) else . end' "$work/original.json" >"$work/updated.json" || exit 1
     info "待保存：$old_tag → $tag，端口 $port。"
     if ! confirm "保存修改？运行中的服务将按需重启，失败时回滚；修改认证或端口后需重新导入客户端链接。"; then
@@ -1659,6 +1709,7 @@ set_default_server() (
 generate_client() {
     local inbound=$1 server=$2 public_key=${3:-}
     valid_host "$server" || { fail "服务器地址格式无效。"; return 1; }
+    validate_obfs_template "$inbound" || return
     # Import supports all core schemas, but export must never silently drop security options.
     jq -e '
       def transport_ok:
@@ -1697,7 +1748,7 @@ generate_client() {
         (.users[0] | keys - ["name","uuid","password"] | length == 0) and
         (.users[0].password | type == "string" and length > 0) and
         .tls.enabled == true and .transport == null and
-        .obfs == null and .realm == null and .masquerade == null and .padding_scheme == null and
+        .realm == null and .masquerade == null and .padding_scheme == null and
         (if .type == "tuic" then (.users[0].uuid | type == "string" and length > 0) else true end)
       else false end)' "$inbound" >/dev/null || {
         fail "该导入配置超出客户端导出模板范围，请按原始配置设置客户端；不会忽略 TLS 或其他安全字段。"
@@ -1724,6 +1775,7 @@ generate_client() {
             .uuid=$in.users[0].uuid | .password=$in.users[0].password
             | .congestion_control=($in.congestion_control // "cubic")
           else .password=$in.users[0].password end
+        | if $in.type == "hysteria2" and $in.obfs != null then .obfs=$in.obfs else . end
         | if $in.tls.enabled == true then
             .tls={enabled:true,server_name:$in.tls.server_name}
             | if $in.tls.alpn != null then .tls.alpn=$in.tls.alpn else . end
@@ -1738,6 +1790,7 @@ uri_encode() { jq -rn --arg value "$1" '$value|@uri'; }
 
 client_link() {
     local file=$1 tag=${2:-sing-box} type server port credential transport query sni key sid path method alpn flow
+    validate_obfs_template "$file" || return
     type=$(jq -r '.type' "$file") && server=$(jq -r '.server' "$file") &&
         port=$(jq -r '.server_port' "$file") || return
     [[ $server != *:* ]] || server="[$server]"
@@ -1784,6 +1837,9 @@ client_link() {
             alpn=$(jq -r '(.tls.alpn // []) | join(",")' "$file")
             query="sni=$(uri_encode "$sni")"
             [[ -z $alpn ]] || query+="&alpn=$(uri_encode "$alpn")"
+            if [[ $type == hysteria2 && $(jq -r '.obfs.type // ""' "$file") == salamander ]]; then
+                query+="&obfs=salamander&obfs-password=$(jq -r '.obfs.password | @uri' "$file")"
+            fi
             credential=$(uri_encode "$credential")
             if [[ $type == tuic ]]; then
                 credential="$(jq -r '.uuid' "$file"):$credential"
@@ -1804,7 +1860,7 @@ add_wizard_locked() (
     umask 077
     require_core || exit 1
     local choice protocol tag port credential extra="" private_key="" public_key="" short_id="" server="" pair work file
-    local tls_name="" certificate="" tls_key="" password="" default_server=""
+    local tls_name="" certificate="" tls_key="" password="" obfs_password="" default_server=""
     printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n 18. VLESS + TCP + TLS\n  0. 返回\n'
     prompt choice "请选择" 1 || exit 1
     case "$choice" in
@@ -1844,6 +1900,7 @@ add_wizard_locked() (
         shadowsocks|hysteria2|anytls) credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
     esac
     [[ $protocol != tuic ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+    [[ $protocol != hysteria2 ]] || prompt_hysteria2_obfs obfs_password || exit 1
     case "$protocol" in
         vless-ws|vless-ws-tls|vmess-ws|vmess-ws-tls)
             [[ $protocol == *-tls ]] || warn "此模板未启用 TLS；可配合 TLS 反向代理使用。"
@@ -1883,7 +1940,7 @@ add_wizard_locked() (
     work=$(mktemp -d "$STATE_DIR/add.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$short_id" \
-        "$tls_name" "$certificate" "$tls_key" "$password" >"$work/inbound.json" || exit 1
+        "$tls_name" "$certificate" "$tls_key" "$password" "$obfs_password" >"$work/inbound.json" || exit 1
     [[ -z $server ]] || generate_client "$work/inbound.json" "$server" "$public_key" >/dev/null || exit 1
     add_managed_inbound "$work/inbound.json" "$server" "$public_key" || exit 1
     info "已添加 $tag，端口 $((10#$port))。请在服务器防火墙和云安全组放行对应端口。"

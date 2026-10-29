@@ -225,12 +225,13 @@ class ManagerTest(unittest.TestCase):
         certificate: Path | None = None,
         key: Path | None = None,
         tuic_password: str = "",
+        obfs_password: str = "",
     ) -> dict:
         """Call the source-only generator with the extended positional seam."""
         args = (
             protocol, "extended-test", "18443", credential, extra, private_key,
             short_id, tls_server_name, str(certificate or ""), str(key or ""),
-            tuic_password,
+            tuic_password, obfs_password,
         )
         result = self.shell('generate_inbound "$@"', *args, check=True)
         return json.loads(result.stdout)
@@ -726,6 +727,7 @@ printf 'INVALID_REJECTED\n'
                             choice) printf -v "$variable" '%s' "$TEST_CHOICE" ;;
                             tag) printf -v "$variable" '%s' "route-$TEST_CHOICE" ;;
                             port) printf -v "$variable" '%s' "$((20000 + TEST_CHOICE))" ;;
+                            obfs_choice) printf -v "$variable" '%s' 1 ;;
                             extra)
                                 case "$TEST_CHOICE" in
                                     2|13|14|17) printf -v "$variable" '%s' '/route-ws' ;;
@@ -1248,6 +1250,7 @@ printf 'INVALID_REJECTED\n'
                     choice) printf -v "$variable" '%s' "$TEST_WIZARD_CHOICE" ;;
                     tag) printf -v "$variable" '%s' wizard-default ;;
                     port) printf -v "$variable" '%s' 29443 ;;
+                    obfs_choice) printf -v "$variable" '%s' 1 ;;
                     extra) printf -v "$variable" '%s' WizardGrpc ;;
                     tls_name) printf -v "$variable" '%s' "$TEST_TLS_NAME" ;;
                     certificate) printf -v "$variable" '%s' /tmp/wizard-cert.pem ;;

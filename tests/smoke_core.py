@@ -417,6 +417,7 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
         raise RuntimeError("Could not parse core-generated REALITY keypair")
     templates = {
         "hysteria2": ("hy2-password", "", "", "", "localhost", certificate, private_key, ""),
+        "hysteria2-salamander": ("hy2-salamander-password", "", "", "", "localhost", certificate, private_key, ""),
         "tuic": (uuid, "", "", "", "localhost", certificate, private_key, "tuic-password"),
         "anytls": ("anytls-password", "", "", "", "localhost", certificate, private_key, ""),
         "vless-grpc-tls": (uuid, "SmokeGrpc", "", "", "localhost", certificate, private_key, ""),
@@ -430,19 +431,27 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
         "vmess-grpc-tls": (uuid, "SmokeVmessGrpc", "", "", "localhost", certificate, private_key, ""),
     }
     with http_target(payload) as target_port:
-        for protocol, fields in templates.items():
+        for template, fields in templates.items():
+            protocol = "hysteria2" if template == "hysteria2-salamander" else template
             credential, extra, server_private, short_id, server_name, cert, key, password = fields
             server_port, proxy_port = free_port(), free_port()
             while proxy_port == server_port:
                 proxy_port = free_port()
-            inbound = bash_json(
-                manager, environment, "generate_inbound", protocol, "smoke-" + protocol, str(server_port),
+            generator_args = [
+                manager, environment, "generate_inbound", protocol, "smoke-" + template, str(server_port),
                 credential, extra, server_private, short_id, server_name, str(cert or ""), str(key or ""), password,
-            )
+            ]
+            if template == "hysteria2-salamander":
+                generator_args.append("salamander-obfs-password")
+            inbound = bash_json(*generator_args)
+            if template == "hysteria2-salamander" and inbound.get("obfs") != {
+                "type": "salamander", "password": "salamander-obfs-password",
+            }:
+                raise RuntimeError("hysteria2-salamander: generated server obfs did not match")
             inbound["listen"] = LOOPBACK
-            inbound_file = work / (protocol + "-extended-inbound.json")
+            inbound_file = work / (template + "-extended-inbound.json")
             write_json(inbound_file, inbound)
-            server_file = work / (protocol + "-extended-server.json")
+            server_file = work / (template + "-extended-server.json")
             write_json(server_file, server_config(inbound))
             check(core, server_file, work)
             if protocol == "vless-grpc-reality":
@@ -461,24 +470,28 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
                 continue
 
             outbound = bash_json(manager, environment, "generate_client", str(inbound_file), LOOPBACK)
+            if template == "hysteria2-salamander" and outbound.get("obfs") != {
+                "type": "salamander", "password": "salamander-obfs-password",
+            }:
+                raise RuntimeError("hysteria2-salamander: client export obfs did not match")
             if inbound.get("tls", {}).get("enabled"):
                 # Trust only the temporary certificate; insecure=true is never
                 # used, which keeps this an actual certificate verification.
                 if outbound.get("tls", {}).get("insecure", False):
                     raise RuntimeError(f"{protocol}: generated client must not use insecure TLS")
                 outbound.setdefault("tls", {})["certificate"] = certificate.read_text(encoding="utf-8")
-            client_file = work / (protocol + "-extended-client.json")
+            client_file = work / (template + "-extended-client.json")
             write_json(client_file, client_config(outbound, proxy_port))
             check(core, client_file, work)
             quic = protocol in {"hysteria2", "tuic"}
             with running_core(core, server_file, server_port, work, tcp_probe=not quic):
                 with running_core(core, client_file, proxy_port, work):
-                    received = fetch_through_socks_retry(proxy_port, target_port, "/probe/" + protocol)
+                    received = fetch_through_socks_retry(proxy_port, target_port, "/probe/" + template)
                     if received != payload:
-                        raise RuntimeError(f"{protocol}: forwarded HTTP response did not match")
+                        raise RuntimeError(f"{template}: forwarded HTTP response did not match")
                     if quic:
                         run_udp_smoke(proxy_port, protocol)
-            print(f"PASS {protocol}: real server + client forwarded exact HTTP payload over loopback", flush=True)
+            print(f"PASS {template}: real server + client forwarded exact HTTP payload over loopback", flush=True)
 
 
 def run_smoke(core: Path, manager: Path) -> None:
