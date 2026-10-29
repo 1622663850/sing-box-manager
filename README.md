@@ -212,6 +212,8 @@ sudo sing-box bbr-disable         # 确认后恢复本面板开启 BBR 前的参
 sudo sing-box quic-bbr            # 选择 Hy2/TUIC 节点，确认后备份并启用 QUIC BBR
 sudo sing-box quic-bbr my-hy2      # 直接选择指定名称；数字参数仍是名称
 sudo sing-box quic-bbr-status     # 查看 Hy2/TUIC 的协议内部拥塞控制状态
+sudo sing-box quic-bbr-disable    # 选择节点，恢复开启 QUIC BBR 前的实际设置
+sudo sing-box quic-bbr-disable my-hy2
 sudo sing-box acme                # 安装/打开 acme-script 证书管理菜单
 sudo sing-box update 1.14.3        # 将已安装核心更新为指定正式版本，版本号仅作示例
 sudo sing-box start               # 启动，不更改开机自启设置
@@ -286,7 +288,13 @@ UDP 没有通用的系统级 BBR 开关。v1.16.0 起，主菜单 **15 → 2. �
 
 Hysteria 2 会移除该节点的 `up_mbps`、`down_mbps` 带宽设置，并设置 `ignore_client_bandwidth=true`，要求客户端使用 BBR；参见 [sing-box Hy2 说明](https://sing-box.sagernet.org/configuration/inbound/hysteria2/#ignore_client_bandwidth)。默认 Hy2 未设置带宽时允许 BBR，但客户端提供带宽值时可能协商为 Hysteria/Brutal，此选项明确要求 BBR。TUIC 会设置 `congestion_control="bbr"`，支持的算法及默认值见 [TUIC 说明](https://sing-box.sagernet.org/configuration/inbound/tuic/#congestion_control)。TUIC 导出的客户端 JSON 和分享链接会同步携带 BBR 参数，修改后请重新导入客户端。
 
-操作前确认并生成成套备份，使用原有配置修改事务校验、保留 JSONC 注释、同步连接元数据并在失败时回滚。密码、UUID、端口、TLS、证书路径和 Salamander 保持不变；运行中的 sing-box 会短暂重启，停止状态保持停止；已经启用的节点不重复写入或重启。原来的带宽/拥塞控制值包含在成套备份中，可从主菜单 **13** 恢复，恢复会影响整套配置，请留意其后的节点修改。主菜单 **16** 仅恢复系统 TCP 设置，不改动 QUIC 节点。新增节点和已有节点均不会因更新面板而自动启用此设置。
+操作前确认并生成成套备份，使用原有配置修改事务校验、保留 JSONC 注释、同步连接元数据并在失败时回滚。密码、UUID、端口、TLS、证书路径和 Salamander 保持不变；运行中的 sing-box 会短暂重启，停止状态保持停止；已经启用的节点不重复写入或重启。主菜单 **16** 仅恢复系统 TCP 设置，不改动 QUIC 节点。新增节点和已有节点均不会因更新面板而自动启用或关闭此设置。
+
+v1.17.0 起，**主菜单 15 → 4. 关闭 UDP/QUIC BBR（恢复开启前设置）** 可按序号选择节点。开启时将原字段记录在该节点权限为 `600` 的连接元数据中，并与配置一起保存；重复开启保留首次记录。关闭只恢复 Hy2 的 `up_mbps`、`down_mbps`、`ignore_client_bandwidth` 或 TUIC 的 `congestion_control`，包括字段原本缺失、显式 `null`、`0`、`false` 的区别，不统一强制 CUBIC。其后对名称、认证、端口、证书等其他字段的正常修改会保留；改名时恢复记录随节点迁移。成功恢复后清除活动记录，历史备份保留；操作失败或中断时配置、元数据和恢复记录一起回滚。
+
+恢复记录缺失、损坏、与当前协议不匹配，节点与元数据不同步，或 QUIC 字段已被外部改动时，拒绝猜测或覆盖。恢复前会确认并备份；如果开启前已经是 BBR，恢复后仍会是 BBR并明确提示。成套备份仍可从主菜单 **13** 恢复整套配置，但须留意备份之后的其他节点修改。
+
+v1.16.0 或外部工具启用的旧节点没有活动恢复记录。可在核对**明确的开启前成套备份**后执行 `sudo sing-box quic-bbr-record my-hy2 /var/lib/sing-box-manager/backups/bundle-原备份.json`。只有该备份节点经 BBR 开启转换后与当前节点完全一致时才允许登记，不扫描或猜测“最新备份”，不覆盖已有记录；登记不修改节点配置、不重启服务。节点和备份不匹配时需人工核对，不能把已经开启后的备份当作开启前状态。
 
 依据：[Linux TCP 参数](https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html)、[默认 qdisc](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/net.html)、[sysctl.d 优先级](https://www.freedesktop.org/software/systemd/man/latest/sysctl.d.html)。
 

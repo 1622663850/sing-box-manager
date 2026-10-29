@@ -33,6 +33,9 @@ class QuicBbrTest(unittest.TestCase):
     def calls(self, log: Path) -> list[list[str]]:
         return fixture.ManagerTest.calls(self, log)
 
+    def _metadata(self, node: dict) -> Path:
+        return self.state_dir / "clients" / (node["tag"] + ".json")
+
     def tls_material(self, common_name: str = "example.com") -> tuple[Path, Path]:
         return fixture.ManagerTest.tls_material(self, common_name)
 
@@ -146,7 +149,13 @@ class QuicBbrTest(unittest.TestCase):
         self.assertEqual(saved_hy2["obfs"], before_hy2["obfs"])
         self.assertEqual(saved_other, other)
         self.assertIn("// preserve QUIC BBR comments", self.config.read_text(encoding="utf-8"))
-        self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["inbound"], saved_hy2)
+        metadata_value = json.loads(metadata.read_text(encoding="utf-8"))
+        self.assertEqual(metadata_value["inbound"], saved_hy2)
+        self.assertEqual(metadata_value["quic_bbr_restore"], {
+            "format": "sing-box-manager-quic-bbr-v1",
+            "type": "hysteria2",
+            "settings": {"up_mbps": 10, "down_mbps": 20},
+        })
         self.assertEqual(other_metadata.read_bytes(), before_other_metadata)
         self.assertFalse(self.state()["active"])
         bundles = sorted((self.state_dir / "backups").glob("bundle-*.json"))
@@ -239,6 +248,269 @@ class QuicBbrTest(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), before_config)
         self.assertEqual(metadata.read_bytes(), before_metadata)
         self.assertTrue(self.state()["active"])
+
+    def test_quic_restore_records_preserve_missing_zero_null_false_and_limit_fields(self) -> None:
+        cases = (
+            ("hy2-missing", "hysteria2", {}),
+            ("hy2-zero-null-false", "hysteria2", {"up_mbps": 0, "down_mbps": None, "ignore_client_bandwidth": False}),
+            ("hy2-values", "hysteria2", {"up_mbps": 12, "down_mbps": 34, "ignore_client_bandwidth": True}),
+            ("tuic-cubic", "tuic", {"congestion_control": "cubic"}),
+            ("tuic-newreno", "tuic", {"congestion_control": "new_reno"}),
+            ("tuic-missing", "tuic", {"__delete__": "congestion_control"}),
+            ("tuic-null", "tuic", {"congestion_control": None}),
+        )
+        for tag, protocol, fields in cases:
+            with self.subTest(tag=tag):
+                node = self.hysteria2(tag=tag, port=24401) if protocol == "hysteria2" else self.tuic(tag=tag, port=24402)
+                if "__delete__" in fields:
+                    node.pop(fields["__delete__"], None)
+                else:
+                    node.update(fields)
+                original = copy.deepcopy(node)
+                self._write_config([node])
+                metadata = self._write_metadata(node)
+                result = self.shell('confirm() { return 0; }; configure_quic_bbr_locked "$1"', tag, check=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                metadata_value = json.loads(metadata.read_text(encoding="utf-8"))
+                record = metadata_value["quic_bbr_restore"]
+                expected_settings = {
+                    key: original[key]
+                    for key in (("up_mbps", "down_mbps", "ignore_client_bandwidth") if protocol == "hysteria2" else ("congestion_control",))
+                    if key in original
+                }
+                self.assertEqual(record["settings"], expected_settings)
+                current_path = self.root / (tag + "-current.json")
+                fixture.dump(current_path, metadata_value["inbound"])
+                record_path = self.root / (tag + "-record.json")
+                fixture.dump(record_path, record)
+                restored = json.loads(self.shell(
+                    'generate_quic_bbr_restore "$1" "$2"', str(current_path), str(record_path), check=True,
+                ).stdout)
+                for key in expected_settings:
+                    self.assertIn(key, restored)
+                    self.assertEqual(restored[key], expected_settings[key])
+                for key in (("up_mbps", "down_mbps", "ignore_client_bandwidth") if protocol == "hysteria2" else ("congestion_control",)):
+                    if key not in expected_settings:
+                        self.assertNotIn(key, restored)
+
+    def test_disable_quic_bbr_restores_only_recorded_fields_and_deletes_record(self) -> None:
+        node = self.hysteria2(tag="hy2-disable", port=24501, obfs="disable-obfs")
+        node["up_mbps"] = 8
+        node["down_mbps"] = 9
+        self._write_config([node])
+        metadata = self._write_metadata(node)
+        self.shell('confirm() { return 0; }; configure_quic_bbr_locked "$1"', node["tag"], check=True)
+        current = json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"][0]
+        current["users"][0]["password"] = "edited-hy-password"
+        current["listen_port"] = 24502
+        candidate = self.root / "hy2-disable-edited.json"
+        fixture.dump(candidate, current)
+        expected = self.root / "hy2-disable-before-edit.json"
+        fixture.dump(expected, current | {"listen_port": 24501, "users": node["users"]})
+        self.shell('replace_inbound_file "$1" "$2" "" "" "$3"', node["tag"], str(candidate), str(expected), check=True)
+        result = self.shell('confirm() { return 0; }; disable_quic_bbr_locked "$1"', node["tag"], check=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        restored = json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"][0]
+        self.assertEqual(restored["users"][0]["password"], "edited-hy-password")
+        self.assertEqual(restored["listen_port"], 24502)
+        self.assertEqual(restored["obfs"], node["obfs"])
+        self.assertEqual(restored["tls"], node["tls"])
+        self.assertEqual(restored["up_mbps"], 8)
+        self.assertEqual(restored["down_mbps"], 9)
+        self.assertNotIn("ignore_client_bandwidth", restored)
+        metadata_value = json.loads(metadata.read_text(encoding="utf-8"))
+        self.assertNotIn("quic_bbr_restore", metadata_value)
+        self.assertEqual(metadata_value["inbound"], restored)
+
+    def test_restore_helper_rejects_missing_corrupt_external_and_mismatched_records(self) -> None:
+        node = self.hysteria2(tag="hy2-record-invalid", port=24601)
+        node["up_mbps"] = 5
+        current = self._apply_helper(node)
+        current_path = self.root / "invalid-current.json"
+        fixture.dump(current_path, current)
+        valid = {
+            "format": "sing-box-manager-quic-bbr-v1",
+            "type": "hysteria2",
+            "settings": {"up_mbps": 5},
+        }
+        records = {
+            "missing-format": {},
+            "wrong-format": {**valid, "format": "other"},
+            "wrong-type": {**valid, "type": "tuic"},
+            "unknown-setting": {**valid, "settings": {"up_mbps": 5, "unexpected": 1}},
+            "external-change": valid,
+        }
+        changed = dict(current)
+        changed["up_mbps"] = 99
+        changed_path = self.root / "invalid-external.json"
+        fixture.dump(changed_path, changed)
+        for name, record in records.items():
+            with self.subTest(case=name):
+                record_path = self.root / (name + ".json")
+                fixture.dump(record_path, record)
+                source = changed_path if name == "external-change" else current_path
+                result = self.shell('generate_quic_bbr_restore "$1" "$2"', str(source), str(record_path))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), "")
+        missing = self.root / "missing-record.json"
+        result = self.shell('generate_quic_bbr_restore "$1" "$2"', str(current_path), str(missing))
+        self.assertNotEqual(result.returncode, 0)
+        corrupt = self.root / "corrupt-record.json"
+        corrupt.write_bytes(b"{")
+        result = self.shell('generate_quic_bbr_restore "$1" "$2"', str(current_path), str(corrupt))
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_normal_edit_rename_preserves_record_until_quic_disable(self) -> None:
+        node = self.hysteria2(tag="hy2-rename", port=24651)
+        node["up_mbps"] = 6
+        self._write_config([node])
+        old_metadata = self._write_metadata(node)
+        self.shell('confirm() { return 0; }; configure_quic_bbr_locked "$1"', node["tag"], check=True)
+        current = json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"][0]
+        candidate = dict(current)
+        candidate["tag"] = "hy2-renamed"
+        candidate["listen_port"] = 24652
+        candidate_path = self.root / "hy2-renamed.json"
+        expected_path = self.root / "hy2-rename-current.json"
+        fixture.dump(candidate_path, candidate)
+        fixture.dump(expected_path, current)
+        self.shell(
+            'replace_inbound_file "$1" "$2" "example.com" "" "$3"',
+            node["tag"], str(candidate_path), str(expected_path), check=True,
+        )
+        new_metadata = self.state_dir / "clients/hy2-renamed.json"
+        self.assertFalse(old_metadata.exists())
+        record = json.loads(new_metadata.read_text(encoding="utf-8"))["quic_bbr_restore"]
+        self.assertEqual(record["settings"], {"up_mbps": 6})
+        self.shell('confirm() { return 0; }; disable_quic_bbr_locked "$1"', "hy2-renamed", check=True)
+        restored = json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"][0]
+        self.assertEqual(restored["tag"], "hy2-renamed")
+        self.assertEqual(restored["listen_port"], 24652)
+        self.assertEqual(restored["up_mbps"], 6)
+        self.assertNotIn("ignore_client_bandwidth", restored)
+        self.assertNotIn("quic_bbr_restore", json.loads(new_metadata.read_text(encoding="utf-8")))
+
+    def test_replace_metadata_expected_absence_cas_rejects_without_changes(self) -> None:
+        node = self.hysteria2(tag="hy2-cas", port=24661)
+        node["up_mbps"] = 4
+        self._write_config([node])
+        metadata = self._write_metadata(node)
+        self.shell('confirm() { return 0; }; configure_quic_bbr_locked "$1"', node["tag"], check=True)
+        candidate = json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"][0]
+        candidate["listen_port"] = 24662
+        candidate_path = self.root / "hy2-cas-candidate.json"
+        expected_path = self.root / "hy2-cas-expected.json"
+        fixture.dump(candidate_path, candidate)
+        fixture.dump(expected_path, json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"][0])
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        result = self.shell(
+            'replace_inbound_file "$1" "$2" "" "" "$3" "" -',
+            node["tag"], str(candidate_path), str(expected_path),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+
+    def test_quic_confirmation_metadata_change_is_rejected_without_overwrite(self) -> None:
+        node = self.hysteria2(tag="hy2-confirm-cas", port=24666)
+        node["up_mbps"] = 4
+        self._write_config([node])
+        metadata = self._write_metadata(node)
+        before_config = self.config.read_bytes()
+        self.env["QUIC_METADATA_PATH"] = str(metadata)
+        result = self.shell(
+            r'''
+            confirm() {
+                jq '.server="external.example"' "$QUIC_METADATA_PATH" >"$QUIC_METADATA_PATH.tmp" &&
+                    mv -- "$QUIC_METADATA_PATH.tmp" "$QUIC_METADATA_PATH"
+                return 0
+            }
+            configure_quic_bbr_locked "$1"
+            ''',
+            node["tag"],
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["server"], "external.example")
+        self.assertNotIn("quic_bbr_restore", json.loads(metadata.read_text(encoding="utf-8")))
+
+    def test_record_write_failure_rolls_back_enable_and_record_delete_failure_rolls_back_disable(self) -> None:
+        node = self.hysteria2(tag="hy2-record-fail", port=24671)
+        node["up_mbps"] = 3
+        self._write_config([node])
+        metadata = self._write_metadata(node)
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        body = r'''
+            eval "$(declare -f atomic_copy | sed '1s/^atomic_copy/real_atomic_copy/')"
+            atomic_copy() { if [[ $2 == *"/clients/hy2-record-fail.json" ]]; then return 1; fi; real_atomic_copy "$@"; }
+            confirm() { return 0; }
+            configure_quic_bbr_locked "$1"
+        '''
+        result = self.shell(body, node["tag"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+
+        self.shell('confirm() { return 0; }; configure_quic_bbr_locked "$1"', node["tag"], check=True)
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        result = self.shell(body.replace("configure_quic_bbr_locked", "disable_quic_bbr_locked"), node["tag"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+
+    def test_disable_restart_failure_rolls_back_record_and_service(self) -> None:
+        node = self.hysteria2(tag="hy2-disable-restart", port=24681)
+        node["up_mbps"] = 2
+        self._write_config([node])
+        metadata = self._write_metadata(node)
+        self.shell('confirm() { return 0; }; configure_quic_bbr_locked "$1"', node["tag"], check=True)
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        self.state(active=True, restart_failures=1)
+        result = self.shell('confirm() { return 0; }; disable_quic_bbr_locked "$1"', node["tag"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+        self.assertTrue(self.state()["active"])
+
+    def test_record_quic_bbr_adopts_only_matching_backup_and_never_overwrites_record(self) -> None:
+        original = self.hysteria2(tag="hy2-adopt", port=24701)
+        original["up_mbps"] = 15
+        original["down_mbps"] = 25
+        self._write_config([original])
+        metadata = self._write_metadata(original)
+        bundle = Path(self.shell("create_backup", check=True).stdout.strip())
+        current = self._apply_helper(original)
+        self._write_config([current])
+        metadata.write_text(json.dumps({"server": "example.com", "public_key": "", "inbound": current}) + "\n", encoding="utf-8")
+        before_config = self.config.read_bytes()
+        after_bundle = Path(self.shell("create_backup", check=True).stdout.strip())
+        rejected = self.shell('confirm() { return 0; }; record_quic_bbr_locked "$1" "$2"', original["tag"], str(after_bundle))
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("quic_bbr_restore", json.loads(metadata.read_text(encoding="utf-8")))
+        result = self.shell('confirm() { return 0; }; record_quic_bbr_locked "$1" "$2"', original["tag"], str(bundle), check=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertFalse(any("restart" in call for call in self.calls(self.system_log)))
+        adopted = json.loads(metadata.read_text(encoding="utf-8"))["quic_bbr_restore"]
+        self.assertEqual(adopted["settings"], {"up_mbps": 15, "down_mbps": 25})
+        adopted_before = json.dumps(adopted, sort_keys=True)
+
+        mismatched = json.loads(bundle.read_text(encoding="utf-8"))
+        mismatched["config"]["inbounds"][0]["up_mbps"] = 99
+        mismatched["config"]["inbounds"][0]["down_mbps"] = 88
+        mismatched["clients"][original["tag"]]["inbound"] = mismatched["config"]["inbounds"][0]
+        mismatched.pop("config_source", None)
+        bad_bundle = self.root / "bad-adopt-bundle.json"
+        fixture.dump(bad_bundle, mismatched)
+        self.shell('validate_bundle "$1"', str(bad_bundle), check=True)
+        result = self.shell('confirm() { return 0; }; record_quic_bbr_locked "$1" "$2"', original["tag"], str(bad_bundle))
+        self.assertNotEqual(result.returncode, 0)
+        current_record = json.loads(metadata.read_text(encoding="utf-8"))["quic_bbr_restore"]
+        self.assertEqual(json.dumps(current_record, sort_keys=True), adopted_before)
 
     def test_cli_quic_bbr_and_status_routes(self) -> None:
         body = r'''

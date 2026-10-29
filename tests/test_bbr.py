@@ -565,11 +565,15 @@ disable_bbr_locked() { printf 'BBR_DISABLED\n'; }
 show_bbr_status() { printf 'BBR_STATUS\n'; }
 configure_quic_bbr_locked() { printf 'QUIC_BBR:%s\n' "$*"; }
 show_quic_bbr_status() { printf 'QUIC_STATUS\n'; }
+disable_quic_bbr() { printf 'QUIC_DISABLE:%s\n' "$*"; }
+record_quic_bbr() { printf 'QUIC_RECORD:%s\n' "$*"; }
 main bbr
 main bbr-status
 main bbr-disable
 main quic-bbr hy2-node
 main quic-bbr-status
+main quic-bbr-disable hy2-node
+main quic-bbr-record hy2-node bundle.json
 main bbr extra >/dev/null 2>&1 || printf 'INVALID\n'
 main bbr-disable extra >/dev/null 2>&1 || printf 'INVALID_DISABLE\n'
 '''
@@ -581,17 +585,20 @@ main bbr-disable extra >/dev/null 2>&1 || printf 'INVALID_DISABLE\n'
         self.assertIn("BBR_DISABLED", result.stdout)
         self.assertIn("LOCK:configure_quic_bbr_locked hy2-node", result.stdout)
         self.assertIn("QUIC_STATUS", result.stdout)
+        self.assertIn("QUIC_DISABLE:hy2-node", result.stdout)
+        self.assertIn("QUIC_RECORD:hy2-node bundle.json", result.stdout)
         self.assertIn("INVALID_DISABLE", result.stdout)
         self.assertIn("INVALID", result.stdout)
 
     def test_bbr_submenu_dispatches_tcp_quic_and_status_actions(self) -> None:
         body = r'''
-choices=(1 2 3 0)
+choices=(1 2 3 4 0)
 choice_index=0
 prompt() { printf -v "$1" '%s' "${choices[$choice_index]}"; choice_index=$((choice_index + 1)); }
 read() { return 0; }
 enable_bbr() { printf 'TCP_MENU\n'; }
 enable_quic_bbr() { printf 'QUIC_MENU\n'; }
+disable_quic_bbr() { printf 'QUIC_DISABLE_MENU\n'; }
 with_lock() { "$@"; }
 configure_quic_bbr_locked() { printf 'QUIC_MENU\n'; }
 show_quic_bbr_status() { printf 'QUIC_STATUS_MENU\n'; }
@@ -602,6 +609,7 @@ bbr_menu
         self.assertIn("TCP_MENU", result.stdout)
         self.assertIn("QUIC_MENU", result.stdout)
         self.assertIn("QUIC_STATUS_MENU", result.stdout)
+        self.assertIn("QUIC_DISABLE_MENU", result.stdout)
 
     @unittest.skipUnless(pty is not None, "PTY support is required for menu routing")
     def test_menu_fifteen_calls_bbr(self) -> None:

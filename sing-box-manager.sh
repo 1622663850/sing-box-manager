@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.16.0"
+SB_MANAGER_VERSION="1.17.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1473,6 +1473,7 @@ detect_inbound_template() {
 replace_inbound_file() (
     umask 077
     local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
+    local quic_record=${6:-} expected_metadata=${7:-}
     local tag port old_port work snapshot old_metadata new_metadata effective backup=""
     local transaction=0 old_metadata_exists=0 active=0 changed=0
     require_core && safe_paths || exit 1
@@ -1541,6 +1542,18 @@ replace_inbound_file() (
     [[ ! -L $old_metadata && ! -L $new_metadata ]] || { fail "拒绝操作连接信息符号链接。"; exit 1; }
     [[ ! -e $old_metadata || -f $old_metadata ]] || { fail "原连接信息不是普通文件。"; exit 1; }
     [[ $tag == "$old_tag" || ! -e $new_metadata ]] || { fail "新名称已有连接信息文件，请使用其他名称。"; exit 1; }
+    if [[ $expected_metadata == - ]]; then
+        [[ ! -e $old_metadata ]] || { fail "连接信息已在确认期间创建，请重新操作。"; exit 1; }
+    elif [[ -n $expected_metadata ]]; then
+        cmp -s "$expected_metadata" "$old_metadata" || { fail "连接信息已在确认期间修改，请重新操作。"; exit 1; }
+    fi
+    if [[ -n $quic_record ]]; then
+        case "$(jq -r .type "$file")" in hysteria2|tuic) ;; *) fail "此协议不支持 QUIC 恢复记录。"; exit 1;; esac
+        if [[ $quic_record != null ]]; then
+            printf '%s\n' "$quic_record" >"$work/quic-record.json" || exit 1
+            validate_quic_bbr_record "$work/quic-record.json" "$(jq -r .type "$file")" || exit 1
+        fi
+    fi
     effective=$server
     [[ -n $effective ]] || effective=$(read_default_server) || exit 1
     if [[ -z $effective && $(jq -r .type "$file") == hysteria2 ]]; then effective=$(jq -r '.tls.server_name // ""' "$file"); fi
@@ -1553,8 +1566,10 @@ replace_inbound_file() (
         jq -e 'type == "object"' "$old_metadata" >/dev/null || exit 1
         cp -- "$old_metadata" "$work/metadata-before.json" || exit 1
     else printf '{}\n' >"$work/metadata-before.json"; fi
-    jq --arg server "$server" --arg key "$public_key" --slurpfile node "$file" \
-        '.server=$server | .public_key=$key | .inbound=$node[0]' "$work/metadata-before.json" >"$work/metadata.json" || exit 1
+    jq --arg server "$server" --arg key "$public_key" --slurpfile node "$file" --arg record "$quic_record" \
+        '.server=$server | .public_key=$key | .inbound=$node[0]
+         | if $record=="" then . elif $record=="null" then del(.quic_bbr_restore)
+           else .quic_bbr_restore=($record|fromjson) end' "$work/metadata-before.json" >"$work/metadata.json" || exit 1
     [[ $(json_query "$snapshot" -Sc .) == "$(jq -Sc . "$work/candidate.json")" ]] || changed=1
     if [[ $changed -eq 0 && $old_metadata_exists -eq 1 &&
           $(jq -Sc . "$work/metadata-before.json") == "$(jq -Sc . "$work/metadata.json")" ]]; then
@@ -2322,6 +2337,46 @@ generate_quic_bbr_inbound() {
     }
 }
 
+quic_bbr_settings() {
+    jq -e 'if .type=="hysteria2" then with_entries(select(.key=="up_mbps" or .key=="down_mbps" or .key=="ignore_client_bandwidth"))
+      elif .type=="tuic" then with_entries(select(.key=="congestion_control"))
+      else error("unsupported QUIC protocol") end' "$1"
+}
+
+validate_quic_bbr_record() {
+    jq -se --arg type "$2" '
+      length==1 and (.[0] | type=="object" and
+        (keys==["format","settings","type"]) and .format=="sing-box-manager-quic-bbr-v1" and .type==$type and
+        (.settings | type=="object" and
+          if $type=="hysteria2" then
+            (keys-["up_mbps","down_mbps","ignore_client_bandwidth"]|length==0) and
+            all(to_entries[]; if .key=="ignore_client_bandwidth" then (.value==null or (.value|type)=="boolean")
+                else (.value==null or (.value|type)=="number" and (.value|isfinite) and .value>=0) end)
+          elif $type=="tuic" then (keys-["congestion_control"]|length==0) and
+            all(.[]; .==null or .=="" or .=="cubic" or .=="new_reno" or .=="bbr")
+          else false end))' "$1" >/dev/null 2>&1 || {
+        fail "QUIC BBR 恢复记录无效；不会猜测开启前的设置。"; return 1;
+    }
+}
+
+make_quic_bbr_record() {
+    local settings
+    settings=$(quic_bbr_settings "$1") || return 1
+    jq -n --arg type "$(jq -r .type "$1")" --argjson settings "$settings" \
+        '{format:"sing-box-manager-quic-bbr-v1",type:$type,settings:$settings}'
+}
+
+generate_quic_bbr_restore() {
+    local current target
+    validate_quic_bbr_record "$2" "$(jq -r .type "$1")" || return 1
+    current=$(quic_bbr_settings "$1" | jq -Sc .) || return 1
+    target=$(generate_quic_bbr_inbound "$1" | quic_bbr_settings /dev/stdin | jq -Sc .) || return 1
+    [[ $current == "$target" ]] || { fail "当前 QUIC 拥塞控制已被其他操作修改，拒绝覆盖。"; return 1; }
+    jq --slurpfile record "$2" '
+      (if .type=="hysteria2" then del(.up_mbps,.down_mbps,.ignore_client_bandwidth)
+       else del(.congestion_control) end) + $record[0].settings' "$1"
+}
+
 # shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 show_quic_bbr_status() {
     [[ $# -eq 0 ]] || { fail "用法：sing-box quic-bbr-status"; return 1; }
@@ -2339,13 +2394,17 @@ show_quic_bbr_status() {
 }
 
 # shellcheck disable=SC2016 # config_jq filters use literal jq variables.
-configure_quic_bbr_locked() (
+configure_quic_bbr_change() (
     umask 077
-    local tag=${1:-} work metadata server="" public_key="" backup
-    [[ $# -le 1 ]] || { fail "用法：sing-box quic-bbr [配置名称]"; exit 1; }
+    local action=$1; shift
+    local tag=${1:-} bundle=${2:-} work metadata server="" public_key="" backup record="" expected_meta=- had_record=0
+    if [[ $action == record ]]; then
+        [[ $# -eq 2 ]] || { fail "用法：sing-box quic-bbr-record 配置名称 开启前成套备份"; exit 1; }
+    else [[ $# -le 1 ]] || { fail "QUIC BBR 操作仅接受一个配置名称。"; exit 1; }; fi
     require_core && safe_paths || exit 1
     if [[ -z $tag ]]; then
-        select_inbound tag "开启 UDP/QUIC BBR" || exit 1
+        if [[ $action == disable ]]; then select_inbound tag "关闭 UDP/QUIC BBR" || exit 1
+        else select_inbound tag "开启 UDP/QUIC BBR" || exit 1; fi
         [[ -n $tag ]] || exit 0
     fi
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
@@ -2354,43 +2413,104 @@ configure_quic_bbr_locked() (
     config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/original.json" || exit 1
     generate_quic_bbr_inbound "$work/original.json" >"$work/updated.json" || exit 1
     detect_inbound_template "$work/original.json" >/dev/null || exit 1
-    if [[ $(jq -Sc . "$work/original.json") == "$(jq -Sc . "$work/updated.json")" ]]; then
-        info "$tag 的 UDP/QUIC BBR 已启用，无需修改。"; exit 0
-    fi
     metadata="$CLIENT_DIR/$tag.json"
     [[ ! -L $metadata && ( ! -e $metadata || -f $metadata ) ]] || { fail "连接信息文件无效。"; exit 1; }
-    if [[ -f $metadata && $(jq -Sc .inbound "$metadata") == "$(jq -Sc . "$work/original.json")" ]]; then
-        server=$(jq -r '.server // ""' "$metadata") || exit 1
-        public_key=$(jq -r '.public_key // ""' "$metadata") || exit 1
+    if [[ -f $metadata ]]; then
+        cp -- "$metadata" "$work/metadata-before.json" || exit 1
+        expected_meta="$work/metadata-before.json"
+        jq -e 'type=="object"' "$expected_meta" >/dev/null || exit 1
+        if jq -e 'has("quic_bbr_restore")' "$expected_meta" >/dev/null; then had_record=1; fi
+        if [[ $(jq -Sc .inbound "$expected_meta") == "$(jq -Sc . "$work/original.json")" ]]; then
+            server=$(jq -r '.server // ""' "$expected_meta") || exit 1
+            public_key=$(jq -r '.public_key // ""' "$expected_meta") || exit 1
+        elif [[ $had_record -eq 1 || $action != enable ]]; then
+            fail "节点与连接信息不一致，拒绝使用或覆盖恢复记录。"; exit 1
+        fi
+        [[ $had_record -eq 0 ]] || jq '.quic_bbr_restore' "$expected_meta" >"$work/record.json" || exit 1
     fi
-    info "将为 $tag 开启协议内部的 QUIC BBR，不修改系统 TCP 参数。"
-    if [[ $(jq -r .type "$work/original.json") == hysteria2 ]]; then
-        info "Hy2 将移除 up_mbps/down_mbps 带宽设置，并要求客户端使用 BBR；TLS、密码及混淆保持不变。"
-    else
-        info "TUIC 的拥塞控制将设为 bbr；成功后请重新导入客户端链接以同步算法。"
-    fi
-    confirm "确认开启？先备份；运行中的 sing-box 会短暂重启，失败时回滚。" || { info "已取消。"; exit 0; }
+    case "$action" in
+        enable)
+            if [[ $had_record -eq 1 ]]; then generate_quic_bbr_restore "$work/original.json" "$work/record.json" >/dev/null || exit 1; fi
+            if [[ $(jq -Sc . "$work/original.json") == "$(jq -Sc . "$work/updated.json")" ]]; then
+                info "$tag 的 UDP/QUIC BBR 已启用，无需修改。"; exit 0
+            fi
+            make_quic_bbr_record "$work/original.json" >"$work/record.json" || exit 1
+            record=$(jq -c . "$work/record.json") || exit 1
+            info "将为 $tag 开启 QUIC BBR，并记录原带宽/拥塞控制字段；系统 TCP 参数保持不变。"
+            info "Hy2 会移除 up_mbps/down_mbps 并要求 BBR；TUIC 会设置 congestion_control=bbr。"
+            ;;
+        disable)
+            [[ $had_record -eq 1 ]] || { fail "没有该节点开启前的恢复记录；请核对原备份，不会猜测原值。"; exit 1; }
+            generate_quic_bbr_restore "$work/original.json" "$work/record.json" >"$work/updated.json" || exit 1
+            record=null
+            info "将恢复 $tag 开启 QUIC BBR 前的带宽/拥塞控制字段，不改动其他节点或认证信息。"
+            if jq -e 'if .type=="tuic" then .congestion_control=="bbr" else
+              (.up_mbps // 0)==0 and (.down_mbps // 0)==0 and .ignore_client_bandwidth==true end' "$work/updated.json" >/dev/null; then
+                warn "开启前已经使用 BBR，恢复后仍为 BBR；本次撤销的是面板开启操作。"
+            fi
+            ;;
+        record)
+            [[ -f $bundle && ! -L $bundle ]] && validate_bundle "$bundle" || exit 1
+            jq -e --arg tag "$tag" '[.config.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("备份节点不存在或名称重复") end' "$bundle" >"$work/before.json" || exit 1
+            generate_quic_bbr_inbound "$work/before.json" >"$work/enabled.json" || exit 1
+            [[ $(jq -Sc . "$work/before.json") != "$(jq -Sc . "$work/enabled.json")" ]] || {
+                fail "指定备份已是开启后的 BBR 目标设置，不能作为开启前的依据。"; exit 1;
+            }
+            [[ $(jq -Sc . "$work/enabled.json") == "$(jq -Sc . "$work/original.json")" ]] || {
+                fail "指定备份与当前节点不匹配，拒绝补造恢复记录。"; exit 1;
+            }
+            make_quic_bbr_record "$work/before.json" >"$work/import-record.json" || exit 1
+            if [[ $had_record -eq 1 ]]; then
+                [[ $(jq -Sc . "$work/record.json") == "$(jq -Sc . "$work/import-record.json")" ]] || {
+                    fail "已有恢复记录，不会覆盖首次记录。"; exit 1;
+                }
+                info "恢复记录已存在，无需修改。"; exit 0
+            fi
+            record=$(jq -c . "$work/import-record.json") || exit 1
+            cp -- "$work/original.json" "$work/updated.json" || exit 1
+            info "将按指定成套备份为 $tag 补齐恢复记录，不更改节点配置或重启服务。"
+            ;;
+        *) exit 1 ;;
+    esac
+    if [[ $action == record ]]; then confirm "确认登记此备份中的原设置？（先备份，失败回滚）" || { info "已取消。"; exit 0; }
+    elif [[ $action == disable ]]; then confirm "确认关闭并恢复 QUIC BBR 开启前的设置？先备份；运行中的 sing-box 会短暂重启，失败回滚。" || { info "已取消。"; exit 0; }
+    else confirm "确认开启 QUIC BBR？先备份；运行中的 sing-box 会短暂重启，失败回滚。" || { info "已取消。"; exit 0; }; fi
     backup=$(create_backup) || exit 1
-    replace_inbound_file "$tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" || exit 1
-    info "UDP/QUIC BBR 已开启。成套备份：$backup（可从主菜单 13 恢复）。"
+    replace_inbound_file "$tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" "$record" "$expected_meta" || exit 1
+    info "UDP/QUIC BBR 操作已完成。成套备份：$backup（可从主菜单 13 恢复）。"
 )
+
+configure_quic_bbr_locked() { configure_quic_bbr_change enable "$@"; }
+disable_quic_bbr_locked() { configure_quic_bbr_change disable "$@"; }
+record_quic_bbr_locked() { configure_quic_bbr_change record "$@"; }
 
 enable_quic_bbr() {
     [[ $# -le 1 ]] || { fail "用法：sing-box quic-bbr [配置名称]"; return 1; }
     with_lock configure_quic_bbr_locked "$@"
 }
 
+disable_quic_bbr() {
+    [[ $# -le 1 ]] || { fail "用法：sing-box quic-bbr-disable [配置名称]"; return 1; }
+    with_lock disable_quic_bbr_locked "$@"
+}
+
+record_quic_bbr() {
+    [[ $# -eq 2 ]] || { fail "用法：sing-box quic-bbr-record 配置名称 开启前成套备份"; return 1; }
+    with_lock record_quic_bbr_locked "$@"
+}
+
 bbr_menu() {
     local choice
     while true; do
-        printf '\nBBR 设置\n  1. 开启系统 TCP BBR\n  2. 开启 UDP/QUIC BBR（选择 Hy2/TUIC 节点）\n  3. 查看 UDP/QUIC 拥塞控制状态\n  0. 返回\n'
+        printf '\nBBR 设置\n  1. 开启系统 TCP BBR\n  2. 开启 UDP/QUIC BBR（选择 Hy2/TUIC 节点）\n  3. 查看 UDP/QUIC 拥塞控制状态\n  4. 关闭 UDP/QUIC BBR（恢复开启前设置）\n  0. 返回\n'
         prompt choice "请选择 BBR 操作" 0 || return 0
         case "$choice" in
             1) enable_bbr ;;
             2) enable_quic_bbr ;;
             3) show_quic_bbr_status ;;
+            4) disable_quic_bbr ;;
             0) return 0 ;;
-            *) fail "请输入 0–3。" ;;
+            *) fail "请输入 0–4。" ;;
         esac || true
         read -r -p "按回车键返回 BBR 菜单..." choice || return 0
     done
@@ -2858,6 +2978,8 @@ sing-box 中文终端管理面板
   sing-box bbr-status             只读查看 TCP 拥塞控制及默认队列规则
   sing-box quic-bbr [TAG]         为 Hy2/TUIC 节点启用 QUIC BBR，先备份再按需重启
   sing-box quic-bbr-status        只读查看 Hy2/TUIC 的 QUIC 拥塞控制状态
+  sing-box quic-bbr-disable [TAG] 恢复节点开启 QUIC BBR 前的设置
+  sing-box quic-bbr-record TAG FILE 核对指定旧成套备份并登记节点恢复记录
   sing-box acme                   安装/打开 acme-script 证书管理菜单
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
@@ -2907,7 +3029,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|format-config|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -2931,6 +3053,8 @@ main() {
         bbr-status) show_bbr_status "$@" ;;
         quic-bbr) enable_quic_bbr "$@" ;;
         quic-bbr-status) show_quic_bbr_status "$@" ;;
+        quic-bbr-disable) disable_quic_bbr "$@" ;;
+        quic-bbr-record) record_quic_bbr "$@" ;;
         acme) open_acme_menu "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;

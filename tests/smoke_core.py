@@ -463,6 +463,17 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
                 "type": "salamander", "password": "salamander-obfs-password",
             }:
                 raise RuntimeError("hysteria2-salamander: generated server obfs did not match")
+            restore_record = None
+            if template == "hysteria2-bbr":
+                restore_record = {
+                    "format": "sing-box-manager-quic-bbr-v1", "type": "hysteria2",
+                    "settings": {},
+                }
+            elif template == "tuic-bbr":
+                restore_record = {
+                    "format": "sing-box-manager-quic-bbr-v1", "type": "tuic",
+                    "settings": {"congestion_control": "cubic"},
+                }
             inbound["listen"] = LOOPBACK
             inbound_file = work / (template + "-extended-inbound.json")
             write_json(inbound_file, inbound)
@@ -508,6 +519,40 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
                         raise RuntimeError(f"{template}: forwarded HTTP response did not match")
                     if quic:
                         run_udp_smoke(proxy_port, protocol)
+            if restore_record is not None:
+                record_file = work / (template + "-restore-record.json")
+                write_json(record_file, restore_record)
+                restored = bash_json(
+                    manager, environment, "generate_quic_bbr_restore", str(inbound_file), str(record_file),
+                )
+                restored["listen"] = LOOPBACK
+                restored_file = work / (template + "-restored-inbound.json")
+                write_json(restored_file, restored)
+                restored_server = work / (template + "-restored-server.json")
+                restored_outbound = bash_json(manager, environment, "generate_client", str(restored_file), LOOPBACK)
+                if restored.get("tls", {}).get("enabled"):
+                    if restored_outbound.get("tls", {}).get("insecure", False):
+                        raise RuntimeError(f"{template}: restored client export must not use insecure TLS")
+                    restored_outbound.setdefault("tls", {})["certificate"] = certificate.read_text(encoding="utf-8")
+                restored_client = work / (template + "-restored-client.json")
+                restored_server_port, restored_proxy_port = free_port(), free_port()
+                while restored_proxy_port == restored_server_port:
+                    restored_proxy_port = free_port()
+                # Rebuild files with the selected free ports before the second live roundtrip.
+                restored["listen_port"] = restored_server_port
+                restored_outbound["server_port"] = restored_server_port
+                write_json(restored_file, restored)
+                write_json(restored_server, server_config(restored))
+                write_json(restored_client, client_config(restored_outbound, restored_proxy_port))
+                check(core, restored_server, work)
+                check(core, restored_client, work)
+                with running_core(core, restored_server, restored_server_port, work, tcp_probe=not quic):
+                    with running_core(core, restored_client, restored_proxy_port, work):
+                        received = fetch_through_socks_retry(restored_proxy_port, target_port, "/probe/" + template + "-restored")
+                        if received != payload:
+                            raise RuntimeError(f"{template}: restored forwarding did not match")
+                        if quic:
+                            run_udp_smoke(restored_proxy_port, protocol)
             print(f"PASS {template}: real server + client forwarded exact HTTP payload over loopback", flush=True)
 
 
