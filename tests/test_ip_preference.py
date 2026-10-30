@@ -18,6 +18,24 @@ class IpPreferenceTest(unittest.TestCase):
         self.marker = self.core.parent / ".managed"
         self.marker.write_text("sing-box-manager-v1\n", encoding="utf-8")
         self.marker.chmod(0o600)
+        self.curl_log = self.root / "curl.jsonl"
+        curl = self.bin / "curl"
+        curl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "args=sys.argv[1:]\n"
+            "log=pathlib.Path(os.environ['MOCK_CURL_LOG'])\n"
+            "with log.open('a', encoding='utf-8') as stream: stream.write(json.dumps(args) + '\\n')\n"
+            "count=len(log.read_text(encoding='utf-8').splitlines())\n"
+            "mode=os.environ.get('MOCK_CURL_MODE','success')\n"
+            "if mode=='first-fail-then-success' and count==1: raise SystemExit(22)\n"
+            "if mode=='all-fail': raise SystemExit(28)\n"
+            "if mode=='first-only' and count>1: raise SystemExit(28)\n"
+            "print(os.environ.get('MOCK_CURL_BODY','2606:4700:4700::1111'), end='')\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        self.env.update({"MOCK_CURL_LOG": str(self.curl_log), "MOCK_CURL_MODE": "success", "MOCK_CURL_BODY": "2606:4700:4700::1111"})
 
     def shell(self, body: str, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         return fixture.ManagerTest.shell(self, body, *args, check=check)
@@ -112,6 +130,51 @@ class IpPreferenceTest(unittest.TestCase):
         result = self.shell('generate_outbound_preference "$1" "$2"', str(bad), "prefer_ipv6")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_ipv6_egress_probe_contract_and_first_success_fallback(self) -> None:
+        result = self.shell("check_ipv6_egress", check=True)
+        self.assertIn("IPv6", result.stdout + result.stderr)
+        calls = [json.loads(line) for line in self.curl_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "-q")
+        self.assertIn("--noproxy", calls[0])
+        self.assertIn("*", calls[0])
+        self.assertIn("-6", calls[0])
+        self.assertIn("--proto", calls[0])
+        self.assertIn("=https", calls[0])
+        self.assertIn("--connect-timeout", calls[0])
+        self.assertIn("4", calls[0])
+        self.assertIn("--max-time", calls[0])
+        self.assertIn("8", calls[0])
+        self.assertIn("--max-filesize", calls[0])
+        self.assertIn("128", calls[0])
+        self.assertTrue(calls[0][-1].endswith("api64.ipify.org") or calls[0][-1].endswith("icanhazip.com"))
+
+        self.curl_log.unlink()
+        self.env["MOCK_CURL_MODE"] = "first-fail-then-success"
+        result = self.shell("check_ipv6_egress", check=True)
+        self.assertEqual(len(self.curl_log.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_ipv6_egress_probe_rejects_invalid_addresses_without_echoing_body(self) -> None:
+        for body in ("192.0.2.1", "fc00::1", "fe80::1", "<html>bad</html>", "ff02::1", "2001:db8::1", "::1", "::", "::ffff:8.8.8.8", "2606:4700::1%eth0"):
+            with self.subTest(body=body):
+                self.curl_log.unlink(missing_ok=True)
+                self.env["MOCK_CURL_MODE"] = "success"
+                self.env["MOCK_CURL_BODY"] = body
+                result = self.shell("check_ipv6_egress")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(body, result.stdout + result.stderr)
+        self.env["MOCK_CURL_MODE"] = "success"
+        self.env["MOCK_CURL_BODY"] = "2606:4700:4700::1111"
+
+    def test_ipv6_egress_missing_curl_is_a_safe_failure(self) -> None:
+        result = self.shell("have(){ [[ $1 != curl ]] && command -v \"$1\" >/dev/null; }; check_ipv6_egress")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("保留原设置", result.stdout + result.stderr)
+        self.assertFalse(self.curl_log.exists())
+        result = self.shell('have(){ [[ $1 != python3 ]] && command -v "$1" >/dev/null; }; check_ipv6_egress')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("保留原设置", result.stdout + result.stderr)
+
     def test_configure_preserves_jsonc_stopped_state_and_creates_backup(self) -> None:
         self.config.write_text(
             '{\n  // keep IP preference comment\n  "dns": {"servers":[{"tag":"local","type":"local"}]},\n'
@@ -157,6 +220,60 @@ class IpPreferenceTest(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), before)
         self.assertEqual(list((self.state_dir / "backups").glob("bundle-*.json")), [])
         self.assertFalse(any("restart" in call for call in self.calls()))
+        self.assertFalse(self.curl_log.exists())
+
+    def test_ipv6_enable_probe_failure_keeps_config_metadata_backups_and_service(self) -> None:
+        self.config.write_text(json.dumps(self._base()) + "\n", encoding="utf-8")
+        metadata = self.state_dir / "clients/sample.json"
+        metadata.parent.mkdir(parents=True, exist_ok=True)
+        metadata.write_text('{"server":"example.com","inbound":{"tag":"sample"}}\n', encoding="utf-8")
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        old_backup = self.state_dir / "backups/bundle-existing.json"
+        old_backup.write_text("preserve existing backup\n", encoding="utf-8")
+        backups_before = {p.name:p.read_bytes() for p in (self.state_dir / "backups").iterdir()}
+        state_before = self.state(active=True, enabled=True)
+        self.env["MOCK_CURL_MODE"] = "all-fail"
+        result = self.shell('confirm() { return 0; }; configure_outbound_preference_locked prefer_ipv6')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+        self.assertEqual({p.name:p.read_bytes() for p in (self.state_dir / "backups").iterdir()}, backups_before)
+        self.assertEqual(self.state(), state_before)
+        self.assertEqual(len(self.curl_log.read_text(encoding="utf-8").splitlines()), 2)
+        self.assertIn("保留原设置", result.stdout + result.stderr)
+        self.assertFalse(any(any(action in call for action in ("start", "stop", "restart")) for call in self.calls()))
+
+    def test_ipv6_success_restarts_active_service_and_preserves_metadata_and_boot(self) -> None:
+        metadata = self.state_dir / "clients/sample.json"
+        metadata.parent.mkdir(parents=True, exist_ok=True)
+        metadata.write_text('{"server":"example.com"}\n', encoding="utf-8")
+        before_metadata = metadata.read_bytes()
+        self.state(active=True, enabled=True)
+        self.shell('confirm() { return 0; }; configure_outbound_preference_locked prefer_ipv6', check=True)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(saved["dns"]["strategy"], "prefer_ipv6")
+        self.assertEqual(saved["route"]["default_domain_resolver"]["strategy"], "prefer_ipv6")
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+        self.assertTrue(self.state()["active"])
+        self.assertTrue(self.state()["enabled"])
+        self.assertEqual(sum("restart" in call for call in self.calls()), 1)
+        self.assertFalse(any("enable" in call or "start" in call for call in self.calls()))
+        self.assertEqual(len(list((self.state_dir / "backups").glob("bundle-*.json"))), 1)
+        self.assertEqual(len(self.curl_log.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_ipv4_save_does_not_probe_ipv6_and_cancel_or_status_do_not_probe(self) -> None:
+        self.env["MOCK_CURL_MODE"] = "all-fail"
+        self.config.write_text(json.dumps(self._base()) + "\n", encoding="utf-8")
+        self.shell('confirm() { return 0; }; configure_outbound_preference_locked prefer_ipv4', check=True)
+        self.assertFalse(self.curl_log.exists() and self.curl_log.read_text(encoding="utf-8").strip())
+        before = self.config.read_bytes()
+        cancelled = self.shell('confirm() { return 1; }; configure_outbound_preference_locked prefer_ipv6')
+        self.assertNotEqual(cancelled.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(self.curl_log.exists() and self.curl_log.read_text(encoding="utf-8").strip())
+        self.shell("show_outbound_preference", check=True)
+        self.assertFalse(self.curl_log.exists() and self.curl_log.read_text(encoding="utf-8").strip())
 
     def test_main_menu_cancel_and_status_stay_in_submenu(self) -> None:
         from test_menu_navigation import MenuNavigationTest

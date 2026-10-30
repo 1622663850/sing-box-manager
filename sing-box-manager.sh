@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.21.0"
+SB_MANAGER_VERSION="1.21.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -3254,6 +3254,37 @@ show_outbound_preference() {
     info "这是域名解析的默认优先级；独立规则、出站解析器及固定 IP 连接保持各自设置。"
 }
 
+check_ipv6_egress() {
+    local url response address
+    if ! have curl || ! have python3; then
+        fail "检测 IPv6 公网出站需要 curl 和 python3，已保留原设置。"; return 1
+    fi
+    info "正在检测 IPv6 公网出站（HTTPS 直连，最多约 16 秒）..."
+    for url in https://api64.ipify.org https://icanhazip.com; do
+        if ! response=$(curl -q --noproxy '*' -6 --proto '=https' --fail --silent --show-error \
+            --connect-timeout 4 --max-time 8 --max-filesize 128 "$url" 2>/dev/null); then
+            continue
+        fi
+        if address=$(python3 - "$response" 2>/dev/null <<'PY_IPV6_EGRESS'
+import ipaddress
+import sys
+try:
+    source = sys.argv[1].strip()
+    address = ipaddress.ip_address(source)
+    if (address.version != 6 or not address.is_global or address.is_multicast or
+            address.ipv4_mapped is not None or "%" in source):
+        sys.exit(1)
+    print(str(address))
+except ValueError:
+    sys.exit(1)
+PY_IPV6_EGRESS
+        ); then
+            info "IPv6 公网出站检测通过：$address"; return 0
+        fi
+    done
+    fail "未能确认 IPv6 公网出站可用（可能是网络、DNS 或检测站点不可达），已保留原设置。"
+}
+
 configure_outbound_preference_locked() (
     umask 077
     local strategy=${1:-} work backup
@@ -3271,6 +3302,7 @@ configure_outbound_preference_locked() (
     info "运行中的服务将短暂重启；停止状态和开机自启设置保留。IPv6 需要服务器具备可用的 IPv6 网络。"
     info "独立 DNS/路由规则、outbound.domain_resolver 等显式设置可能覆盖默认策略。"
     confirm "保存出站 IP 优先级？（自动备份）" || exit 1
+    if [[ $strategy == prefer_ipv6 ]]; then check_ipv6_egress || exit 1; fi
     cmp -s "$work/original.json" "$CONFIG_FILE" || { fail "配置已被其他操作修改，请重新设置。"; exit 1; }
     backup=$(create_backup) || exit 1
     commit_config "$work/candidate.json" || exit 1
