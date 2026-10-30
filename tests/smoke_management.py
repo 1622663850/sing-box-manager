@@ -46,6 +46,15 @@ def read_json(path: Path) -> dict:
 
 def run(core: Path, manager: Path) -> None:
     unit = "sing-box-manager-smoke-" + uuid.uuid4().hex + ".service"
+    require(unit != "sing-box.service", "refusing the production service name")
+    runtime_dir = Path("/run/systemd/system")
+    runtime_unit = runtime_dir / unit
+
+    def systemd_quote(value: Path) -> str:
+        text = str(value)
+        require("\n" not in text and "\r" not in text, "runtime path contains a newline")
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     with tempfile.TemporaryDirectory(prefix="sing-box-management-") as temporary:
         work = Path(temporary)
         root = work / "fixture"
@@ -118,17 +127,31 @@ def run(core: Path, manager: Path) -> None:
         default_file.write_text(smoke.LOOPBACK + "\n", encoding="utf-8")
         default_file.chmod(0o600)
         unit_started = False
+        unit_created = False
+        runtime_unit_source = b""
         try:
             execute([str(core), "check", "-D", str(state), "-c", str(config)], "fixture validation")
-            # Set before invoking systemd-run so a failed invocation also cleans
-            # up a unit which may already have been registered with systemd.
+            require(not runtime_unit.exists() and not runtime_unit.is_symlink(), "runtime unit already exists")
+            runtime_unit_source = (
+                "[Unit]\n"
+                f"Description=sing-box-manager isolated smoke {unit}\n"
+                "[Service]\n"
+                "Type=simple\n"
+                "UMask=0077\n"
+                f"WorkingDirectory={state}\n"
+                f"ExecStart={systemd_quote(core)} run -D {systemd_quote(state)} -c {systemd_quote(config)}\n"
+                "StandardOutput=null\n"
+                "StandardError=null\n"
+            ).encode("utf-8")
+            with runtime_unit.open("xb") as stream:
+                unit_created = True
+                stream.write(runtime_unit_source)
+            os.chmod(runtime_unit, 0o644)
+            execute(["systemctl", "daemon-reload"], "isolated unit daemon-reload")
+            # Mark before start so a partially registered unit is always stopped.
             unit_started = True
             execute([
-                "systemd-run", "--quiet", "--unit=" + unit,
-                "--property=Type=exec", "--property=UMask=0077",
-                "--property=StandardOutput=null", "--property=StandardError=null",
-                "--property=WorkingDirectory=" + str(state), "--",
-                str(core), "run", "-D", str(state), "-c", str(config),
+                "systemctl", "start", unit,
             ], "isolated unit start")
             time.sleep(0.3)
             pid()
@@ -152,6 +175,20 @@ def run(core: Path, manager: Path) -> None:
             require(bundle["default_server"] == smoke.LOOPBACK, "backup default address mismatch")
             require(backup.stat().st_mode & 0o777 == 0o600, "backup permissions mismatch")
             print("PASS backup: configuration, metadata, default address and private permissions", flush=True)
+
+            # Verify the new activation path while the isolated service is stopped.
+            execute(["systemctl", "stop", unit], "isolated service stop before add")
+            stopped_added = node("stopped-added", smoke.free_port())
+            stopped_added_file = work / "stopped-added.json"
+            smoke.write_json(stopped_added_file, stopped_added)
+            call("add_managed_inbound", str(stopped_added_file), smoke.LOOPBACK)
+            pid()
+            verify_forwarding("stopped-added")
+            print("PASS stopped add: add_managed_inbound started the isolated service and forwarded HTTP", flush=True)
+            # Return to the baseline bundle before the active-service transaction checks below.
+            call("restore_backup", str(backup))
+            pid()
+            require(fixture_config() == baseline_config, "stopped-add cleanup did not restore baseline")
 
             added = node("added", smoke.free_port())
             added_file = work / "added.json"
@@ -233,10 +270,15 @@ def run(core: Path, manager: Path) -> None:
             print("PASS diagnose: healthy isolated service and no configuration/process changes", flush=True)
         finally:
             if unit_started:
-                execute(["systemctl", "stop", unit], "isolated unit cleanup")
+                subprocess.run(["systemctl", "stop", unit], capture_output=True, timeout=30)
                 status = subprocess.run(["systemctl", "is-active", "--quiet", unit], capture_output=True, timeout=15)
                 require(status.returncode != 0, "isolated unit is still active after cleanup")
                 subprocess.run(["systemctl", "reset-failed", unit], capture_output=True, timeout=15)
+            if unit_created:
+                require(runtime_unit.is_file() and not runtime_unit.is_symlink(), "runtime unit was replaced or removed")
+                require(runtime_unit.read_bytes() == runtime_unit_source, "runtime unit changed during smoke")
+                runtime_unit.unlink()
+                execute(["systemctl", "daemon-reload"], "isolated unit daemon-reload after cleanup")
     print("PASS cleanup: isolated unit stopped; all temporary credentials and files removed", flush=True)
 
 
@@ -247,7 +289,7 @@ def main() -> int:
     args = parser.parse_args()
     if sys.platform != "linux" or os.geteuid() != 0:
         parser.error("requires root on Linux with running systemd")
-    if not Path("/run/systemd/system").is_dir() or not all(shutil.which(name) for name in ("bash", "jq", "ss", "systemctl", "systemd-run")):
+    if not Path("/run/systemd/system").is_dir() or not all(shutil.which(name) for name in ("bash", "jq", "ss", "systemctl")):
         parser.error("requires systemd, bash, jq and ss")
     core, manager = args.core.resolve(), args.manager.resolve()
     if not core.is_file() or not os.access(core, os.X_OK) or not manager.is_file():

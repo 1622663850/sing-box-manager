@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.18.0"
+SB_MANAGER_VERSION="1.19.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -586,8 +586,9 @@ atomic_copy() {
 
 commit_config() (
     umask 077
-    local candidate=$1 policy=${2:-preserve} active=0 old_exists=0 snapshot backup="" transaction=0
+    local candidate=$1 policy=${2:-preserve} activation=${3:-preserve} active=0 old_exists=0 snapshot backup="" transaction=0 start_attempted=0
     case "$policy" in preserve|replace) ;; *) fail "未知的配置保存方式。"; exit 1;; esac
+    case "$activation" in preserve|start) ;; *) fail "未知的服务启动策略。"; exit 1;; esac
     safe_paths || exit 1
     install -d -m 700 "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR" || exit 1
     snapshot=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX") || exit 1
@@ -600,6 +601,7 @@ commit_config() (
             if [[ $old_exists -eq 1 ]]; then
                 atomic_copy "$backup" "$CONFIG_FILE" || restored=0
                 if [[ $active -eq 1 && $restored -eq 1 ]]; then restart_checked || restored=0; fi
+                if [[ $active -eq 0 && $start_attempted -eq 1 ]]; then systemctl stop "$SERVICE" || restored=0; fi
             else
                 rm -f -- "$CONFIG_FILE" || restored=0
                 systemctl stop "$SERVICE" || restored=0
@@ -631,11 +633,19 @@ commit_config() (
     fi
     transaction=1
     chmod 600 "$snapshot" && mv -f -- "$snapshot" "$CONFIG_FILE" || exit 1
-    if [[ $active -eq 1 ]]; then restart_checked || exit 1; fi
+    if [[ $active -eq 1 ]]; then restart_checked || exit 1
+    elif [[ $activation == start ]]; then
+        start_attempted=1
+        if ! systemctl start "$SERVICE" || ! wait_healthy; then
+            fail "新增配置后服务未正常启动，正在恢复原配置和停止状态。"; exit 1
+        fi
+    fi
     transaction=0
     [[ $old_exists -eq 0 ]] || info "旧配置已备份：$backup"
     if [[ $active -eq 1 ]]; then
         info "配置已保存，服务已重新启动。"
+    elif [[ $activation == start ]]; then
+        info "配置已保存，原先未运行的服务已自动启动。"
     else
         info "配置已保存；服务仍处于停止状态，可选择 3.启动。"
     fi
@@ -667,7 +677,7 @@ add_inbound_file() (
     candidate="$work/candidate.json"
     config_jq --slurpfile node "$file" '.inbounds = ((.inbounds // []) + [$node[0]])' \
         >"$candidate" || exit 1
-    commit_config "$candidate"
+    commit_config "$candidate" preserve start
 )
 
 import_config() {
@@ -2137,8 +2147,9 @@ validate_bundle() {
 
 apply_bundle() (
     umask 077
-    local file=$1 policy=${2:-preserve} work backup="" tag server active=0 transaction=0 had_clients=0
+    local file=$1 policy=${2:-preserve} activation=${3:-preserve} work backup="" tag server active=0 transaction=0 had_clients=0 start_requested=0
     case "$policy" in preserve|replace) ;; *) fail "未知的配置恢复方式。"; exit 1;; esac
+    case "$activation" in preserve|start) ;; *) fail "未知的服务启动策略。"; exit 1;; esac
     require_core && safe_paths && validate_bundle "$file" || exit 1
     work=$(mktemp -d "$STATE_DIR/restore.XXXXXX") || exit 1
     # shellcheck disable=SC2317,SC2329 # Called by the EXIT trap.
@@ -2150,6 +2161,7 @@ apply_bundle() (
                 atomic_copy "$work/config-before.json" "$CONFIG_FILE" || restored=0
                 if [[ $active -eq 1 && $restored -eq 1 ]]; then restart_checked || restored=0; fi
             elif [[ $active -eq 1 ]] && ! service_is_active; then restart_checked || restored=0; fi
+            if [[ $active -eq 0 && $start_requested -eq 1 ]]; then systemctl stop "$SERVICE" || restored=0; fi
             # Inspect the actual rename result: a signal may arrive before a flag assignment.
             if [[ -d $work/clients-before ]]; then
                 rm -rf -- "$CLIENT_DIR" && mv -- "$work/clients-before" "$CLIENT_DIR" || restored=0
@@ -2197,7 +2209,8 @@ apply_bundle() (
     else rm -f -- "$DEFAULT_SERVER_FILE" || exit 1; fi
     if { [[ $policy == replace ]] && ! cmp -s "$CONFIG_FILE" "$work/config.json"; } ||
        [[ $(config_jq -Sc .) != "$(json_query "$work/config.json" -Sc .)" ]]; then
-        commit_config "$work/config.json" "$policy" || exit 1
+        [[ $activation != start || $active -ne 0 ]] || start_requested=1
+        commit_config "$work/config.json" "$policy" "$activation" || exit 1
     fi
     transaction=0
     info "配置及连接信息已保存。操作前备份：$backup"
@@ -2260,7 +2273,7 @@ add_managed_inbound() (
         '.config.inbounds += [$node[0]] | .clients[$tag]={server:$server,public_key:$key,inbound:$node[0]}
          | if $record!="" then .clients[$tag].quic_bbr_restore=($record|fromjson) else . end' \
         "$work/before.json" >"$work/after.json" || exit 1
-    apply_bundle "$work/after.json"
+    apply_bundle "$work/after.json" preserve start
 )
 
 list_backups() {

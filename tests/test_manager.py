@@ -39,6 +39,11 @@ actions = {"is-active", "is-enabled", "start", "stop", "restart", "enable",
 action = next((arg for arg in args if arg in actions), "")
 quiet = "--quiet" in args or "-q" in args
 if action == "is-active":
+    if state.get("health_failures", 0):
+        state["health_failures"] -= 1
+        state_path.write_text(json.dumps(state))
+        if not quiet: print("inactive")
+        sys.exit(3)
     if not quiet: print("active" if state["active"] else "inactive")
     sys.exit(0 if state["active"] else 3)
 if action == "is-enabled":
@@ -50,11 +55,19 @@ if action == "restart" and state.get("restart_failures", 0):
     state_path.write_text(json.dumps(state))
     print("simulated service restart failure", file=sys.stderr)
     sys.exit(1)
+if action == "start" and state.get("start_failures", 0):
+    state["start_failures"] -= 1
+    state_path.write_text(json.dumps(state))
+    print("simulated service start failure", file=sys.stderr)
+    sys.exit(1)
 if action == "daemon-reload" and state.get("reload_failures", 0):
     state["reload_failures"] -= 1
     state_path.write_text(json.dumps(state))
     print("simulated systemd reload failure", file=sys.stderr)
     sys.exit(1)
+if action == "start" and state.get("start_unhealthy_once"):
+    state["start_unhealthy_once"] = False
+    state["health_failures"] = 3
 if action in {"start", "restart"}: state["active"] = True
 if action == "stop": state["active"] = False
 if action == "enable":
@@ -135,7 +148,10 @@ class ManagerTest(unittest.TestCase):
         self.mock_state = self.root / "service-state.json"
         self.system_log = self.root / "systemctl.jsonl"
         self.core_log = self.root / "core.jsonl"
-        dump(self.mock_state, {"active": False, "enabled": False, "restart_failures": 0})
+        dump(self.mock_state, {
+            "active": False, "enabled": False, "restart_failures": 0,
+            "start_failures": 0, "start_unhealthy_once": False, "health_failures": 0,
+        })
         self.original = {
             "log": {"level": "info", "timestamp": True},
             "inbounds": [],
