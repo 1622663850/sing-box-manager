@@ -184,7 +184,17 @@ class MultiUserTest(unittest.TestCase):
         json_target = self.root / "multi-outbounds.json"
         self.shell('export_clients json "$1"', str(json_target), check=True)
         outbounds = json.loads(json_target.read_text(encoding="utf-8"))["outbounds"]
-        self.assertEqual([item["tag"] for item in outbounds], ["export-multi-user1-alice", "export-multi-user2-bob"])
+        self.assertEqual([item["tag"] for item in outbounds], ["export-multi:user1:alice", "export-multi:user2:bob"])
+        # Node names cannot contain ':', so user labels cannot collide with a single-user node name.
+        single = self.vless("export-multi-user1-alice", 25412)
+        single["users"] = single["users"][:1]
+        self._write_config([node, single])
+        self._metadata(single)
+        unique_target = self.root / "multi-unique-outbounds.json"
+        self.shell('export_clients json "$1"', str(unique_target), check=True)
+        combined = json.loads(unique_target.read_text(encoding="utf-8"))["outbounds"]
+        self.assertEqual(len(combined), 3)
+        self.assertEqual(len({item["tag"] for item in combined}), 3)
 
     def test_edit_selected_user_preserves_other_users_jsonc_metadata_and_public_key(self) -> None:
         node = self.vless("edit-multi", 25421)

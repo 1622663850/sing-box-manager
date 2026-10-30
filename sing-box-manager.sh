@@ -2287,7 +2287,7 @@ show_client() (
         label=$tag
         if [[ $count -gt 1 ]]; then
             name=$(jq -r --argjson i "$((index - 1))" '.users[$i].name // ""' "$inbound") || exit 1
-            label="$tag-user$index${name:+-$name}"
+            label="$tag:user$index${name:+:$name}"
         fi
         if [[ $mode == json-only ]]; then
             jq --arg tag "$label" '.tag=$tag' "$work/outbound.json" || exit 1
