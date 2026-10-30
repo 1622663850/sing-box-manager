@@ -1600,7 +1600,7 @@ replace_inbound_file() (
     local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
     local quic_record=${6:-} expected_metadata=${7:-}
     local activation=${8:-preserve} start_requested=0
-    local tag port work snapshot old_metadata new_metadata effective backup=""
+    local tag port old_port work snapshot old_metadata new_metadata effective backup=""
     local transaction=0 old_metadata_exists=0 active=0 changed=0
     require_core && safe_paths || exit 1
     case "$activation" in preserve|start) ;; *) fail "未知的服务启动策略。"; exit 1;; esac
@@ -1653,6 +1653,7 @@ replace_inbound_file() (
         fail "修改配置不切换协议类型，请分别添加所需协议。"; exit 1;
     }
     detect_inbound_template "$file" >/dev/null || exit 1
+    old_port=$(jq -r .listen_port "$work/old-inbound.json") || exit 1
     check_inbound_conflicts "$file" "$old_tag" "$snapshot" || exit 1
     if [[ $tag != "$old_tag" ]] && json_query "$snapshot" -e --arg old "$old_tag" \
         'del(.inbounds[] | select(.tag==$old)) | any(.. | strings; .==$old)' >/dev/null; then
