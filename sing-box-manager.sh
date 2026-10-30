@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.19.0"
+SB_MANAGER_VERSION="1.20.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1485,11 +1485,58 @@ prepare_quic_bbr_wizard() {
     esac
 }
 
+validate_inbound_users() {
+    jq -e '
+      def uuid_ok: type=="string" and test("^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$");
+      if .type=="shadowsocks" then .users==null else . as $node |
+        (["vless","vmess","hysteria2","tuic","anytls"]|index($node.type))!=null and
+        (.users|type=="array" and length>0) and
+        all(.users[];
+          type=="object" and (.name==null or (.name|type=="string" and (test("[[:cntrl:]]")|not))) and
+          if $node.type=="vless" or $node.type=="vmess" then
+            (keys-["name","uuid","flow","alterId"]|length==0) and (.uuid|uuid_ok) and
+            (if $node.type=="vmess" then (.alterId // 0)==0 and .flow==null
+             else (.flow // "")==($node.users[0].flow // "") end)
+          else (keys-["name","uuid","password"]|length==0) and
+            (.password|type=="string" and length>0 and (contains("\u0000")|not)) and
+            (if $node.type=="tuic" then (.uuid|uuid_ok) else .uuid==null end) end) and
+        ([.users[] | .name // "" | select(.!="")] | length as $n | (unique|length)==$n) and
+        ([.users[] | if $node.type=="vless" or $node.type=="vmess" or $node.type=="tuic"
+                    then .uuid|ascii_downcase else .password end] | length as $n | (unique|length)==$n)
+      end' "$1" >/dev/null 2>&1 || {
+        fail "用户列表无效：不支持的字段、认证或名称重复、空认证或不一致的 VLESS flow；现有用户不会被忽略。"; return 1;
+    }
+}
+
+inbound_user_count() {
+    jq -er 'if .type=="shadowsocks" and .users==null then 1
+      elif (.users|type)=="array" and (.users|length)>0 then .users|length
+      else error("invalid users") end' "$1"
+}
+
+select_inbound_user() {
+    local destination=$1 file=$2 count inbound_user_selection
+    printf -v "$destination" '%s' ""
+    validate_inbound_users "$file" || return 1
+    count=$(inbound_user_count "$file") || return 1
+    [[ $(jq -r .type "$file") != shadowsocks ]] || { fail "此 Shadowsocks 模板仅支持单密码。"; return 1; }
+    jq -r '["用户序号","用户名"], (.users|to_entries[]|[.key+1,(.value.name // "未命名")]) | @tsv' "$file" || return 1
+    while true; do
+        prompt inbound_user_selection "选择用户序号（0 返回）" 0 || return 1
+        [[ $inbound_user_selection != 0 ]] || return 0
+        if [[ $inbound_user_selection =~ ^[1-9][0-9]{0,5}$ ]] && (( inbound_user_selection <= count )); then
+            printf -v "$destination" '%s' "$inbound_user_selection"; return 0
+        fi
+        warn "用户序号无效，请选择 1–$count。"
+    done
+}
+
 detect_inbound_template() {
     validate_obfs_template "$1" || return
+    validate_inbound_users "$1" || return
     jq -er '
       if .type == "shadowsocks" and .method == "2022-blake3-aes-128-gcm" and .users == null then "shadowsocks"
-      elif (.users | length) != 1 then error("single-user templates only")
+      elif (.users | length) < 1 then error("empty user list")
       elif .type == "hysteria2" or .type == "tuic" or .type == "anytls" then
         if .tls.enabled == true then .type else error("TLS required") end
       elif .type == "vless" then
@@ -1511,7 +1558,7 @@ detect_inbound_template() {
          else error("unsupported VMess transport") end)
         + (if .tls.enabled == true then "-tls" else "" end)
       else error("unsupported template") end' "$1" 2>/dev/null || {
-        fail "该配置不属于当前支持的单用户向导模板，请通过完整 JSON 导入修改。"; return 1;
+        fail "该配置不属于当前支持的向导模板，请通过完整 JSON 导入修改。"; return 1;
     }
 }
 
@@ -1520,9 +1567,11 @@ replace_inbound_file() (
     umask 077
     local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
     local quic_record=${6:-} expected_metadata=${7:-}
+    local activation=${8:-preserve} start_requested=0
     local tag port old_port work snapshot old_metadata new_metadata effective backup=""
     local transaction=0 old_metadata_exists=0 active=0 changed=0
     require_core && safe_paths || exit 1
+    case "$activation" in preserve|start) ;; *) fail "未知的服务启动策略。"; exit 1;; esac
     valid_tag "$old_tag" || { fail "原配置名称无效。"; exit 1; }
     jq -e 'type == "object" and (.tag|type == "string") and (.listen_port|type == "number")' "$file" >/dev/null || exit 1
     tag=$(jq -r .tag "$file") && port=$(jq -r .listen_port "$file") || exit 1
@@ -1542,6 +1591,7 @@ replace_inbound_file() (
             elif [[ $active -eq 1 ]] && ! service_is_active; then
                 restart_checked || rollback_ok=0
             fi
+            if [[ $active -eq 0 && $start_requested -eq 1 ]]; then systemctl stop "$SERVICE" || rollback_ok=0; fi
             if [[ $old_metadata_exists -eq 1 ]]; then
                 if ! cmp -s "$backup/metadata.json" "$old_metadata"; then
                     atomic_copy "$backup/metadata.json" "$old_metadata" 600 || rollback_ok=0
@@ -1603,7 +1653,7 @@ replace_inbound_file() (
     effective=$server
     [[ -n $effective ]] || effective=$(read_default_server) || exit 1
     if [[ -z $effective && $(jq -r .type "$file") == hysteria2 ]]; then effective=$(jq -r '.tls.server_name // ""' "$file"); fi
-    generate_client "$file" "${effective:-example.invalid}" "$public_key" >"$work/client-check.json" || exit 1
+    generate_client "$file" "${effective:-example.invalid}" "$public_key" 1 >"$work/client-check.json" || exit 1
     json_query "$snapshot" --arg old "$old_tag" --slurpfile node "$file" \
         '.inbounds |= map(if .tag==$old then $node[0] else . end)' >"$work/candidate.json" || exit 1
     validate_config "$work/candidate.json" || exit 1
@@ -1632,7 +1682,10 @@ replace_inbound_file() (
     install -d -m 700 "$CLIENT_DIR" || exit 1
     transaction=1
     atomic_copy "$work/metadata.json" "$new_metadata" 600 || exit 1
-    [[ $changed -eq 0 ]] || commit_config "$work/candidate.json" || exit 1
+    if [[ $changed -ne 0 ]]; then
+        [[ $activation != start || $active -ne 0 ]] || start_requested=1
+        commit_config "$work/candidate.json" preserve "$activation" || exit 1
+    fi
     [[ $tag == "$old_tag" ]] || rm -f -- "$old_metadata" || exit 1
     transaction=0
     info "已修改 $tag；连接信息已同步。备份：$backup"
@@ -1647,6 +1700,7 @@ edit_wizard_locked() (
     local old_tag=${1:-} tag port protocol work metadata server="" public_key="" credential extra=""
     local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" obfs_password="" rotation pair
     local quic_bbr_choice="" quic_record="" record_source=- expected_metadata=""
+    local selected_user_index=1 user_count
     [[ $# -le 1 ]] || { fail "用法：sing-box edit [配置名称]"; exit 1; }
     if [[ -z $old_tag ]]; then
         select_inbound old_tag "修改" || exit 1
@@ -1658,10 +1712,18 @@ edit_wizard_locked() (
     config_jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
         >"$work/original.json" || exit 1
     protocol=$(detect_inbound_template "$work/original.json") || exit 1
+    user_count=$(inbound_user_count "$work/original.json") || exit 1
+    if [[ $user_count -gt 1 ]]; then
+        info "此入站有 $user_count 个用户：认证信息只修改所选用户；端口、TLS、REALITY、混淆和 BBR 是共享设置。"
+        select_inbound_user selected_user_index "$work/original.json" || exit 1
+        [[ -n $selected_user_index ]] || exit 0
+    fi
     tag=$old_tag
     port=$(jq -r .listen_port "$work/original.json")
-    credential=$(jq -r '.users[0].uuid // .users[0].password // .password // ""' "$work/original.json")
-    password=$(jq -r '.users[0].password // ""' "$work/original.json")
+    credential=$(jq -jr --argjson i "$((selected_user_index - 1))" '(.users[$i].uuid // .users[$i].password // .password // "") + "."' "$work/original.json") || exit 1
+    credential=${credential%.}
+    password=$(jq -jr --argjson i "$((selected_user_index - 1))" '(.users[$i].password // "") + "."' "$work/original.json") || exit 1
+    password=${password%.}
     extra=$(jq -r '.transport.path // .transport.service_name // ""' "$work/original.json")
     tls_name=$(jq -r '.tls.server_name // .tls.reality.handshake.server // ""' "$work/original.json")
     private_key=$(jq -r '.tls.reality.private_key // ""' "$work/original.json")
@@ -1744,10 +1806,10 @@ edit_wizard_locked() (
         "$tls_name" "$certificate" "$tls_key" "$password" "$obfs_password" >"$work/generated.json" || exit 1
     # Overlay only template fields; preserve listen options, user names, TLS ALPN,
     # and a non-default REALITY handshake port from an imported configuration.
-    jq --slurpfile updated "$work/generated.json" '
+    jq --slurpfile updated "$work/generated.json" --argjson i "$((selected_user_index - 1))" '
         . as $old | . * $updated[0]
         | .listen = $old.listen
-        | if $old.users != null then .users=[($old.users[0] * $updated[0].users[0])] else . end
+        | if $old.users != null then .users=$old.users | .users[$i]=($old.users[$i] * $updated[0].users[0]) else . end
         | if $old.tls.alpn != null then .tls.alpn=$old.tls.alpn else . end
         | if $old.tls.reality.handshake.server_port != null then
             .tls.reality.handshake.server_port=$old.tls.reality.handshake.server_port else . end
@@ -1794,9 +1856,18 @@ set_default_server() (
 )
 
 generate_client() {
-    local inbound=$1 server=$2 public_key=${3:-}
+    local inbound=$1 server=$2 public_key=${3:-} user_index=${4:-} count
     valid_host "$server" || { fail "服务器地址格式无效。"; return 1; }
     validate_obfs_template "$inbound" || return
+    validate_inbound_users "$inbound" || return
+    count=$(inbound_user_count "$inbound") || return
+    if [[ -z $user_index ]]; then
+        [[ $count -eq 1 ]] || { fail "此入站有多个用户，请明确选择用户序号后导出。"; return 1; }
+        user_index=1
+    fi
+    if [[ ! $user_index =~ ^[1-9][0-9]{0,5}$ ]] || (( user_index > count )); then
+        fail "用户序号无效。"; return 1
+    fi
     # Import supports all core schemas, but export must never silently drop security options.
     jq -e '
       def transport_ok:
@@ -1822,7 +1893,7 @@ generate_client() {
         else .tls == null or .tls == {enabled:false} end;
       (.multiplex == null or .multiplex == {enabled:false}) and transport_ok and tls_ok and
       (if .type == "vless" or .type == "vmess" then
-        (.users | length == 1) and
+        (.users | length >= 1) and
         (.users[0] | keys - ["name","uuid","flow","alterId"] | length == 0) and
         (.users[0].uuid | type == "string" and length > 0) and
         (if .type == "vmess" then (.users[0].alterId // 0) == 0 and .users[0].flow == null
@@ -1831,7 +1902,7 @@ generate_client() {
         .method == "2022-blake3-aes-128-gcm" and .users == null and .destinations == null and
         .tls == null and .transport == null
       elif .type == "hysteria2" or .type == "tuic" or .type == "anytls" then
-        (.users | length == 1) and
+        (.users | length >= 1) and
         (.users[0] | keys - ["name","uuid","password"] | length == 0) and
         (.users[0].password | type == "string" and length > 0) and
         .tls.enabled == true and .transport == null and
@@ -1850,18 +1921,18 @@ generate_client() {
             "$(jq -r '.tls.certificate_path // ""' "$inbound")" \
             "$(jq -r '.tls.key_path // ""' "$inbound")" || return
     fi
-    jq --arg server "$server" --arg key "$public_key" '
-        . as $in | {tag:"proxy",type:.type,server:$server,server_port:.listen_port}
+    jq --arg server "$server" --arg key "$public_key" --argjson i "$((user_index - 1))" '
+        . as $in | .users[$i] as $user | {tag:"proxy",type:.type,server:$server,server_port:.listen_port}
         | if .type == "vless" or .type == "vmess" then
-            .uuid = $in.users[0].uuid
+            .uuid = $user.uuid
             | if $in.transport != null then .transport = $in.transport else . end
             | if .type == "vmess" then .security="auto" | .alter_id=0
-              elif ($in.users[0].flow // "") != "" then .flow=$in.users[0].flow else . end
+              elif ($user.flow // "") != "" then .flow=$user.flow else . end
           elif .type == "shadowsocks" then .method=$in.method | .password=$in.password
           elif .type == "tuic" then
-            .uuid=$in.users[0].uuid | .password=$in.users[0].password
+            .uuid=$user.uuid | .password=$user.password
             | .congestion_control=($in.congestion_control // "cubic")
-          else .password=$in.users[0].password end
+          else .password=$user.password end
         | if $in.type == "hysteria2" and $in.obfs != null then .obfs=$in.obfs else . end
         | if $in.tls.enabled == true then
             .tls={enabled:true,server_name:$in.tls.server_name}
@@ -2047,9 +2118,126 @@ add_wizard_locked() (
 )
 
 # shellcheck disable=SC2016 # config_jq filters use literal jq variables.
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
+list_inbound_users() (
+    umask 077
+    local tag=${1:-} work
+    [[ $# -le 1 ]] || { fail "用法：sing-box users [配置名称]"; exit 1; }
+    require_core && safe_paths || exit 1
+    if [[ -z $tag ]]; then select_inbound tag "查看用户" || exit 1; [[ -n $tag ]] || exit 0; fi
+    valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/users-view.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/node.json" || exit 1
+    detect_inbound_template "$work/node.json" >/dev/null || exit 1
+    [[ $(jq -r .type "$work/node.json") != shadowsocks ]] || { fail "此 Shadowsocks 模板仅支持单密码。"; exit 1; }
+    info "$tag 的用户（不显示连接凭据）："
+    jq -r '["用户序号","用户名"], (.users|to_entries[]|[.key+1,(.value.name // "未命名")]) | @tsv' "$work/node.json"
+)
+
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
+change_inbound_user() (
+    umask 077
+    local action=$1; shift
+    local tag=${1:-} work type user_name credential password="" selected_user_index="" count
+    local metadata expected_metadata=- server="" public_key="" activation=preserve
+    [[ $# -le 1 ]] || { fail "用户操作仅接受一个入站配置名称。"; exit 1; }
+    case "$action" in add|delete) ;; *) exit 1;; esac
+    require_core && safe_paths || exit 1
+    if [[ -z $tag ]]; then select_inbound tag "管理用户" || exit 1; [[ -n $tag ]] || exit 0; fi
+    valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/users-change.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/original.json" || exit 1
+    detect_inbound_template "$work/original.json" >/dev/null || exit 1
+    type=$(jq -r .type "$work/original.json") || exit 1
+    [[ $type != shadowsocks ]] || { fail "此 Shadowsocks 模板仅支持单密码。"; exit 1; }
+    count=$(inbound_user_count "$work/original.json") || exit 1
+    metadata="$CLIENT_DIR/$tag.json"
+    [[ ! -L $metadata && ( ! -e $metadata || -f $metadata ) ]] || { fail "连接信息文件无效。"; exit 1; }
+    if [[ -f $metadata ]]; then
+        cp -- "$metadata" "$work/metadata-before.json" || exit 1
+        expected_metadata="$work/metadata-before.json"
+        jq -e 'type=="object"' "$expected_metadata" >/dev/null || exit 1
+        if [[ $(jq -Sc .inbound "$expected_metadata") == "$(jq -Sc . "$work/original.json")" ]]; then
+            server=$(jq -r '.server // ""' "$expected_metadata") || exit 1
+            public_key=$(jq -r '.public_key // ""' "$expected_metadata") || exit 1
+        elif jq -e 'has("quic_bbr_restore")' "$expected_metadata" >/dev/null; then
+            fail "节点与恢复记录不一致，已取消用户操作。"; exit 1
+        fi
+    fi
+    if [[ $action == add ]]; then
+        prompt user_name "新用户名（字母/数字/短横线/下划线）" "user-$(date +%H%M%S)" || exit 1
+        valid_tag "$user_name" || { fail "用户名格式无效。"; exit 1; }
+        case "$type" in
+            vless|vmess|tuic)
+                credential=$("$CORE_BIN" generate uuid) || exit 1
+                prompt_secret credential "新用户 UUID（回车自动生成，@new 重新生成）" "$credential" || exit 1
+                [[ $credential != @new ]] || credential=$("$CORE_BIN" generate uuid) || exit 1 ;;
+            *)
+                credential=$("$CORE_BIN" generate rand --base64 16) || exit 1
+                prompt_secret credential "新用户密码（回车自动生成，@new 重新生成）" "$credential" || exit 1
+                [[ $credential != @new ]] || credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
+        esac
+        if [[ $type == tuic ]]; then
+            password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+            prompt_secret password "新用户 TUIC 密码（回车自动生成，@new 重新生成）" "$password" || exit 1
+            [[ $password != @new ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+        fi
+        jq --arg name "$user_name" --arg credential "$credential" --arg password "$password" '
+          .type as $type | .users += [(.users[0] | .name=$name |
+            if $type=="vless" or $type=="vmess" or $type=="tuic" then .uuid=$credential else .password=$credential end
+            | if $type=="tuic" then .password=$password else . end)]' "$work/original.json" >"$work/updated.json" || exit 1
+        activation=start
+        validate_inbound_users "$work/updated.json" || exit 1
+        confirm "确认给 $tag 添加用户 $user_name？共享原端口/TLS，原用户保留；服务将启动或短暂重启，失败回滚。" || { info "已取消。"; exit 0; }
+    else
+        [[ $count -gt 1 ]] || { fail "不能删除最后一个用户；如需移除此入站，请使用删除配置。"; exit 1; }
+        select_inbound_user selected_user_index "$work/original.json" || exit 1
+        [[ -n $selected_user_index ]] || exit 0
+        jq --argjson i "$((selected_user_index - 1))" 'del(.users[$i])' "$work/original.json" >"$work/updated.json" || exit 1
+        confirm "确认删除 $tag 的第 $selected_user_index 个用户？其凭据将失效，其他用户保留；运行中的服务会短暂重启。" || { info "已取消。"; exit 0; }
+    fi
+    replace_inbound_file "$tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" "" "$expected_metadata" "$activation" || exit 1
+    info "入站用户已更新。可从用户管理菜单按用户导出独立分享链接。"
+)
+
+add_inbound_user_locked() { change_inbound_user add "$@"; }
+delete_inbound_user_locked() { change_inbound_user delete "$@"; }
+add_inbound_user() { with_lock add_inbound_user_locked "$@"; }
+delete_inbound_user() { with_lock delete_inbound_user_locked "$@"; }
+
+users_menu() {
+    local tag=${1:-} choice selected_tag
+    [[ $# -le 1 ]] || { fail "用法：sing-box users [配置名称]"; return 1; }
+    [[ -z $tag ]] || valid_tag "$tag" || { fail "配置名称无效。"; return 1; }
+    [[ -t 0 ]] || { list_inbound_users "$@"; return; }
+    while true; do
+        printf '\n入站多用户管理\n  1. 用户列表（不显示凭据）\n  2. 添加用户\n  3. 删除用户\n  4. 按用户导出客户端和分享链接\n  5. 修改入站/所选用户认证\n  0. 返回\n'
+        prompt choice "请选择用户操作" 0 || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) list_inbound_users ${tag:+"$tag"} ;;
+            2) add_inbound_user ${tag:+"$tag"} ;;
+            3) delete_inbound_user ${tag:+"$tag"} ;;
+            4)
+                selected_tag=$tag
+                if [[ -z $selected_tag ]]; then select_inbound selected_tag "导出用户"; fi
+                [[ -z $selected_tag ]] || show_client "$selected_tag"
+                ;;
+            5) with_lock edit_wizard_locked ${tag:+"$tag"} ;;
+            *) fail "请输入 0–5。" ;;
+        esac || true
+        read -r -p "按回车键返回用户管理菜单..." choice || return 0
+    done
+}
+
+# shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 show_client() (
     umask 077
-    local tag=$1 server=${2:-} mode=${3:-full} inbound public_key="" metadata work
+    local tag=$1 server=${2:-} mode=${3:-full} user_index=${4:-} inbound public_key="" metadata work count index label name
+    local -a indices
+    case "$mode" in full|json-only|link-only) ;; *) fail "无效的客户端导出方式。"; exit 1;; esac
     require_core || exit 1
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/view.XXXXXX") || exit 1
@@ -2080,17 +2268,38 @@ show_client() (
         fail "缺少此 REALITY 入站对应的公钥。请使用原始公钥；不会输出不完整的客户端配置。"
         exit 1
     fi
-    generate_client "$inbound" "$server" "$public_key" >"$work/outbound.json" || exit 1
-    if [[ $mode == json-only ]]; then
-        jq --arg tag "$tag" '.tag=$tag' "$work/outbound.json"
-        exit $?
+    validate_inbound_users "$inbound" || exit 1
+    count=$(inbound_user_count "$inbound") || exit 1
+    if [[ $user_index == all ]]; then
+        for ((index=1; index<=count; index++)); do indices+=("$index"); done
+    else
+        if [[ -z $user_index ]]; then
+            if [[ $count -gt 1 ]]; then
+                [[ $mode == full && -t 0 ]] || { fail "此入站有多个用户，请指定用户序号或导出全部用户。"; exit 1; }
+                select_inbound_user user_index "$inbound" || exit 1
+                [[ -n $user_index ]] || exit 0
+            else user_index=1; fi
+        fi
+        indices=("$user_index")
     fi
-    if [[ $mode != link-only ]]; then
-        info "客户端 outbound JSON（包含连接凭据）："
-        cat "$work/outbound.json"
-        info "分享链接："
-    fi
-    client_link "$work/outbound.json" "$tag"
+    for index in "${indices[@]}"; do
+        generate_client "$inbound" "$server" "$public_key" "$index" >"$work/outbound.json" || exit 1
+        label=$tag
+        if [[ $count -gt 1 ]]; then
+            name=$(jq -r --argjson i "$((index - 1))" '.users[$i].name // ""' "$inbound") || exit 1
+            label="$tag-user$index${name:+-$name}"
+        fi
+        if [[ $mode == json-only ]]; then
+            jq --arg tag "$label" '.tag=$tag' "$work/outbound.json" || exit 1
+            continue
+        fi
+        if [[ $mode != link-only ]]; then
+            info "$label 客户端 outbound JSON（包含连接凭据）："
+            cat "$work/outbound.json"
+            info "分享链接："
+        fi
+        client_link "$work/outbound.json" "$label" || exit 1
+    done
 )
 
 snapshot_bundle() (
@@ -2299,8 +2508,8 @@ export_clients() (
     config_jq -e '.inbounds|length>0' >/dev/null || { fail "没有可导出的节点。"; exit 1; }
     while IFS= read -r tag; do
         if [[ $format == json ]]; then
-            show_client "$tag" "" json-only >>"$work/nodes" || exit 1
-        else show_client "$tag" "" link-only >>"$work/nodes" || exit 1; fi
+            show_client "$tag" "" json-only all >>"$work/nodes" || exit 1
+        else show_client "$tag" "" link-only all >>"$work/nodes" || exit 1; fi
     done < <(config_jq -r '.inbounds[].tag')
     case "$format" in
         links) cp -- "$work/nodes" "$work/result" ;;
@@ -2351,7 +2560,7 @@ diagnose() (
                 fi
             else warn "TLS 文件、有效期、域名或密钥配对检查失败；请检查节点证书设置。"; issue=1; fi
         fi
-        if show_client "$tag" "" link-only >"$work/client" 2>"$work/client-error"; then info "客户端链接生成检查通过（不显示凭据）。"
+        if show_client "$tag" "" link-only all >"$work/client" 2>"$work/client-error"; then info "客户端链接生成检查通过（不显示凭据）。"
         else warn "客户端链接不能生成，请检查连接地址、公钥元数据或模板支持范围。"; issue=1; fi
     done < <(config_jq -c '.inbounds[]?')
     info "此检查不探测公网，不修改防火墙；云平台入站规则、DNS 解析及实际客户端连接需分别验证。"
@@ -2388,7 +2597,7 @@ show_config_list() {
     info "以下分享链接包含连接凭据，可复制整行导入客户端："
     while IFS= read -r tag; do
         printf '\n[%s]\n' "$(jq -rn --arg tag "$tag" '$tag | gsub("[[:cntrl:]]"; "?")')"
-        show_client "$tag" "" link-only || warn "此配置暂时无法生成分享链接，其他配置仍会继续显示。"
+        show_client "$tag" "" link-only all || warn "此配置暂时无法生成分享链接，其他配置仍会继续显示。"
     done < <(config_jq -r '.inbounds[]?.tag')
 }
 
@@ -3017,8 +3226,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-17]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n 18. 入站多用户管理\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-18]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -3042,8 +3251,9 @@ menu() {
             15) bbr_menu || true; continue ;;
             16) disable_bbr || true ;;
             17) open_acme_menu || true ;;
+            18) users_menu || true; continue ;;
             0) return 0 ;;
-            *) warn "请输入 0–17。" ;;
+            *) warn "请输入 0–18。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -3087,7 +3297,10 @@ sing-box 中文终端管理面板
   sing-box add-file /path/in.json 添加单个 inbound JSON 对象
   sing-box import /path/full.json 导入完整 JSON 配置（需要确认）
   sing-box info                   查看配置菜单
-  sing-box client TAG [SERVER]    输出客户端 outbound JSON 与分享链接
+  sing-box client TAG [SERVER] [USER_INDEX|all] 按用户输出客户端 JSON 与分享链接
+  sing-box users [TAG]            入站多用户管理；非交互时只显示用户列表
+  sing-box user-add [TAG]         为入站添加独立认证用户（交互确认）
+  sing-box user-delete [TAG]      按序号删除入站用户（保留至少一个）
   sing-box server [IP/域名|-]     设置默认连接地址；无参数打开向导，- 清除
   sing-box validate               检查实际服务配置
   sing-box format-config          格式化配置文件，保留注释和值，备份且不重启服务
@@ -3116,7 +3329,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|server|validate|format-config|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -3174,9 +3387,12 @@ main() {
             ;;
         info) show_config ;;
         server) with_lock set_default_server "$@" ;;
+        users) users_menu "$@" ;;
+        user-add) add_inbound_user "$@" ;;
+        user-delete) delete_inbound_user "$@" ;;
         client)
-            [[ $# -ge 1 && $# -le 2 ]] || { fail "用法：sing-box client TAG [SERVER]"; return 1; }
-            show_client "$1" "${2:-}"
+            [[ $# -ge 1 && $# -le 3 ]] || { fail "用法：sing-box client TAG [SERVER] [USER_INDEX|all]"; return 1; }
+            show_client "$1" "${2:-}" full "${3:-}"
             ;;
         validate) require_core && validate_config "$CONFIG_FILE" ;;
         format-config) format_config "$@" ;;

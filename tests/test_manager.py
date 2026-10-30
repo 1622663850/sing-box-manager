@@ -2092,13 +2092,25 @@ printf 'INVALID_REJECTED\n'
         grpc["transport"] = {"type": "grpc", "service_name": "example"}
         multiple_users = self.inbound()
         multiple_users["users"].append({"uuid": "0325ba41-4946-4ad5-b6b3-476eb50c37cb"})
-        for name, inbound in (("ordinary-tls", tls), ("grpc", grpc), ("multiple-users", multiple_users)):
+        for name, inbound in (("ordinary-tls", tls), ("grpc", grpc)):
             with self.subTest(case=name):
                 path = self.root / (name + ".json")
                 dump(path, inbound)
                 result = self.shell('generate_client "$1" "example.com"', str(path))
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout.strip(), "")
+        multiple_path = self.root / "multiple-users.json"
+        dump(multiple_path, multiple_users)
+        result = self.shell('generate_client "$1" "example.com"', str(multiple_path))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+        for index, expected_uuid in enumerate((multiple_users["users"][0]["uuid"], multiple_users["users"][1]["uuid"]), start=1):
+            with self.subTest(user_index=index):
+                result = self.shell(
+                    'generate_client "$1" "example.com" "" "$2"',
+                    str(multiple_path), str(index), check=True,
+                )
+                self.assertEqual(json.loads(result.stdout)["uuid"], expected_uuid)
 
     def test_client_export_accepts_own_templates_without_losing_tls(self) -> None:
         fields = {
