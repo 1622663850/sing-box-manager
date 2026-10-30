@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.20.1"
+SB_MANAGER_VERSION="1.21.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -3205,6 +3205,107 @@ open_acme_menu() {
     bash "$script" 9>&-
 }
 
+# shellcheck disable=SC2016 # json_query filters use literal jq variables.
+generate_outbound_preference() {
+    [[ $# -eq 2 ]] || return 1
+    case "$2" in prefer_ipv6|prefer_ipv4) ;; *) fail "仅支持 prefer_ipv6 或 prefer_ipv4。"; return 1;; esac
+    json_query "$1" --arg strategy "$2" '
+      if type != "object" or ((.dns // {}) | type) != "object" or
+         ((.route // {}) | type) != "object" or ((.dns.servers // []) | type) != "array"
+      then error("invalid DNS/route structure") else . end |
+      .dns = (.dns // {}) | .route = (.route // {}) |
+      if ((.dns.servers // []) | length) == 0 then
+        .dns.servers = [{type:"local",tag:"local"}] else . end |
+      (.route.default_domain_resolver // {}) as $old |
+      (if ($old | type) == "string" then {server:$old}
+       elif ($old | type) == "object" then $old
+       else error("invalid default resolver") end) as $resolver |
+      ($resolver.server // "") as $explicit |
+      (if $explicit != "" then $explicit
+       elif (.dns.final // "") != "" then .dns.final
+       else .dns.servers[0].tag end) as $server |
+      if ($server | type) != "string" or $server == "" or
+         ([.dns.servers[] | select(.tag == $server)] | length) != 1
+      then error("unresolved DNS server tag") else . end |
+      .dns.strategy = $strategy |
+      .route.default_domain_resolver = ($resolver + {server:$server,strategy:$strategy})
+    ' 2>/dev/null || { fail "DNS/路由配置无效，或默认 DNS 引用不明确；请先为 DNS 服务器设置唯一 tag。"; return 1; }
+}
+
+outbound_preference_label() {
+    case "$1" in
+        prefer_ipv6) printf '优先 IPv6' ;;
+        prefer_ipv4) printf '优先 IPv4' ;;
+        ipv6_only) printf '仅 IPv6（自定义）' ;;
+        ipv4_only) printf '仅 IPv4（自定义）' ;;
+        "") printf '未设置（沿用默认）' ;;
+        *) printf '自定义策略' ;;
+    esac
+}
+
+show_outbound_preference() {
+    require_core || return
+    local dns_strategy route_strategy
+    dns_strategy=$(config_jq -r '.dns.strategy // ""') || return
+    route_strategy=$(config_jq -r '
+      .route.default_domain_resolver | if type == "object" then .strategy // "" else "" end') || return
+    printf 'DNS 默认解析：%s\n默认出站解析：%s\n' \
+        "$(outbound_preference_label "$dns_strategy")" "$(outbound_preference_label "$route_strategy")"
+    info "这是域名解析的默认优先级；独立规则、出站解析器及固定 IP 连接保持各自设置。"
+}
+
+configure_outbound_preference_locked() (
+    umask 077
+    local strategy=${1:-} work backup
+    [[ $# -eq 1 ]] || exit 1
+    require_core && safe_paths || exit 1
+    work=$(mktemp -d "$STATE_DIR/ip-preference.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -- "$CONFIG_FILE" "$work/original.json" || exit 1
+    generate_outbound_preference "$work/original.json" "$strategy" >"$work/candidate.json" || exit 1
+    if [[ $(json_query "$work/original.json" -Sc .) == "$(json_query "$work/candidate.json" -Sc .)" ]]; then
+        info "默认出站已是$(outbound_preference_label "$strategy")，无需修改或重启。"; exit 0
+    fi
+    validate_config "$work/candidate.json" >/dev/null || exit 1
+    info "设置为$(outbound_preference_label "$strategy")；保留 DNS 服务器和路由规则，另一地址族仍可回退。"
+    info "运行中的服务将短暂重启；停止状态和开机自启设置保留。IPv6 需要服务器具备可用的 IPv6 网络。"
+    info "独立 DNS/路由规则、outbound.domain_resolver 等显式设置可能覆盖默认策略。"
+    confirm "保存出站 IP 优先级？（自动备份）" || exit 1
+    cmp -s "$work/original.json" "$CONFIG_FILE" || { fail "配置已被其他操作修改，请重新设置。"; exit 1; }
+    backup=$(create_backup) || exit 1
+    commit_config "$work/candidate.json" || exit 1
+    info "出站 IP 优先级已保存。成套备份：$backup"
+)
+
+outbound_preference_menu() {
+    local choice
+    while true; do
+        printf '\n出站 IP 优先级\n'
+        show_outbound_preference || true
+        printf '\n  1. 开启 IPv6 优先\n  2. 关闭 IPv6 优先（改为 IPv4 优先）\n  3. 查看当前设置\n  0. 返回\n'
+        read -r -p "请选择出站策略 [0]: " choice || return 0
+        case "$choice" in
+            1) with_lock configure_outbound_preference_locked prefer_ipv6 || true ;;
+            2) with_lock configure_outbound_preference_locked prefer_ipv4 || true ;;
+            3) show_outbound_preference || true ;;
+            0|"") return 0 ;;
+            *) warn "请输入 0–3。" ;;
+        esac
+        read -r -p "按回车键返回出站设置菜单..." choice || return 0
+    done
+}
+
+set_outbound_preference() {
+    [[ $# -le 1 ]] || { fail "用法：sing-box ip-preference [ipv6|ipv4|status]"; return 1; }
+    case "${1:-}" in
+        "") outbound_preference_menu ;;
+        ipv6) with_lock configure_outbound_preference_locked prefer_ipv6 ;;
+        ipv4) with_lock configure_outbound_preference_locked prefer_ipv4 ;;
+        status) show_outbound_preference ;;
+        *) fail "用法：sing-box ip-preference [ipv6|ipv4|status]" ;;
+    esac
+}
+
 show_status() {
     local active enabled version="未安装"
     local green="" red="" yellow="" dim="" reset=""
@@ -3249,8 +3350,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n 18. 入站多用户管理\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-18]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n 18. 入站多用户管理\n 19. 出站 IP 优先级（IPv6 / IPv4）\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-19]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -3275,8 +3376,9 @@ menu() {
             16) disable_bbr || true ;;
             17) open_acme_menu || true ;;
             18) users_menu || true; continue ;;
+            19) outbound_preference_menu || true; continue ;;
             0) return 0 ;;
-            *) warn "请输入 0–18。" ;;
+            *) warn "请输入 0–19。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -3300,6 +3402,7 @@ sing-box 中文终端管理面板
   sing-box quic-bbr-status        只读查看 Hy2/TUIC 的 QUIC 拥塞控制状态
   sing-box quic-bbr-disable [TAG] 恢复节点开启 QUIC BBR 前的设置
   sing-box quic-bbr-record TAG FILE 核对指定旧成套备份并登记节点恢复记录
+  sing-box ip-preference [ipv6|ipv4|status] 设置或查看默认出站 IP 优先级
   sing-box acme                   安装/打开 acme-script 证书管理菜单
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
   sing-box start | restart        启动 / 重新启动
@@ -3352,7 +3455,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|ip-preference|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -3379,6 +3482,7 @@ main() {
         quic-bbr-disable) disable_quic_bbr "$@" ;;
         quic-bbr-record) record_quic_bbr "$@" ;;
         acme) open_acme_menu "$@" ;;
+        ip-preference) set_outbound_preference "$@" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;

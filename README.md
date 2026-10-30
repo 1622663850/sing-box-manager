@@ -24,6 +24,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 16 | 关闭 TCP BBR（恢复开启前设置） | 使用本面板的开启记录恢复原算法、默认队列及原配置文件状态，失败回滚 |
 | 17 | 安装/打开 ACME 证书菜单 | 首次安装 acme-script 菜单，已安装时直接进入；退出后返回本面板 |
 | 18 | 入站多用户管理 | 同一入站添加/删除独立认证用户、按用户导出；原端口、TLS 和其他用户保留 |
+| 19 | 出站 IP 优先级 | 开启 IPv6 优先、改为 IPv4 优先，或查看当前默认策略 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -386,3 +387,13 @@ sudo python3 tests/smoke_management.py --core /absolute/path/to/sing-box
 - [233boy/sing-box](https://github.com/233boy/sing-box)：参考其终端菜单、命令透传和管理思路；本仓库独立实现，没有复制其脚本代码。
 
 本仓库脚本采用 [MIT License](LICENSE)。sing-box 核心独立下载，遵循其自身许可证；本仓库不重新分发核心二进制。
+
+## 出站 IPv6 / IPv4 优先级
+
+v1.21.0 起，主菜单 **19 → 1** 开启 IPv6 优先，**19 → 2** 关闭 IPv6 优先并改为 IPv4 优先，**19 → 3** 查看当前设置。命令行也可使用 `sudo sing-box ip-preference ipv6`、`ipv4` 或 `status`；无参数打开子菜单。
+
+保存会同时设置 `dns.strategy` 和 `route.default_domain_resolver.strategy` 为 `prefer_ipv6` / `prefer_ipv4`。已有默认解析器保留其服务器引用和其他参数；尚未指定时使用 `dns.final`，再回退到第一个 DNS 服务器。尚无 DNS 服务器时添加 `{ "type": "local", "tag": "local" }`，已有服务器和规则保持原样；缺失或重复 tag 导致默认引用不明确时拒绝保存。
+
+这是域名解析的默认优先级，并不强制只使用某个地址族；请求为固定 IP、客户端已解析为 IP，或独立 DNS/路由规则和出站配置显式覆盖策略时，不保证改用 IPv6。服务器仍需具备可用的 IPv6 网络。[官方 DNS 策略](https://sing-box.sagernet.org/configuration/dns/#strategy)及[默认解析器覆盖关系](https://sing-box.sagernet.org/configuration/route/#default_domain_resolver)见文档。
+
+保存前确认、生成成套备份并校验完整配置，保留 JSONC 注释、节点凭据和连接元数据。运行中的服务按需重启，原本停止则继续停止，自启不变；重启失败恢复原配置。重复选择相同设置不写入、不备份、不重启。更新面板不会自动改变当前优先级。
