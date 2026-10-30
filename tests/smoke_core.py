@@ -450,10 +450,15 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
             if template == "hysteria2-salamander":
                 generator_args.append("salamander-obfs-password")
             inbound = bash_json(*generator_args)
+            restore_record = None
             if template in {"hysteria2-bbr", "tuic-bbr"}:
                 inbound_file = work / (template + "-pre-bbr-inbound.json")
                 write_json(inbound_file, inbound)
-                inbound = bash_json(manager, environment, "generate_quic_bbr_inbound", str(inbound_file))
+                record_file = work / (template + "-wizard-record.json")
+                inbound = bash_json(
+                    manager, environment, "prepare_quic_bbr_wizard", str(inbound_file), "1", "-", str(record_file),
+                )
+                restore_record = json.loads(record_file.read_text(encoding="utf-8")) if record_file.stat().st_size else None
                 if template == "hysteria2-bbr":
                     if not inbound.get("ignore_client_bandwidth", False) or "up_mbps" in inbound or "down_mbps" in inbound:
                         raise RuntimeError("hysteria2-bbr: QUIC BBR server fields were not applied")
@@ -463,17 +468,6 @@ def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], w
                 "type": "salamander", "password": "salamander-obfs-password",
             }:
                 raise RuntimeError("hysteria2-salamander: generated server obfs did not match")
-            restore_record = None
-            if template == "hysteria2-bbr":
-                restore_record = {
-                    "format": "sing-box-manager-quic-bbr-v1", "type": "hysteria2",
-                    "settings": {},
-                }
-            elif template == "tuic-bbr":
-                restore_record = {
-                    "format": "sing-box-manager-quic-bbr-v1", "type": "tuic",
-                    "settings": {"congestion_control": "cubic"},
-                }
             inbound["listen"] = LOOPBACK
             inbound_file = work / (template + "-extended-inbound.json")
             write_json(inbound_file, inbound)

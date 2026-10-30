@@ -238,6 +238,7 @@ class Hysteria2ObfsTest(unittest.TestCase):
                             *) printf -v "$variable" '%s' "${3-}" ;;
                         esac
                     }
+                    prompt_quic_bbr() { printf -v "$1" 2; }
                     prompt_secret() {
                         SECRET_CALLS=$((SECRET_CALLS + 1))
                         if [[ $SECRET_CALLS == 1 ]]; then
@@ -328,6 +329,7 @@ class Hysteria2ObfsTest(unittest.TestCase):
                             *) printf -v "$variable" '%s' '' ;;
                         esac
                     }
+                    prompt_quic_bbr() { printf -v "$1" 2; }
                     prompt_secret() { printf -v "$1" '%s' "$TEST_OBFS_SECRET"; }
                     prompt_tls_certificate_files() {
                         printf -v certificate '%s' "$TEST_CERTIFICATE"

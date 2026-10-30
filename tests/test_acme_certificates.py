@@ -261,6 +261,8 @@ certificate=''; tls_key=''; prompt_tls_certificate_files root.example.com '' '';
 require_core() { return 0; }
 prompt() { case "$1" in choice) printf -v "$1" '%s' "$TEST_CHOICE";; tag) printf -v "$1" '%s' "tls-$TEST_CHOICE";; port) printf -v "$1" '%s' "$((44000 + TEST_CHOICE))";; obfs_choice) printf -v "$1" 1;; extra) printf -v "$1" TunService;; tls_name|server) printf -v "$1" example.com;; esac; }
 prompt_tls_certificate_files() { printf 'H:%s\n' "$1" >>"$TLS_ROUTE_LOG"; printf -v certificate '%s' "$TLS_CERT"; printf -v tls_key '%s' "$TLS_KEY"; }
+prompt_quic_bbr() { printf -v "$1" 2; }
+prepare_quic_bbr_wizard() { : >"$4"; cat -- "$1"; }
 generate_inbound() { printf '{"type":"vless","tag":"%s","listen_port":443,"users":[{"uuid":"b7efdc96-87aa-4910-81b4-374b2eecc737"}]}' "$2"; }
 generate_client() { return 0; }; add_managed_inbound() { return 0; }; show_client() { return 0; }
 for TEST_CHOICE in 7 8 9 10 12 14 15 17 18; do add_wizard_locked || exit; done
@@ -290,6 +292,7 @@ for TEST_CHOICE in 7 8 9 10 12 14 15 17 18; do add_wizard_locked || exit; done
 require_core() { return 0; }
 prompt() { if [[ "$1" == tls_choice ]]; then printf -v "$1" 1; else printf -v "$1" '%s' "${3:-}"; fi; }
 prompt_secret() { printf -v "$1" '%s' "${3:-}"; }
+prompt_quic_bbr() { printf -v "$1" 2; }
 prompt_tls_certificate_files() { printf 'H:%s\n' "$1" >>"$TLS_EDIT_LOG"; printf -v certificate '%s' "$TLS_CERT"; printf -v tls_key '%s' "$TLS_KEY"; }
 replace_inbound_file() { printf 'R:%s\n' "$1" >>"$TLS_EDIT_LOG"; return 0; }
 confirm() { return 0; }

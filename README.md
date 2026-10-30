@@ -93,8 +93,8 @@ v1.12.0 起，**修改配置、删除配置、选择客户端导出**均显示�
 4. **Shadowsocks 2022**：使用 `2022-blake3-aes-128-gcm`，自动生成随机密钥。
 5. **导入单个 inbound JSON**：追加至现有 `.inbounds`，保留其他配置；检查名称、端口冲突。
 6. **导入完整 JSON**：交互确认后替换当前主配置，保留旧配置备份。
-7. **Hysteria 2**：自动生成密码，使用 UDP 和 TLS；可选 Salamander 混淆。
-8. **TUIC**：自动生成 UUID 和密码，使用 UDP 和 TLS。
+7. **Hysteria 2**：自动生成密码，使用 UDP 和 TLS；可选 Salamander 混淆，向导默认开启 QUIC BBR。
+8. **TUIC**：自动生成 UUID 和密码，使用 UDP 和 TLS；向导默认开启 QUIC BBR。
 9. **AnyTLS**：自动生成密码，使用 TCP 和 TLS。
 10. **VLESS + gRPC + TLS**：自动生成 UUID，填写 gRPC 服务名及证书信息。
 11. **VMess + TCP**：自动生成 UUID，使用 AEAD（alterId 为 0），不额外启用 TLS。
@@ -291,6 +291,10 @@ Hysteria 2 会移除该节点的 `up_mbps`、`down_mbps` 带宽设置，并设�
 操作前确认并生成成套备份，使用原有配置修改事务校验、保留 JSONC 注释、同步连接元数据并在失败时回滚。密码、UUID、端口、TLS、证书路径和 Salamander 保持不变；运行中的 sing-box 会短暂重启，停止状态保持停止；已经启用的节点不重复写入或重启。主菜单 **16** 仅恢复系统 TCP 设置，不改动 QUIC 节点。新增节点和已有节点均不会因更新面板而自动启用或关闭此设置。
 
 v1.17.0 起，**主菜单 15 → 4. 关闭 UDP/QUIC BBR（恢复开启前设置）** 可按序号选择节点。开启时将原字段记录在该节点权限为 `600` 的连接元数据中，并与配置一起保存；重复开启保留首次记录。关闭只恢复 Hy2 的 `up_mbps`、`down_mbps`、`ignore_client_bandwidth` 或 TUIC 的 `congestion_control`，包括字段原本缺失、显式 `null`、`0`、`false` 的区别，不统一强制 CUBIC。其后对名称、认证、端口、证书等其他字段的正常修改会保留；改名时恢复记录随节点迁移。成功恢复后清除活动记录，历史备份保留；操作失败或中断时配置、元数据和恢复记录一起回滚。
+
+v1.18.0 起，**添加 Hy2（8 → 7）或 TUIC（8 → 8），以及通过主菜单 11 修改这两类节点**，均显示 QUIC BBR 选项：**1 开启（默认）、2 关闭/恢复原设置、0 取消**。添加和修改时直接回车均选择开启，只有保存成功才应用；更新面板本身不会更改现有节点。首次启用会同步保存恢复记录，已有记录不被重复开启覆盖；编辑时选择关闭会恢复记录中的原 QUIC 字段并清除记录，同时保留这次输入的名称、认证、端口、TLS 和混淆修改。没有恢复记录且原本未强制 BBR 时保留原设置；原本已启用但缺少记录时拒绝猜测关闭后的原值。
+
+新建后选择不启用时，Hy2 使用原来的自动协商，TUIC 使用模板默认 `cubic`；选择默认开启后，新 Hy2 可恢复至无强制 BBR 的原始模板，新 TUIC 可恢复至 `cubic`。TUIC 的客户端 outbound JSON 和分享链接会同步 `congestion_control=bbr` 或恢复后的算法，修改后请重新导入客户端。Hy2 启用时，客户端 JSON 不设置 `up_mbps/down_mbps`，服务端通过 `ignore_client_bandwidth` 要求 BBR，详见 [sing-box 客户端说明](https://sing-box.sagernet.org/configuration/outbound/hysteria2/#up_mbps-down_mbps)；[官方 Hy2 URI 格式](https://v2.hysteria.network/docs/developers/URI-Scheme/)没有单独的 BBR 参数，分享链接保留标准认证、SNI 和 Salamander 参数，由协议协商执行服务端设置，不添加非标准的 BBR 参数。
 
 恢复记录缺失、损坏、与当前协议不匹配，节点与元数据不同步，或 QUIC 字段已被外部改动时，拒绝猜测或覆盖。恢复前会确认并备份；如果开启前已经是 BBR，恢复后仍会是 BBR并明确提示。成套备份仍可从主菜单 **13** 恢复整套配置，但须留意备份之后的其他节点修改。
 

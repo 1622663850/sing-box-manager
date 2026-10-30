@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.17.0"
+SB_MANAGER_VERSION="1.18.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1439,6 +1439,42 @@ prompt_hysteria2_obfs() {
     esac
 }
 
+prompt_quic_bbr() {
+    prompt "$1" "QUIC BBR：1 开启（回车默认），2 关闭/恢复原设置，0 取消" 1 || return 1
+    case "${!1}" in
+        1|2) return 0 ;;
+        0) info "已取消 QUIC BBR 设置。"; return 1 ;;
+        *) fail "请输入 0–2。"; return 1 ;;
+    esac
+}
+
+prepare_quic_bbr_wizard() {
+    local file=$1 choice=$2 record_source=$3 record_output=$4 enabled
+    : >"$record_output" || return 1
+    if [[ $record_source != - ]]; then
+        generate_quic_bbr_restore "$file" "$record_source" >/dev/null || return 1
+    fi
+    case "$choice" in
+        1)
+            enabled=$(generate_quic_bbr_inbound "$file") || return 1
+            if [[ $record_source == - && $(jq -Sc . "$file") != "$(jq -Sc . <<<"$enabled")" ]]; then
+                make_quic_bbr_record "$file" >"$record_output" || return 1
+            fi
+            printf '%s\n' "$enabled"
+            ;;
+        2)
+            if [[ $record_source != - ]]; then
+                generate_quic_bbr_restore "$file" "$record_source" || return 1
+                printf 'null\n' >"$record_output" || return 1
+            elif jq -e 'if .type=="tuic" then .congestion_control=="bbr" else
+              (.up_mbps // 0)==0 and (.down_mbps // 0)==0 and .ignore_client_bandwidth==true end' "$file" >/dev/null; then
+                fail "没有开启前的恢复记录，不能猜测关闭后的原值；请先核对旧备份。"; return 1
+            else cat -- "$file"; fi
+            ;;
+        *) fail "无效的 QUIC BBR 选项。"; return 1 ;;
+    esac
+}
+
 detect_inbound_template() {
     validate_obfs_template "$1" || return
     jq -er '
@@ -1600,6 +1636,7 @@ edit_wizard_locked() (
     require_core || exit 1
     local old_tag=${1:-} tag port protocol work metadata server="" public_key="" credential extra=""
     local private_key="" short_id="" tls_name="" certificate="" tls_key="" password="" obfs_password="" rotation pair
+    local quic_bbr_choice="" quic_record="" record_source=- expected_metadata=""
     [[ $# -le 1 ]] || { fail "用法：sing-box edit [配置名称]"; exit 1; }
     if [[ -z $old_tag ]]; then
         select_inbound old_tag "修改" || exit 1
@@ -1631,6 +1668,23 @@ edit_wizard_locked() (
         server=$(jq -r '.server // ""' "$metadata")
         public_key=$(jq -r '.public_key // ""' "$metadata")
     fi
+    if [[ $protocol == hysteria2 || $protocol == tuic ]]; then
+        [[ ! -e $metadata || -f $metadata ]] || { fail "连接信息文件无效。"; exit 1; }
+        expected_metadata=-
+        if [[ -f $metadata ]]; then
+            cp -- "$metadata" "$work/metadata-before.json" || exit 1
+            expected_metadata="$work/metadata-before.json"
+            jq -e 'type=="object"' "$expected_metadata" >/dev/null || exit 1
+            if jq -e 'has("quic_bbr_restore")' "$expected_metadata" >/dev/null; then
+                [[ $(jq -Sc .inbound "$expected_metadata") == "$(jq -Sc . "$work/original.json")" ]] || {
+                    fail "节点与恢复记录不一致，已取消编辑。"; exit 1;
+                }
+                record_source="$work/quic-record-before.json"
+                jq '.quic_bbr_restore' "$expected_metadata" >"$record_source" || exit 1
+                generate_quic_bbr_restore "$work/original.json" "$record_source" >/dev/null || exit 1
+            fi
+        fi
+    fi
     info "修改 $old_tag（$protocol）：回车保留原值；认证信息不回显，输入 @new 可重新生成。"
     prompt tag "配置名称" "$tag" && prompt port "监听端口" "$port" || exit 1
     if ! valid_tag "$tag" || ! valid_port "$port"; then fail "名称或端口无效。"; exit 1; fi
@@ -1647,6 +1701,7 @@ edit_wizard_locked() (
         [[ $password != @new ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
     fi
     [[ $protocol != hysteria2 ]] || prompt_hysteria2_obfs obfs_password "$obfs_password" || exit 1
+    if [[ $protocol == hysteria2 || $protocol == tuic ]]; then prompt_quic_bbr quic_bbr_choice || exit 1; fi
     case "$protocol" in
         *-ws|*-ws-tls) prompt extra "WebSocket 路径" "$extra" || exit 1 ;;
         *-grpc-*) prompt extra "gRPC 服务名" "$extra" || exit 1 ;;
@@ -1686,16 +1741,23 @@ edit_wizard_locked() (
         | if $old.tls.alpn != null then .tls.alpn=$old.tls.alpn else . end
         | if $old.tls.reality.handshake.server_port != null then
             .tls.reality.handshake.server_port=$old.tls.reality.handshake.server_port else . end
-        | if $old.type == "tuic" and $old.congestion_control != null then .congestion_control=$old.congestion_control else . end
+        | if $old.type == "tuic" then
+            if ($old|has("congestion_control")) then .congestion_control=$old.congestion_control else del(.congestion_control) end
+          else . end
         | if $old.type == "hysteria2" then
             if $updated[0].obfs == null then del(.obfs) else .obfs=$updated[0].obfs end
           else . end
         | if $old.listen == null then del(.listen) else . end' "$work/original.json" >"$work/updated.json" || exit 1
+    if [[ -n $quic_bbr_choice ]]; then
+        prepare_quic_bbr_wizard "$work/updated.json" "$quic_bbr_choice" "$record_source" "$work/quic-record-update.json" >"$work/quic-updated.json" || exit 1
+        mv -- "$work/quic-updated.json" "$work/updated.json" || exit 1
+        quic_record=$(cat "$work/quic-record-update.json") || exit 1
+    fi
     info "待保存：$old_tag → $tag，端口 $port。"
     if ! confirm "保存修改？运行中的服务将按需重启，失败时回滚；修改认证或端口后需重新导入客户端链接。"; then
         info "已取消，配置未修改。"; exit 0
     fi
-    replace_inbound_file "$old_tag" "$work/updated.json" "$server" "$public_key" "$work/original.json"
+    replace_inbound_file "$old_tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" "$quic_record" "$expected_metadata"
 )
 
 set_default_server() (
@@ -1876,6 +1938,7 @@ add_wizard_locked() (
     require_core || exit 1
     local choice protocol tag port credential extra="" private_key="" public_key="" short_id="" server="" pair work file
     local tls_name="" certificate="" tls_key="" password="" obfs_password="" default_server=""
+    local quic_bbr_choice="" quic_record=""
     printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n 18. VLESS + TCP + TLS\n  0. 返回\n'
     prompt choice "请选择" 1 || exit 1
     case "$choice" in
@@ -1916,6 +1979,7 @@ add_wizard_locked() (
     esac
     [[ $protocol != tuic ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
     [[ $protocol != hysteria2 ]] || prompt_hysteria2_obfs obfs_password || exit 1
+    if [[ $protocol == hysteria2 || $protocol == tuic ]]; then prompt_quic_bbr quic_bbr_choice || exit 1; fi
     case "$protocol" in
         vless-ws|vless-ws-tls|vmess-ws|vmess-ws-tls)
             [[ $protocol == *-tls ]] || warn "此模板未启用 TLS；可配合 TLS 反向代理使用。"
@@ -1956,8 +2020,13 @@ add_wizard_locked() (
     trap 'rm -rf -- "$work"' EXIT
     generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$short_id" \
         "$tls_name" "$certificate" "$tls_key" "$password" "$obfs_password" >"$work/inbound.json" || exit 1
+    if [[ -n $quic_bbr_choice ]]; then
+        prepare_quic_bbr_wizard "$work/inbound.json" "$quic_bbr_choice" - "$work/quic-record-update.json" >"$work/quic-inbound.json" || exit 1
+        mv -- "$work/quic-inbound.json" "$work/inbound.json" || exit 1
+        quic_record=$(cat "$work/quic-record-update.json") || exit 1
+    fi
     [[ -z $server ]] || generate_client "$work/inbound.json" "$server" "$public_key" >/dev/null || exit 1
-    add_managed_inbound "$work/inbound.json" "$server" "$public_key" || exit 1
+    add_managed_inbound "$work/inbound.json" "$server" "$public_key" "$quic_record" || exit 1
     info "已添加 $tag，端口 $((10#$port))。请在服务器防火墙和云安全组放行对应端口。"
     case "$protocol" in
         hysteria2|tuic) info "该模板监听 UDP，请放行 UDP 端口。" ;;
@@ -2171,7 +2240,7 @@ delete_inbound() (
 # shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 add_managed_inbound() (
     umask 077
-    local file=$1 server=${2:-} public_key=${3:-} work tag port
+    local file=$1 server=${2:-} public_key=${3:-} quic_record=${4:-} work tag port
     require_core && safe_paths || exit 1
     tag=$(jq -er .tag "$file") && port=$(jq -er .listen_port "$file") || exit 1
     valid_tag "$tag" && valid_port "$port" || exit 1
@@ -2182,9 +2251,14 @@ add_managed_inbound() (
     if have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then fail "端口已被占用。"; exit 1; fi
     work=$(mktemp -d "$STATE_DIR/add-save.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
+    if [[ -n $quic_record ]]; then
+        printf '%s\n' "$quic_record" >"$work/quic-record.json" || exit 1
+        generate_quic_bbr_restore "$file" "$work/quic-record.json" >/dev/null || exit 1
+    fi
     snapshot_bundle >"$work/before.json" || exit 1
-    jq --arg tag "$tag" --arg server "$server" --arg key "$public_key" --slurpfile node "$file" \
-        '.config.inbounds += [$node[0]] | .clients[$tag]={server:$server,public_key:$key,inbound:$node[0]}' \
+    jq --arg tag "$tag" --arg server "$server" --arg key "$public_key" --slurpfile node "$file" --arg record "$quic_record" \
+        '.config.inbounds += [$node[0]] | .clients[$tag]={server:$server,public_key:$key,inbound:$node[0]}
+         | if $record!="" then .clients[$tag].quic_bbr_restore=($record|fromjson) else . end' \
         "$work/before.json" >"$work/after.json" || exit 1
     apply_bundle "$work/after.json"
 )

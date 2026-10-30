@@ -741,6 +741,8 @@ printf 'INVALID_REJECTED\n'
                             *) printf -v "$variable" '%s' '' ;;
                         esac
                     }
+                    prompt_quic_bbr() { printf -v "$1" 2; }
+                    prepare_quic_bbr_wizard() { : >"$4"; cat -- "$1"; }
                     generate_inbound() { printf '%s\n' "$1" >> "$TEST_ROUTE_LOG"; printf '{"type":"direct","tag":"route"}\n'; }
                     add_managed_inbound() { return 0; }
                     atomic_copy() { return 0; }
@@ -1259,6 +1261,8 @@ printf 'INVALID_REJECTED\n'
                     *) printf -v "$variable" '%s' '' ;;
                 esac
             }
+            prompt_quic_bbr() { printf -v "$1" 2; }
+            prepare_quic_bbr_wizard() { : >"$4"; cat -- "$1"; }
             generate_inbound() { printf '{"type":"direct","tag":"wizard-default"}\n'; }
             generate_client() { return 0; }
             add_managed_inbound() { return 0; }
