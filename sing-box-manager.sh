@@ -653,6 +653,7 @@ commit_config() (
 
 # Check listening transports, not the TCP/UDP traffic carried inside a proxy.
 # Listen addresses remain conservative: overlapping transports share no port.
+# shellcheck disable=SC2016 # json_query filters use literal jq variables.
 check_inbound_conflicts() {
     local file=$1 excluded=${2:-} config=${3:-$CONFIG_FILE} result port network flag
     result=$(json_query "$config" --slurpfile node "$file" --arg excluded "$excluded" '
