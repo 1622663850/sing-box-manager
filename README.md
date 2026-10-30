@@ -215,7 +215,7 @@ sudo sing-box diagnose                         # 只读诊断，发现问题返�
 
 ### 网络配置
 
-- 在云安全组和服务器防火墙放行所选监听端口。VLESS、VMess、AnyTLS 使用 TCP，Hysteria 2 和 TUIC 使用 UDP，Shadowsocks 使用 TCP 和 UDP；脚本不自动修改防火墙。同端口的 TCP/UDP 共用仍按原有保守冲突检查拒绝，请为各节点选择不同端口。
+- 在云安全组和服务器防火墙放行所选监听端口。VLESS、VMess、AnyTLS 使用 TCP，Hysteria 2 和 TUIC 使用 UDP，Shadowsocks 使用 TCP 和 UDP；脚本不自动修改防火墙。v1.20.1 起，新增、单个 JSON 导入和修改配置按监听协议检查端口：例如 Hy2 使用 UDP 443，VLESS + REALITY 可以同时使用 TCP 443；相同协议的同号端口仍拒绝。Shadowsocks 默认同时占用 TCP/UDP，显式设置 `network` 时按该设置检查。名称仍必须唯一；不同监听地址下的同协议同端口仍按保守方式拒绝。
 - WS / TCP 的“无 TLS”模板不提供传输层加密，可用于已有安全隧道或由反向代理提供 TLS 的部署；客户端必须与实际部署一致。
 - REALITY 握手域名由使用者选择，需从服务器访问并适合 TLS 1.3 握手；配置检查不能代替实际连接验证。
 - Shadowsocks 2022 客户端与服务器需保持实际时钟同步，不要求使用相同的显示时区。

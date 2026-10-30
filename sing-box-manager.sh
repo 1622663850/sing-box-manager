@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.20.0"
+SB_MANAGER_VERSION="1.20.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -651,6 +651,43 @@ commit_config() (
     fi
 )
 
+# Check listening transports, not the TCP/UDP traffic carried inside a proxy.
+# Listen addresses remain conservative: overlapping transports share no port.
+check_inbound_conflicts() {
+    local file=$1 excluded=${2:-} config=${3:-$CONFIG_FILE} result port network flag
+    result=$(json_query "$config" --slurpfile node "$file" --arg excluded "$excluded" '
+      def networks:
+        if .type == "hysteria2" or .type == "tuic" or .type == "hysteria" then ["udp"]
+        elif .type == "vless" or .type == "vmess" or .type == "trojan" then
+          if .transport.type == "quic" then ["udp"] else ["tcp"] end
+        elif .type == "anytls" or .type == "shadowtls" or .type == "http" or
+             .type == "socks" or .type == "mixed" then ["tcp"]
+        elif .type == "shadowsocks" or .type == "direct" or .type == "naive" then
+          if .network == "tcp" then ["tcp"] elif .network == "udp" then ["udp"]
+          else ["tcp","udp"] end
+        else ["tcp","udp"] end;
+      ($node[0] | networks) as $wanted |
+      {port:$node[0].listen_port,
+       conflict:any(.inbounds[]?; .tag != $excluded and
+         (.tag == $node[0].tag or (.listen_port == $node[0].listen_port and
+          ((networks) - $wanted | length) < (networks | length)))),
+       networks:$wanted,
+       owned:[.inbounds[]? | select(.tag == $excluded and .listen_port == $node[0].listen_port) |
+         networks[]]}') || return 1
+    if [[ $(jq -r .conflict <<<"$result") == true ]]; then
+        fail "现有配置已使用该名称，或相同 TCP/UDP 协议的端口。"; return 1
+    fi
+    have ss || return 0
+    port=$(jq -r .port <<<"$result") || return 1
+    for network in $(jq -r '.networks - .owned | .[]' <<<"$result"); do
+        case "$network" in tcp) flag=-lnt ;; udp) flag=-lnu ;; esac
+        if [[ -n $(ss -H "$flag" "sport = :$port" 2>/dev/null) ]]; then
+            fail "端口 $port/$network 正被其他服务占用。"; return 1
+        fi
+    done
+    return 0
+}
+
 # shellcheck disable=SC2016 # config_jq filters use literal jq variables.
 add_inbound_file() (
     umask 077
@@ -667,13 +704,7 @@ add_inbound_file() (
     tag=$(jq -r '.tag' "$file") && port=$(jq -r '.listen_port' "$file") || exit 1
     valid_tag "$tag" || { fail "tag 只能包含字母、数字、短横线、下划线，长度 1–64。"; exit 1; }
     valid_port "$port" || { fail "端口必须为 1–65535 的整数。"; exit 1; }
-    if config_jq -e --arg tag "$tag" --argjson port "$port" \
-        'any(.inbounds[]?; .tag == $tag or .listen_port == $port)' >/dev/null; then
-        fail "现有配置已使用该 tag 或端口。"; exit 1
-    fi
-    if have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then
-        fail "端口 $port 正被其他服务占用。"; exit 1
-    fi
+    check_inbound_conflicts "$file" || exit 1
     candidate="$work/candidate.json"
     config_jq --slurpfile node "$file" '.inbounds = ((.inbounds // []) + [$node[0]])' \
         >"$candidate" || exit 1
@@ -1568,7 +1599,7 @@ replace_inbound_file() (
     local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
     local quic_record=${6:-} expected_metadata=${7:-}
     local activation=${8:-preserve} start_requested=0
-    local tag port old_port work snapshot old_metadata new_metadata effective backup=""
+    local tag port work snapshot old_metadata new_metadata effective backup=""
     local transaction=0 old_metadata_exists=0 active=0 changed=0
     require_core && safe_paths || exit 1
     case "$activation" in preserve|start) ;; *) fail "未知的服务启动策略。"; exit 1;; esac
@@ -1621,17 +1652,10 @@ replace_inbound_file() (
         fail "修改配置不切换协议类型，请分别添加所需协议。"; exit 1;
     }
     detect_inbound_template "$file" >/dev/null || exit 1
-    if json_query "$snapshot" -e --arg old "$old_tag" --arg tag "$tag" --argjson port "$port" \
-        'any(.inbounds[]?; .tag != $old and (.tag==$tag or .listen_port==$port))' >/dev/null; then
-        fail "其他配置已使用该名称或端口。"; exit 1
-    fi
+    check_inbound_conflicts "$file" "$old_tag" "$snapshot" || exit 1
     if [[ $tag != "$old_tag" ]] && json_query "$snapshot" -e --arg old "$old_tag" \
         'del(.inbounds[] | select(.tag==$old)) | any(.. | strings; .==$old)' >/dev/null; then
         fail "原名称被路由或其他配置引用，请保留名称或通过完整 JSON 同步修改引用。"; exit 1
-    fi
-    old_port=$(jq -r .listen_port "$work/old-inbound.json") || exit 1
-    if [[ $port != "$old_port" ]] && have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then
-        fail "端口 $port 正被其他服务占用。"; exit 1
     fi
     old_metadata="$CLIENT_DIR/$old_tag.json"
     new_metadata="$CLIENT_DIR/$tag.json"
@@ -2467,10 +2491,7 @@ add_managed_inbound() (
     tag=$(jq -er .tag "$file") && port=$(jq -er .listen_port "$file") || exit 1
     valid_tag "$tag" && valid_port "$port" || exit 1
     [[ -z $server ]] || valid_host "$server" || exit 1
-    if config_jq -e --arg tag "$tag" --argjson port "$port" 'any(.inbounds[]?; .tag==$tag or .listen_port==$port)' >/dev/null; then
-        fail "现有配置已使用该 tag 或端口。"; exit 1
-    fi
-    if have ss && [[ -n $(ss -H -lntu "sport = :$port" 2>/dev/null) ]]; then fail "端口已被占用。"; exit 1; fi
+    check_inbound_conflicts "$file" || exit 1
     work=$(mktemp -d "$STATE_DIR/add-save.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     if [[ -n $quic_record ]]; then

@@ -402,6 +402,82 @@ def run_reality_loopback_smoke(
             )
 
 
+def run_shared_port_loopback_smoke(
+    core: Path, manager: Path, environment: dict[str, str], work: Path, payload: bytes,
+) -> None:
+    """Run VLESS TCP REALITY and Hysteria2 on one TCP/UDP port."""
+    certificate, private_key = tls_material(work)
+    pair = command([str(core), "generate", "reality-keypair"])
+    private_match = re.search(r"PrivateKey:\s*(\S+)", pair)
+    public_match = re.search(r"PublicKey:\s*(\S+)", pair)
+    if not private_match or not public_match:
+        raise RuntimeError("Could not parse core-generated REALITY keypair")
+    service_port, target_tls_port, reality_proxy_port, hysteria_proxy_port = (
+        free_port(), free_port(), free_port(), free_port(),
+    )
+    while target_tls_port == service_port:
+        target_tls_port = free_port()
+    while reality_proxy_port in {service_port, target_tls_port}:
+        reality_proxy_port = free_port()
+    while hysteria_proxy_port in {service_port, target_tls_port, reality_proxy_port}:
+        hysteria_proxy_port = free_port()
+    reality_inbound = bash_json(
+        manager, environment, "generate_inbound", "vless-reality", "shared-reality",
+        str(service_port), command([str(core), "generate", "uuid"]).strip(), "localhost",
+        private_match.group(1), "0123456789abcdef",
+    )
+    reality_inbound["listen"] = LOOPBACK
+    reality_inbound["tls"]["reality"]["handshake"] = {
+        "server": LOOPBACK, "server_port": target_tls_port,
+    }
+    hysteria_inbound = bash_json(
+        manager, environment, "generate_inbound", "hysteria2", "shared-hysteria",
+        str(service_port), "shared-hysteria-password", "", "", "", "localhost",
+        str(certificate), str(private_key), "",
+    )
+    hysteria_inbound["listen"] = LOOPBACK
+    server = server_config(reality_inbound)
+    server["inbounds"].append(hysteria_inbound)
+    server_file = work / "shared-port-server.json"
+    reality_file = work / "shared-port-reality-inbound.json"
+    hysteria_file = work / "shared-port-hysteria-inbound.json"
+    write_json(server_file, server)
+    write_json(reality_file, reality_inbound)
+    write_json(hysteria_file, hysteria_inbound)
+    reality_outbound = bash_json(
+        manager, environment, "generate_client", str(reality_file), LOOPBACK, public_match.group(1),
+    )
+    hysteria_outbound = bash_json(
+        manager, environment, "generate_client", str(hysteria_file), LOOPBACK,
+    )
+    if hysteria_outbound.get("tls", {}).get("insecure", False):
+        raise RuntimeError("shared Hysteria2 client uses insecure TLS")
+    hysteria_outbound.setdefault("tls", {})["certificate"] = certificate.read_text(encoding="utf-8")
+    reality_client_file = work / "shared-port-reality-client.json"
+    hysteria_client_file = work / "shared-port-hysteria-client.json"
+    write_json(reality_client_file, client_config(reality_outbound, reality_proxy_port))
+    write_json(hysteria_client_file, client_config(hysteria_outbound, hysteria_proxy_port))
+    check(core, server_file, work)
+    check(core, reality_client_file, work)
+    check(core, hysteria_client_file, work)
+    with http_target(payload) as target_port:
+        with udp_echo_target() as udp_target:
+            with running_tls_target(certificate, private_key, target_tls_port, work):
+                with running_core(core, server_file, service_port, work):
+                    with running_core(core, reality_client_file, reality_proxy_port, work):
+                        if fetch_through_socks_retry(
+                            reality_proxy_port, target_port, "/shared/vless-reality",
+                        ) != payload:
+                            raise RuntimeError("shared VLESS REALITY forwarding mismatch")
+                    with running_core(core, hysteria_client_file, hysteria_proxy_port, work):
+                        if fetch_through_socks_retry(
+                            hysteria_proxy_port, target_port, "/shared/hysteria2",
+                        ) != payload:
+                            raise RuntimeError("shared Hysteria2 forwarding mismatch")
+                        check_udp_through_socks(hysteria_proxy_port, udp_target)
+    print("PASS shared-port: VLESS REALITY TCP and Hysteria2 UDP forwarded on one port", flush=True)
+
+
 def run_extended_smoke(core: Path, manager: Path, environment: dict[str, str], work: Path, payload: bytes) -> None:
     """Exercise every added transport with a real server/client loopback pair.
 
@@ -614,6 +690,7 @@ def run_smoke(core: Path, manager: Path) -> None:
         print("PASS vless-reality: real core accepted server and client configs (schema only)", flush=True)
         run_extended_smoke(core, manager, environment, work, payload)
         run_reality_loopback_smoke(core, manager, environment, work, payload)
+        run_shared_port_loopback_smoke(core, manager, environment, work, payload)
     print("All smoke checks passed; temporary files and child processes cleaned up.", flush=True)
 
 
