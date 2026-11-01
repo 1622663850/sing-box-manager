@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.21.1"
+SB_MANAGER_VERSION="1.22.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -3205,6 +3205,777 @@ open_acme_menu() {
     bash "$script" 9>&-
 }
 
+parse_outbound_links() {
+    local input=${1:-}
+    [[ $# -eq 1 && -f $input && ! -L $input ]] || {
+        printf '%s\n' '分享链接解析失败。' >&2
+        return 1
+    }
+    python3 - "$input" <<'PY_OUTBOUND_LINKS'
+from __future__ import annotations
+
+import base64
+import hashlib
+import ipaddress
+import json
+from pathlib import Path
+import re
+import sys
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+
+class ParseError(Exception):
+    pass
+
+
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
+FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def fail() -> None:
+    raise ParseError
+
+
+def decode_b64(value: str) -> bytes:
+    if not value or any(char.isspace() for char in value):
+        fail()
+    raw = value.encode("ascii", "strict")
+    if not re.fullmatch(rb"[A-Za-z0-9+/_-]+={0,2}", raw) or len(raw.rstrip(b"=")) % 4 == 1:
+        fail()
+    padded = raw + b"=" * ((4 - len(raw) % 4) % 4)
+    try:
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+    except (ValueError, UnicodeError, base64.binascii.Error):
+        fail()
+    if not decoded:
+        fail()
+    return decoded
+
+
+def decode_b64_text(value: str) -> str:
+    try:
+        return decode_b64(value).decode("utf-8")
+    except (UnicodeDecodeError, ParseError):
+        fail()
+
+
+def valid_host(host: str) -> bool:
+    if not host or any(ord(char) < 0x21 or ord(char) == 0x7F for char in host):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return bool(HOST_RE.fullmatch(host)) and ".." not in host
+
+
+def endpoint(parts) -> tuple[str, int]:
+    if not parts.hostname or not valid_host(parts.hostname):
+        fail()
+    try:
+        port = parts.port
+    except ValueError:
+        fail()
+    if port is None or not 1 <= port <= 65535:
+        fail()
+    return parts.hostname, port
+
+
+def query_values(parts, allowed: set[str]) -> dict[str, str]:
+    if parts.query and any(char in parts.query for char in "\r\n"):
+        fail()
+    values = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
+    result: dict[str, str] = {}
+    for key, value in values:
+        if key not in allowed or key in result:
+            fail()
+        result[key] = value
+    return result
+
+
+def alpn(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    values = value.split(",")
+    if not values or any(not item or len(item) > 64 for item in values):
+        fail()
+    return values
+
+
+def uuid(value: str) -> str:
+    if not UUID_RE.fullmatch(value):
+        fail()
+    return value
+
+
+def tag(raw: str, preferred: str) -> str:
+    value = unquote(preferred) if preferred else ""
+    if TAG_RE.fullmatch(value):
+        return value
+    return "import-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def tls_fields(result: dict, query: dict[str, str], default_name: str, reality: bool = False) -> None:
+    name = query.get("sni", default_name)
+    if name and not valid_host(name):
+        fail()
+    tls: dict = {"enabled": True}
+    if name:
+        tls["server_name"] = name
+    names = alpn(query.get("alpn"))
+    if names is not None:
+        tls["alpn"] = names
+    if reality:
+        public_key = query.get("pbk")
+        short_id = query.get("sid")
+        if not public_key or not re.fullmatch(r"[A-Za-z0-9_-]{43}", public_key):
+            fail()
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{2}){0,8}", short_id or ""):
+            fail()
+        fingerprint = query.get("fp", "chrome")
+        if not FINGERPRINT_RE.fullmatch(fingerprint):
+            fail()
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+        tls["reality"] = {"enabled": True, "public_key": public_key, "short_id": short_id}
+    elif "fp" in query:
+        fingerprint = query["fp"]
+        if not FINGERPRINT_RE.fullmatch(fingerprint):
+            fail()
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+    result["tls"] = tls
+
+
+def userinfo(parts) -> tuple[str, str]:
+    if "@" not in parts.netloc:
+        fail()
+    return unquote(parts.username or ""), unquote(parts.password or "")
+
+
+def parse_vless(raw: str, parts, name: str) -> dict:
+    user, password = userinfo(parts)
+    if password or not user:
+        fail()
+    host, port = endpoint(parts)
+    query = query_values(
+        parts,
+        {"encryption", "type", "security", "flow", "fp", "sni", "pbk", "sid", "alpn",
+         "path", "host", "serviceName", "mode"},
+    )
+    if query.get("encryption", "none") != "none":
+        fail()
+    transport = query.get("type", "tcp")
+    if transport not in {"tcp", "ws", "grpc"}:
+        fail()
+    security = query.get("security", "none")
+    if security not in {"none", "tls", "reality"}:
+        fail()
+    result = {"type": "vless", "tag": name, "server": host, "server_port": port, "uuid": uuid(user)}
+    if transport == "ws":
+        path = query.get("path")
+        if not path or not path.startswith("/"):
+            fail()
+        result["transport"] = {"type": "ws", "path": path}
+        if "host" in query:
+            if not valid_host(query["host"]):
+                fail()
+            result["transport"]["headers"] = {"Host": query["host"]}
+    elif transport == "grpc":
+        service = query.get("serviceName")
+        if not service or query.get("mode", "gun") != "gun":
+            fail()
+        result["transport"] = {"type": "grpc", "service_name": service}
+    for key in ("path", "host", "serviceName", "mode"):
+        if key in query and ((transport == "ws" and key not in {"path", "host"}) or
+                             (transport == "grpc" and key not in {"serviceName", "mode"}) or
+                             transport == "tcp"):
+            fail()
+    if security == "reality":
+        if transport not in {"tcp", "grpc"}:
+            fail()
+        tls_fields(result, query, host, reality=True)
+        if "flow" in query:
+            if query["flow"] != "xtls-rprx-vision":
+                fail()
+            if transport == "grpc":
+                fail()
+            result["flow"] = query["flow"]
+    elif security == "tls":
+        if any(key in query for key in ("flow", "pbk", "sid")):
+            fail()
+        tls_fields(result, query, host)
+    elif any(key in query for key in ("flow", "fp", "pbk", "sid", "sni", "alpn")):
+        fail()
+    return result
+
+
+def parse_vmess(raw: str, parts) -> dict:
+    if parts.query:
+        fail()
+    encoded = parts.path.lstrip("/") or parts.netloc
+    value = json.loads(decode_b64_text(encoded))
+    if not isinstance(value, dict):
+        fail()
+    allowed = {"v", "ps", "add", "port", "id", "aid", "scy", "net", "type", "host",
+               "path", "tls", "sni", "alpn", "fp"}
+    if set(value) - allowed:
+        fail()
+    host = value.get("add")
+    if not isinstance(host, str) or not valid_host(host):
+        fail()
+    try:
+        port = int(value["port"])
+        aid = int(value.get("aid", 0))
+    except (KeyError, TypeError, ValueError):
+        fail()
+    if not 1 <= port <= 65535 or aid < 0:
+        fail()
+    security = str(value.get("scy", "auto"))
+    if security not in {"auto", "none", "aes-128-gcm", "chacha20-poly1305", "zero"}:
+        fail()
+    result = {
+        "type": "vmess", "tag": tag(raw, str(value.get("ps", ""))),
+        "server": host, "server_port": port, "uuid": uuid(str(value.get("id", ""))),
+        "security": security, "alter_id": aid,
+    }
+    network = value.get("net", "tcp")
+    if network not in {"tcp", "ws", "grpc"}:
+        fail()
+    if network == "ws":
+        path = str(value.get("path", ""))
+        if not path.startswith("/"):
+            fail()
+        result["transport"] = {"type": "ws", "path": path}
+        if value.get("host"):
+            if not valid_host(str(value["host"])):
+                fail()
+            result["transport"]["headers"] = {"Host": str(value["host"])}
+    elif network == "grpc":
+        if value.get("type", "gun") != "gun" or not value.get("path"):
+            fail()
+        result["transport"] = {"type": "grpc", "service_name": str(value["path"])}
+    elif value.get("path") or value.get("host") or value.get("type") not in {None, "none"}:
+        fail()
+    tls_mode = str(value.get("tls", ""))
+    if tls_mode not in {"", "tls"}:
+        fail()
+    if tls_mode:
+        query = {"sni": str(value.get("sni", host))}
+        if value.get("alpn"):
+            query["alpn"] = str(value["alpn"])
+        if value.get("fp"):
+            query["fp"] = str(value["fp"])
+        tls_fields(result, query, host)
+    elif any(value.get(key) for key in ("sni", "alpn", "fp")):
+        fail()
+    return result
+
+
+def parse_hysteria2(raw: str, parts, name: str) -> dict:
+    user, password = userinfo(parts)
+    credential = password or user
+    if not credential:
+        fail()
+    host, port = endpoint(parts)
+    query = query_values(parts, {"sni", "alpn", "obfs", "obfs-password", "insecure"})
+    if query.get("insecure", "0").lower() in {"1", "true", "yes"}:
+        fail()
+    result = {"type": "hysteria2", "tag": name, "server": host, "server_port": port, "password": credential}
+    tls_fields(result, query, host)
+    if "obfs" in query:
+        if query["obfs"] != "salamander" or not query.get("obfs-password"):
+            fail()
+        result["obfs"] = {"type": "salamander", "password": query["obfs-password"]}
+    return result
+
+
+def parse_tuic(raw: str, parts, name: str) -> dict:
+    user, password = userinfo(parts)
+    host, port = endpoint(parts)
+    query = query_values(parts, {"sni", "alpn", "congestion_control", "udp_relay_mode"})
+    if query.get("congestion_control", "cubic") not in {"cubic", "new_reno", "bbr"}:
+        fail()
+    if query.get("udp_relay_mode", "native") not in {"native", "quic"}:
+        fail()
+    if not password:
+        fail()
+    result = {
+        "type": "tuic", "tag": name, "server": host, "server_port": port,
+        "uuid": uuid(user), "password": password,
+        "congestion_control": query.get("congestion_control", "cubic"),
+    }
+    tls_fields(result, query, host)
+    return result
+
+
+def parse_anytls(raw: str, parts, name: str) -> dict:
+    user, password = userinfo(parts)
+    credential = password or user
+    if not credential:
+        fail()
+    host, port = endpoint(parts)
+    query = query_values(parts, {"sni", "alpn"})
+    result = {"type": "anytls", "tag": name, "server": host, "server_port": port, "password": credential}
+    tls_fields(result, query, host)
+    return result
+
+
+def parse_ss(raw: str, parts, name: str) -> dict:
+    if parts.query:
+        fail()
+    if "@" in parts.netloc:
+        method, password = userinfo(parts)
+        host, port = endpoint(parts)
+        if not password:
+            decoded = decode_b64_text(method)
+            if ":" not in decoded:
+                fail()
+            method, password = decoded.split(":", 1)
+        if not method or not password:
+            fail()
+    elif parts.netloc and not parts.path:
+        decoded = decode_b64_text(parts.netloc)
+        if "@" not in decoded:
+            fail()
+        credentials, address = decoded.rsplit("@", 1)
+        if ":" not in credentials:
+            fail()
+        method, password = credentials.split(":", 1)
+        host, port = endpoint(urlsplit("ss://" + address))
+    else:
+        decoded = decode_b64_text(parts.path.lstrip("/"))
+        if "@" not in decoded:
+            fail()
+        credentials, address = decoded.rsplit("@", 1)
+        if ":" not in credentials:
+            fail()
+        method, password = credentials.split(":", 1)
+        fake = urlsplit("ss://" + address)
+        host, port = endpoint(fake)
+    if not method or not password:
+        fail()
+    return {"type": "shadowsocks", "tag": name, "server": host, "server_port": port,
+            "method": unquote(method), "password": unquote(password)}
+
+
+def parse_trojan(raw: str, parts, name: str) -> dict:
+    user, password = userinfo(parts)
+    credential = password or user
+    if not credential:
+        fail()
+    host, port = endpoint(parts)
+    query = query_values(parts, {"security", "sni", "alpn", "fp", "type", "path", "host", "serviceName", "mode", "insecure"})
+    if query.get("security", "tls") not in {"tls", ""} or query.get("insecure", "0") in {"1", "true"}:
+        fail()
+    result = {"type": "trojan", "tag": name, "server": host, "server_port": port, "password": credential}
+    transport = query.get("type", "tcp")
+    if transport == "ws":
+        path = query.get("path", "")
+        if not path.startswith("/"):
+            fail()
+        result["transport"] = {"type": "ws", "path": path}
+        if query.get("host"):
+            if not valid_host(query["host"]):
+                fail()
+            result["transport"]["headers"] = {"Host": query["host"]}
+    elif transport == "grpc":
+        if not query.get("serviceName") or query.get("mode", "gun") != "gun":
+            fail()
+        result["transport"] = {"type": "grpc", "service_name": query["serviceName"]}
+    elif transport != "tcp":
+        fail()
+    tls_fields(result, query, host)
+    return result
+
+
+def parse_socks(raw: str, parts, name: str) -> dict:
+    user = password = ""
+    if "@" in parts.netloc:
+        user, password = userinfo(parts)
+    host, port = endpoint(parts)
+    if parts.query:
+        fail()
+    result = {"type": "socks", "tag": name, "server": host, "server_port": port}
+    if user:
+        result["username"] = user
+    if password:
+        result["password"] = password
+    return result
+
+
+def parse_http(raw: str, parts, name: str) -> dict:
+    user = password = ""
+    if "@" in parts.netloc:
+        user, password = userinfo(parts)
+    host, port = endpoint(parts)
+    if parts.query:
+        fail()
+    result = {"type": "http", "tag": name, "server": host, "server_port": port}
+    if user:
+        result["username"] = user
+    if password:
+        result["password"] = password
+    if parts.scheme == "https":
+        tls_fields(result, {}, host)
+    return result
+
+
+def parse_line(raw: str) -> dict:
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        fail()
+    scheme = parts.scheme.lower()
+    preferred = unquote(parts.fragment)
+    if scheme == "vmess":
+        result = parse_vmess(raw, parts)
+        result["tag"] = tag(raw, preferred or result["tag"])
+        return result
+    name = tag(raw, preferred)
+    if scheme == "vless":
+        return parse_vless(raw, parts, name)
+    if scheme in {"hysteria2", "hy2"}:
+        return parse_hysteria2(raw, parts, name)
+    if scheme == "tuic":
+        return parse_tuic(raw, parts, name)
+    if scheme == "anytls":
+        return parse_anytls(raw, parts, name)
+    if scheme == "ss":
+        return parse_ss(raw, parts, name)
+    if scheme == "trojan":
+        return parse_trojan(raw, parts, name)
+    if scheme in {"socks5", "socks5h"}:
+        return parse_socks(raw, parts, name)
+    if scheme in {"http", "https"}:
+        return parse_http(raw, parts, name)
+    fail()
+
+
+def main() -> int:
+    try:
+        path = Path(sys.argv[1])
+        lines = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        if not lines:
+            fail()
+        print(json.dumps([parse_line(line) for line in lines], ensure_ascii=False, separators=(",", ":")))
+        return 0
+    except (OSError, ParseError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        print("分享链接解析失败。", file=sys.stderr)
+        return 1
+
+
+raise SystemExit(main())
+PY_OUTBOUND_LINKS
+}
+
+
+normalize_outbound_import() (
+    umask 077
+    local file=$1 work
+    [[ -f $file && ! -L $file && $(stat -c '%s' "$file") -le 1048576 ]] || {
+        fail "导入文件须为不超过 1 MiB 的普通文件。"; exit 1;
+    }
+    work=$(mktemp -d "$STATE_DIR/outbound-import.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -- "$file" "$work/source" || exit 1
+    if json_query "$work/source" . >"$work/json" 2>/dev/null; then
+        jq -e 'if type=="array" then .
+          elif type=="object" and has("type") then [.]
+          elif type=="object" and keys==["outbounds"] then .outbounds
+          else error("not outbound JSON") end | if type=="array" and length>0 then . else error("empty import") end' \
+          "$work/json" 2>/dev/null || { fail "请导入单个 outbound、数组或仅含 outbounds 的 JSON。"; exit 1; }
+    else parse_outbound_links "$work/source"; fi
+)
+
+# shellcheck disable=SC2016 # json_query filters use literal jq variables.
+add_outbounds_file_locked() (
+    umask 077
+    local file=$1 work tag backup
+    require_core && safe_paths || exit 1
+    work=$(mktemp -d "$STATE_DIR/outbound-add.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -- "$CONFIG_FILE" "$work/before.json" || exit 1
+    normalize_outbound_import "$file" >"$work/nodes.json" || exit 1
+    jq -e 'type=="array" and length>0 and all(.[]; type=="object" and
+      (.type|type=="string" and length>0) and (.tag|type=="string")) and
+      ([.[].tag]|length== (unique|length))' "$work/nodes.json" >/dev/null || { fail "出站格式无效或名称重复。"; exit 1; }
+    while IFS= read -r tag; do
+        valid_tag "$tag" || { fail "出站名称须为 1–64 位字母、数字、短横线或下划线。"; exit 1; }
+    done < <(jq -r '.[].tag' "$work/nodes.json")
+    if json_query "$work/before.json" -e --slurpfile nodes "$work/nodes.json" '
+      [(.outbounds[]?.tag),(.endpoints[]?.tag)] as $old | any($nodes[0][]; .tag as $t | $old|index($t)!=null)' >/dev/null; then
+        fail "已有相同名称的出站或 endpoint，导入已取消。"; exit 1
+    fi
+    json_query "$work/before.json" --slurpfile nodes "$work/nodes.json" '.outbounds=((.outbounds // [])+$nodes[0])' >"$work/after.json" || exit 1
+    validate_config "$work/after.json" >"$work/check.log" 2>&1 || { fail "出站未通过核心校验，未保存；请核对协议、认证、TLS 和 DNS 引用。"; exit 1; }
+    jq -r '["名称","协议"],(.[]|[.tag,.type]) | @tsv' "$work/nodes.json"
+    if jq -e 'any(.[]; .tls.insecure==true)' "$work/nodes.json" >/dev/null; then
+        warn "导入内容显式关闭了 TLS 证书校验，请确认远端配置可信。"
+    fi
+    info "仅新增出站，不改变入站绑定；运行中的服务会短暂重启，停止状态与自启保留。"
+    confirm "导入以上出站？（自动备份）" || exit 1
+    cmp -s "$work/before.json" "$CONFIG_FILE" || { fail "配置已变化，请重新导入。"; exit 1; }
+    backup=$(create_backup) || exit 1
+    commit_config "$work/after.json" >"$work/save.log" 2>&1 || { fail "保存出站失败，已执行原有回滚；请检查服务状态和备份。"; exit 1; }
+    info "出站已添加，成套备份：$backup"
+)
+
+# shellcheck disable=SC2016 # jq bundle filters use literal variables.
+bind_outbound_locked() (
+    umask 077
+    local inbound=$1 target=$2 work
+    require_core && safe_paths || exit 1
+    valid_tag "$inbound" && { [[ $target == - ]] || valid_tag "$target"; } || { fail "入站或出站名称无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/outbound-bind.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before.json" || exit 1
+    jq --arg i "$inbound" --arg o "$target" '
+      if ([.config.inbounds[]? | select(.tag==$i)]|length)!=1 then error("inbound not unique") else . end |
+      if $o!="-" and ([.config.outbounds[]? | select(.tag==$o)]|length)!=1 then error("outbound not unique") else . end |
+      (.clients[$i].outbound_route // null) as $record |
+      if $record!=null then
+        if $record.format!="sing-box-manager-outbound-route-v1" or
+           $record.rule != {inbound:[$i],action:"route",outbound:$record.rule.outbound} or
+           ([.config.route.rules[]? | select(.==$record.rule)]|length)!=1
+        then error("managed rule changed") else . end
+      else . end |
+      if $record==null and $o!="-" and any(.config.route.rules[]?; .=={inbound:[$i],action:"route",outbound:$o})
+      then error("identical unowned rule") else . end |
+      if $o=="-" and $record==null then .
+      else
+        .config.route.rules=((.config.route.rules // []) | map(select($record==null or .!=$record.rule))) |
+        if $o=="-" then
+          del(.clients[$i].outbound_route) |
+          if $record.created_metadata==true and .clients[$i]=={} then del(.clients[$i]) else . end
+        else
+          {inbound:[$i],action:"route",outbound:$o} as $rule |
+          .config.route.rules=([$rule]+.config.route.rules) |
+          (.clients|has($i)|not) as $created |
+          .clients[$i].outbound_route={format:"sing-box-manager-outbound-route-v1",rule:$rule,
+            created_metadata:(if $record!=null then ($record.created_metadata // false) else $created end)}
+        end
+      end' "$work/before.json" >"$work/after.json" 2>/dev/null || {
+        fail "绑定不存在、名称重复，或原面板绑定规则已被外部修改；未保存。"; exit 1;
+    }
+    if [[ $(jq -Sc '{config,clients}' "$work/before.json") == "$(jq -Sc '{config,clients}' "$work/after.json")" ]]; then
+        info "绑定设置未变化，无需保存或重启。"; exit 0
+    fi
+    jq .config "$work/after.json" >"$work/config.json" || exit 1
+    validate_config "$work/config.json" >"$work/check.log" 2>&1 || { fail "绑定未通过核心校验，请检查出站和现有路由。"; exit 1; }
+    if [[ $target == - ]]; then info "取消 $inbound 的面板出站绑定，恢复由其余路由规则及默认出站决定。"
+    else info "$inbound 的流量将优先使用出站 $target（此规则优先于已有路由规则）。"; fi
+    confirm "保存入站出站绑定？（自动备份，运行中的服务短暂重启）" || exit 1
+    snapshot_bundle >"$work/current.json" || exit 1
+    [[ $(jq -Sc . "$work/current.json") == "$(jq -Sc . "$work/before.json")" ]] || { fail "配置或连接信息已变化，请重试。"; exit 1; }
+    apply_bundle "$work/after.json" >"$work/save.log" 2>&1 || { fail "保存绑定失败，已执行原有配置及连接信息回滚；请检查服务状态和备份。"; exit 1; }
+    info "入站出站绑定已保存。"
+)
+
+# shellcheck disable=SC2016 # json_query filters use literal jq variables.
+delete_outbound_locked() (
+    umask 077
+    local tag=$1 work backup
+    require_core && safe_paths || exit 1
+    valid_tag "$tag" || { fail "出站名称无效。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/outbound-delete.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -- "$CONFIG_FILE" "$work/before.json" || exit 1
+    json_query "$work/before.json" -e --arg t "$tag" '(.outbounds|length)>1 and ([.outbounds[]|select(.tag==$t)]|length)==1' >/dev/null || { fail "出站不存在、名称重复或是最后一个出站，不能删除。"; exit 1; }
+    if json_query "$work/before.json" -e --arg t "$tag" 'del(.outbounds[]|select(.tag==$t)) | any(..|strings; .==$t)' >/dev/null; then
+        fail "出站仍被路由、detour 或选择器等引用，请先解除引用。"; exit 1
+    fi
+    json_query "$work/before.json" --arg t "$tag" '.outbounds|=map(select(.tag!=$t))' >"$work/after.json" || exit 1
+    validate_config "$work/after.json" >"$work/check.log" 2>&1 || { fail "删除后配置未通过校验，未保存。"; exit 1; }
+    confirm "删除出站 $tag？（自动备份）" || exit 1
+    cmp -s "$work/before.json" "$CONFIG_FILE" || { fail "配置已变化，请重试。"; exit 1; }
+    backup=$(create_backup) || exit 1
+    commit_config "$work/after.json" >"$work/save.log" 2>&1 || { fail "删除失败，已执行原有回滚；请检查服务状态和备份。"; exit 1; }
+    info "出站已删除，成套备份：$backup"
+)
+
+list_outbounds() {
+    require_core || return
+    config_jq -r '["序号","出站名称","协议","服务器","端口"],
+      ((.outbounds // [])|to_entries[]|[.key+1,.value.tag,.value.type,(.value.server // "-"),(.value.server_port // "-")]) |
+      map(if type=="string" then gsub("[[:cntrl:]]"; "?") else . end)|@tsv' || return
+    info "面板绑定（其余节点沿用原有路由）："
+    local name file
+    for file in "$CLIENT_DIR"/*.json; do
+        [[ -f $file && ! -L $file ]] || continue
+        name=${file##*/}; name=${name%.json}
+        jq -r --arg i "$name" 'select(.outbound_route!=null)|[$i,.outbound_route.rule.outbound]|map(gsub("[[:cntrl:]]";"?"))|@tsv' "$file" || return
+    done
+}
+
+select_outbound() {
+    local destination=$1 outbounds_snapshot outbounds_choice outbounds_tag outbounds_count
+    printf -v "$destination" '%s' ""
+    outbounds_snapshot=$(config_jq -c '.outbounds // []') || return
+    outbounds_count=$(jq length <<<"$outbounds_snapshot") || return
+    [[ $outbounds_count -gt 0 ]] || { info "暂无出站。"; return 0; }
+    jq -r '["序号","名称","协议"],(to_entries[]|[.key+1,.value.tag,.value.type])|
+      map(if type=="string" then gsub("[[:cntrl:]]";"?") else . end)|@tsv' <<<"$outbounds_snapshot"
+    prompt outbounds_choice "选择出站（序号或名称；纯数字名称用 name:名称；0 返回）" 0 || return
+    case "$outbounds_choice" in
+        0) return 0 ;;
+        name:*) outbounds_tag=${outbounds_choice#name:} ;;
+        *)
+            if [[ $outbounds_choice =~ ^[0-9]+$ ]]; then
+                [[ $outbounds_choice =~ ^[1-9][0-9]{0,5}$ ]] && (( outbounds_choice<=outbounds_count )) || { fail "出站序号无效。"; return 1; }
+                outbounds_tag=$(jq -r --argjson i "$((outbounds_choice-1))" '.[$i].tag' <<<"$outbounds_snapshot") || return
+            else outbounds_tag=$outbounds_choice; fi ;;
+    esac
+    valid_tag "$outbounds_tag" && jq -e --arg t "$outbounds_tag" '[.[]|select(.tag==$t)]|length==1' <<<"$outbounds_snapshot" >/dev/null || { fail "出站名称无效或重复。"; return 1; }
+    [[ $(config_jq -c '.outbounds // []') == "$outbounds_snapshot" ]] || { fail "出站列表已变化，请重新选择。"; return 1; }
+    printf -v "$destination" '%s' "$outbounds_tag"
+}
+
+import_outbound_wizard_locked() (
+    umask 077
+    local mode=$1 file work value line
+    work=$(mktemp -d "$STATE_DIR/outbound-paste.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    case "$mode" in
+        file) prompt file "出站 JSON/链接文本文件绝对路径" || exit 1 ;;
+        link)
+            prompt_secret value "粘贴分享链接（输入不回显）" || exit 1
+            printf '%s\n' "$value" >"$work/import"; file="$work/import" ;;
+        json)
+            [[ -t 0 ]] || exit 1
+            info "粘贴 outbound JSON（输入不回显），单独一行 END 结束；Ctrl+D 取消。"
+            file="$work/import"; : >"$file"
+            while true; do
+                IFS= read -r -s line || exit 1
+                [[ $line != END ]] || break
+                printf '%s\n' "$line" >>"$file"
+                [[ $(stat -c '%s' "$file") -le 1048576 ]] || { fail "内容超过 1 MiB。"; exit 1; }
+            done ;;
+        *) exit 1 ;;
+    esac
+    add_outbounds_file_locked "$file"
+)
+
+add_outbound_wizard_locked() (
+    umask 077
+    local choice kind tag server="" port=443 credential="" password="" user="" method="" security=none transport=tcp
+    local tls_name="" key="" sid="" flow="" path="" host="" cc=cubic obfs="" work
+    require_core && safe_paths || exit 1
+    printf '\n添加出站\n  1. VLESS\n  2. VMess\n  3. Hysteria 2\n  4. TUIC\n  5. AnyTLS\n  6. Shadowsocks\n  7. Trojan\n  8. SOCKS5\n  9. HTTP / HTTPS\n 10. 直连\n  0. 返回\n'
+    prompt choice "选择出站协议" 1 || exit 1
+    case "$choice" in 0) exit 0;; 1) kind=vless;; 2) kind=vmess;; 3) kind=hysteria2;; 4) kind=tuic;; 5) kind=anytls;; 6) kind=shadowsocks;; 7) kind=trojan;; 8) kind=socks;; 9) kind=http;; 10) kind=direct;; *) fail "无效协议。"; exit 1;; esac
+    prompt tag "出站名称（字母/数字/短横线/下划线）" "out-$kind-$(date +%H%M%S)" || exit 1
+    valid_tag "$tag" || { fail "出站名称无效。"; exit 1; }
+    if [[ $kind != direct ]]; then
+        prompt server "远端服务器 IP/域名（不含协议前缀）" || exit 1
+        prompt port "远端端口" 443 || exit 1
+        valid_host "$server" && valid_port "$port" || { fail "远端地址或端口无效。"; exit 1; }
+        port=$((10#$port))
+        case "$kind" in
+            vless|vmess|tuic) prompt_secret credential "远端已有用户 UUID" || exit 1 ;;
+            socks|http)
+                prompt user "用户名（无认证则回车）" || exit 1
+                [[ -z $user ]] || prompt_secret password "远端密码" || exit 1 ;;
+            shadowsocks)
+                prompt method "加密方法" 2022-blake3-aes-128-gcm || exit 1
+                prompt_secret password "远端已有密码/密钥" || exit 1 ;;
+            *) prompt_secret password "远端已有密码" || exit 1 ;;
+        esac
+        [[ $kind != tuic ]] || prompt_secret password "TUIC 远端已有密码" || exit 1
+        case "$kind" in
+            vless|vmess|trojan)
+                prompt choice "传输：1 TCP，2 WebSocket，3 gRPC，0 取消" 1 || exit 1
+                case "$choice" in 1) transport=tcp;; 2) transport=ws;; 3) transport=grpc;; 0) exit 0;; *) fail "无效传输。"; exit 1;; esac
+                if [[ $transport == ws ]]; then
+                    prompt path "WebSocket 路径" / || exit 1
+                    prompt host "WebSocket Host（可留空）" || exit 1
+                elif [[ $transport == grpc ]]; then prompt path "gRPC 服务名" TunService || exit 1; fi ;;
+        esac
+        case "$kind" in
+            hysteria2|tuic|anytls|trojan) security=tls ;;
+            vless)
+                prompt choice "安全：1 无 TLS，2 TLS，3 REALITY，0 取消" 2 || exit 1
+                case "$choice" in 1) security=none;; 2) security=tls;; 3) security=reality;; 0) exit 0;; *) exit 1;; esac ;;
+            vmess|http)
+                prompt choice "安全：1 无 TLS，2 TLS，0 取消" 2 || exit 1
+                case "$choice" in 1) security=none;; 2) security=tls;; 0) exit 0;; *) exit 1;; esac ;;
+        esac
+        if [[ $security != none ]]; then
+            prompt tls_name "远端 TLS SNI/服务器名称" "$server" || exit 1
+            valid_host "$tls_name" || { fail "TLS SNI 无效。"; exit 1; }
+            if [[ $security == reality ]]; then
+                prompt key "REALITY 远端公钥" || exit 1
+                prompt sid "REALITY short ID（可留空）" || exit 1
+                [[ $key =~ ^[a-zA-Z0-9_-]{43}$ && $sid =~ ^([a-fA-F0-9]{2}){0,8}$ ]] || { fail "REALITY 公钥或 short ID 无效。"; exit 1; }
+                if [[ $transport == tcp ]]; then
+                    prompt choice "Vision：1 开启，2 不开启，0 取消" 1 || exit 1
+                    case "$choice" in 1) flow=xtls-rprx-vision;; 2) ;; 0) exit 0;; *) exit 1;; esac
+                fi
+            fi
+        elif [[ $transport == grpc ]]; then fail "gRPC 模板需要 TLS 或 REALITY。"; exit 1; fi
+        if [[ $kind == hysteria2 ]]; then prompt_hysteria2_obfs obfs || exit 1; fi
+        if [[ $kind == tuic ]]; then
+            prompt choice "QUIC 拥塞控制：1 BBR，2 CUBIC，3 NEW_RENO，0 取消" 1 || exit 1
+            case "$choice" in 1) cc=bbr;; 2) cc=cubic;; 3) cc=new_reno;; 0) exit 0;; *) exit 1;; esac
+        fi
+    fi
+    work=$(mktemp -d "$STATE_DIR/outbound-wizard.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    jq -n --arg type "$kind" --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+      --arg id "$credential" --arg password "$password" --arg user "$user" --arg method "$method" \
+      --arg security "$security" --arg transport "$transport" --arg sni "$tls_name" --arg key "$key" \
+      --arg sid "$sid" --arg flow "$flow" --arg path "$path" --arg host "$host" --arg cc "$cc" --arg obfs "$obfs" '
+        {type:$type,tag:$tag} |
+        if $type!="direct" then .server=$server|.server_port=$port else . end |
+        if $type=="vless" or $type=="vmess" or $type=="tuic" then .uuid=$id else . end |
+        if $type=="vmess" then .security="auto"|.alter_id=0 else . end |
+        if $type=="hysteria2" or $type=="tuic" or $type=="anytls" or $type=="trojan" or $type=="shadowsocks" then .password=$password else . end |
+        if $type=="socks" then .version="5" else . end |
+        if ($type=="socks" or $type=="http") and $user!="" then .username=$user|.password=$password else . end |
+        if $type=="shadowsocks" then .method=$method else . end |
+        if $type=="tuic" then .congestion_control=$cc else . end |
+        if $obfs!="" then .obfs={type:"salamander",password:$obfs} else . end |
+        if $transport=="ws" then .transport={type:"ws",path:$path} | if $host!="" then .transport.headers={Host:$host} else . end
+        elif $transport=="grpc" then .transport={type:"grpc",service_name:$path} else . end |
+        if $security!="none" then .tls={enabled:true,server_name:$sni} |
+          if $transport=="grpc" then .tls.alpn=["h2"] else . end |
+          if $security=="reality" then .tls.reality={enabled:true,public_key:$key,short_id:$sid}|.tls.utls={enabled:true,fingerprint:"chrome"} else . end
+        else . end |
+        if $flow!="" then .flow=$flow else . end' >"$work/node.json" || exit 1
+    add_outbounds_file_locked "$work/node.json"
+)
+
+outbounds_menu() {
+    local choice inbound target
+    [[ $# -eq 0 ]] || { fail "用法：sing-box outbounds"; return 1; }
+    [[ -t 0 ]] || { list_outbounds; return; }
+    while true; do
+        printf '\n出站节点管理\n  1. 出站列表和入站绑定\n  2. 按协议添加出站\n  3. 粘贴分享链接导入\n  4. 从 JSON/链接文件导入\n  5. 粘贴 outbound JSON 导入\n  6. 选择入站并绑定出站\n  7. 取消入站出站绑定\n  8. 删除出站\n  0. 返回\n'
+        read -r -p "请选择出站操作 [0]: " choice || return 0
+        case "$choice" in
+            0|"") return 0 ;;
+            1) list_outbounds || true ;;
+            2) with_lock add_outbound_wizard_locked || true ;;
+            3) with_lock import_outbound_wizard_locked link || true ;;
+            4) with_lock import_outbound_wizard_locked file || true ;;
+            5) with_lock import_outbound_wizard_locked json || true ;;
+            6|7)
+                if select_inbound inbound "设置出站" && [[ -n $inbound ]]; then
+                    target=-
+                    if [[ $choice == 7 ]] || { select_outbound target && [[ -n $target ]]; }; then
+                        with_lock bind_outbound_locked "$inbound" "$target" || true
+                    fi
+                fi ;;
+            8) if select_outbound target && [[ -n $target ]]; then with_lock delete_outbound_locked "$target" || true; fi ;;
+            *) warn "请输入 0–8。" ;;
+        esac
+        read -r -p "按回车键返回出站管理菜单..." choice || return 0
+    done
+}
+
 # shellcheck disable=SC2016 # json_query filters use literal jq variables.
 generate_outbound_preference() {
     [[ $# -eq 2 ]] || return 1
@@ -3382,8 +4153,8 @@ menu() {
     while true; do
         printf '\n========== sing-box 管理面板 v%s ==========\n' "$SB_MANAGER_VERSION"
         show_status
-        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n 18. 入站多用户管理\n 19. 出站 IP 优先级（IPv6 / IPv4）\n  0. 退出\n\n'
-        read -r -p "请输入选项 [0-19]: " choice || return 0
+        printf '\n  1. 安装 sing-box\n  2. 卸载 sing-box\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 禁用（停止 + 关闭开机自启）\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 sing-box 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、批量导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / UDP QUIC）\n 16. 关闭 TCP BBR（恢复开启前设置）\n 17. 安装/打开 ACME 证书菜单\n 18. 入站多用户管理\n 19. 出站 IP 优先级（IPv6 / IPv4）\n 20. 出站节点管理（添加/导入/入站绑定）\n  0. 退出\n\n'
+        read -r -p "请输入选项 [0-20]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
             2) uninstall_core || true ;;
@@ -3409,8 +4180,9 @@ menu() {
             17) open_acme_menu || true ;;
             18) users_menu || true; continue ;;
             19) outbound_preference_menu || true; continue ;;
+            20) outbounds_menu || true; continue ;;
             0) return 0 ;;
-            *) warn "请输入 0–19。" ;;
+            *) warn "请输入 0–20。" ;;
         esac
         read -r -p "按回车键返回菜单..." choice || return 0
     done
@@ -3434,6 +4206,10 @@ sing-box 中文终端管理面板
   sing-box quic-bbr-status        只读查看 Hy2/TUIC 的 QUIC 拥塞控制状态
   sing-box quic-bbr-disable [TAG] 恢复节点开启 QUIC BBR 前的设置
   sing-box quic-bbr-record TAG FILE 核对指定旧成套备份并登记节点恢复记录
+  sing-box outbounds              出站列表/管理菜单（非交互时只读列表）
+  sing-box outbound-add FILE      从出站 JSON 或分享链接文本文件追加出站
+  sing-box outbound-bind IN OUT|- 绑定入站至出站，- 取消面板绑定
+  sing-box outbound-delete TAG    删除未引用的出站（自动备份）
   sing-box ip-preference [ipv6|ipv4|status] 设置或查看默认出站 IP 优先级
   sing-box acme                   安装/打开 acme-script 证书管理菜单
   sing-box uninstall              卸载核心及服务，保留配置、备份和面板
@@ -3487,7 +4263,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|ip-preference|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|ip-preference|outbounds|outbound-add|outbound-bind|outbound-delete|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -3515,6 +4291,16 @@ main() {
         quic-bbr-record) record_quic_bbr "$@" ;;
         acme) open_acme_menu "$@" ;;
         ip-preference) set_outbound_preference "$@" ;;
+        outbounds) outbounds_menu "$@" ;;
+        outbound-add)
+            [[ $# -eq 1 ]] || { fail "用法：sing-box outbound-add FILE"; return 1; }
+            with_lock add_outbounds_file_locked "$1" ;;
+        outbound-bind)
+            [[ $# -eq 2 ]] || { fail "用法：sing-box outbound-bind IN OUT|-"; return 1; }
+            with_lock bind_outbound_locked "$1" "$2" ;;
+        outbound-delete)
+            [[ $# -eq 1 ]] || { fail "用法：sing-box outbound-delete TAG"; return 1; }
+            with_lock delete_outbound_locked "$1" ;;
         menu) menu ;;
         uninstall) uninstall_core ;;
         remove-panel) remove_panel ;;

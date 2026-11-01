@@ -25,6 +25,7 @@ Linux 上的中文终端管理脚本。安装面板后，输入 `sudo sing-box` 
 | 17 | 安装/打开 ACME 证书菜单 | 首次安装 acme-script 菜单，已安装时直接进入；退出后返回本面板 |
 | 18 | 入站多用户管理 | 同一入站添加/删除独立认证用户、按用户导出；原端口、TLS 和其他用户保留 |
 | 19 | 出站 IP 优先级 | 开启 IPv6 优先、改为 IPv4 优先，或查看当前默认策略 |
+| 20 | 出站节点管理 | 按协议添加、粘贴链接/JSON、文件批量导入、按入站绑定或取消出站 |
 
 面板是交互式终端程序，没有 Web 服务、数据库或常驻面板进程。
 
@@ -400,3 +401,29 @@ v1.21.0 起，主菜单 **19 → 1** 开启 IPv6 优先，**19 → 2** 关闭 IP
 
 
 v1.21.1 起，开启 IPv6 优先时，在确认保存后、备份和写入前自动检测公网 IPv6：以 HTTPS 强制 IPv6 直连 `api64.ipify.org`，失败时再尝试 `icanhazip.com`，任一站点返回有效公网 IPv6 才继续保存。检测禁用代理及 curl 默认配置，单站最多 8 秒，总计约 16 秒；不修改系统网络或防火墙。两站均失败、超时、缺少检测依赖或返回非公网 IPv6 时提示并保留原配置、备份集合和服务状态。检测失败仅表示当前无法确认可用，也可能是 DNS 或检测服务故障。改为 IPv4 优先、取消保存、查看状态和重复选择已有策略不触发公网检测。菜单和 `sing-box ip-preference ipv6` 共用这项检查；更新面板不会改变已有 IPv6 优先设置。
+
+
+## 按入站选择代理出站
+
+v1.22.0 起，主菜单 **20. 出站节点管理** 提供：
+
+- **2 按协议添加**：选择 VLESS、VMess、Hy2、TUIC、AnyTLS、Shadowsocks、Trojan、SOCKS5、HTTP/HTTPS 或直连，设置出站名称及远端已有的地址、端口和认证。VLESS/VMess/Trojan 可按协议选择 TCP、WebSocket、gRPC；VLESS 支持 REALITY/可选 TCP Vision；Hy2 支持 Salamander，TUIC 可选择拥塞控制。
+- **3 粘贴分享链接**、**4 从文件导入**、**5 粘贴 outbound JSON**：支持单 outbound 对象、数组、`{"outbounds":[...]}` 和 JSONC 注释；文件还支持每行一个分享链接。粘贴内容不回显；多行 JSON 以单独一行 `END` 结束。只追加出站，重复名称或不兼容字段会拒绝，完整客户端/服务端配置请先提取 outbounds。
+- **6 绑定**：按序号选择本面板入站，再选择出站。为此入站增加一条位于原有规则前的 `inbound → outbound` 路由，其他入站继续按原有路由和默认出站转发。此处不修改全局默认出站，也不自动修改 DNS 服务器或独立解析策略。
+- **7 取消绑定**：只删除面板记录的绑定规则，保留你原有的规则；规则已被手动修改或重复时拒绝自动处理。取消后按其他规则和默认出站转发，并不强制直连。
+- **8 删除出站**：禁止删除仍被绑定、`route.final`、detour、selector 等引用的出站，且保留至少一个出站。删除入站或改名时也需先取消相关绑定。
+
+名称使用 1–64 位字母、数字、短横线或下划线；列表只显示名称、协议、服务器和端口，不展示认证。链接名称无法直接作为合法 tag 时使用稳定的 `import-...` 名称。分享链接只接受明确支持的参数；复杂传输或未支持参数请改用 JSON，避免静默丢失安全设置。不下载订阅 URL，不解析 Clash YAML。
+
+每次保存先确认并校验完整配置，自动成套备份并保留原 JSONC 注释、节点认证、TLS、IPv6 优先与 QUIC BBR 元数据；失败沿用现有事务回滚。运行中的服务会短暂重启，停止状态和开机自启设置保留；重复绑定同一出站不保存或重启。添加成功后还需执行绑定；更新面板不会自动为现有节点切换出站。配置校验不等于远端可达，需使用真实远端凭据并确保对应 TCP/UDP 通畅。
+
+命令行（写操作需交互确认）：
+
+```bash
+sudo sing-box outbounds
+sudo sing-box outbound-add /root/outbounds.json
+sudo sing-box outbound-add /root/node-links.txt
+sudo sing-box outbound-bind hysteria2-example proxy-egress
+sudo sing-box outbound-bind hysteria2-example -
+sudo sing-box outbound-delete proxy-egress
+```

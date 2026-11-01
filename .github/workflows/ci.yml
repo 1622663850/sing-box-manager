@@ -47,3 +47,5 @@ jobs:
         run: python3 tests/smoke_multiusers.py --core "$RUNNER_TEMP/sing-box-test/sing-box"
       - name: Real-core IP preference and fallback tests
         run: python3 tests/smoke_ip_preference.py --core "$RUNNER_TEMP/sing-box-test/sing-box"
+      - name: Real-core inbound outbound routing tests
+        run: python3 tests/smoke_outbound_routes.py --core "$RUNNER_TEMP/sing-box-test/sing-box" --manager "$GITHUB_WORKSPACE/sing-box-manager.sh"
