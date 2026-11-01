@@ -3741,13 +3741,15 @@ add_outbounds_file_locked() (
 # shellcheck disable=SC2016 # jq bundle filters use literal variables.
 bind_outbound_locked() (
     umask 077
-    local inbound=$1 target=$2 work
+    local bind_inbound=$1 bind_target=$2 work
     require_core && safe_paths || exit 1
-    valid_tag "$inbound" && { [[ $target == - ]] || valid_tag "$target"; } || { fail "入站或出站名称无效。"; exit 1; }
+    if ! valid_tag "$bind_inbound" || { [[ $bind_target != - ]] && ! valid_tag "$bind_target"; }; then
+        fail "入站或出站名称无效。"; exit 1
+    fi
     work=$(mktemp -d "$STATE_DIR/outbound-bind.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     snapshot_bundle >"$work/before.json" || exit 1
-    jq --arg i "$inbound" --arg o "$target" '
+    jq --arg i "$bind_inbound" --arg o "$bind_target" '
       if ([.config.inbounds[]? | select(.tag==$i)]|length)!=1 then error("inbound not unique") else . end |
       if $o!="-" and ([.config.outbounds[]? | select(.tag==$o)]|length)!=1 then error("outbound not unique") else . end |
       (.clients[$i].outbound_route // null) as $record |
@@ -3780,8 +3782,8 @@ bind_outbound_locked() (
     fi
     jq .config "$work/after.json" >"$work/config.json" || exit 1
     validate_config "$work/config.json" >"$work/check.log" 2>&1 || { fail "绑定未通过核心校验，请检查出站和现有路由。"; exit 1; }
-    if [[ $target == - ]]; then info "取消 $inbound 的面板出站绑定，恢复由其余路由规则及默认出站决定。"
-    else info "$inbound 的流量将优先使用出站 $target（此规则优先于已有路由规则）。"; fi
+    if [[ $bind_target == - ]]; then info "取消 $bind_inbound 的面板出站绑定，恢复由其余路由规则及默认出站决定。"
+    else info "$bind_inbound 的流量将优先使用出站 $bind_target（此规则优先于已有路由规则）。"; fi
     confirm "保存入站出站绑定？（自动备份，运行中的服务短暂重启）" || exit 1
     snapshot_bundle >"$work/current.json" || exit 1
     [[ $(jq -Sc . "$work/current.json") == "$(jq -Sc . "$work/before.json")" ]] || { fail "配置或连接信息已变化，请重试。"; exit 1; }
@@ -3792,19 +3794,19 @@ bind_outbound_locked() (
 # shellcheck disable=SC2016 # json_query filters use literal jq variables.
 delete_outbound_locked() (
     umask 077
-    local tag=$1 work backup
+    local delete_outbound_tag=$1 work backup
     require_core && safe_paths || exit 1
-    valid_tag "$tag" || { fail "出站名称无效。"; exit 1; }
+    valid_tag "$delete_outbound_tag" || { fail "出站名称无效。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/outbound-delete.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     cp -- "$CONFIG_FILE" "$work/before.json" || exit 1
-    json_query "$work/before.json" -e --arg t "$tag" '(.outbounds|length)>1 and ([.outbounds[]|select(.tag==$t)]|length)==1' >/dev/null || { fail "出站不存在、名称重复或是最后一个出站，不能删除。"; exit 1; }
-    if json_query "$work/before.json" -e --arg t "$tag" 'del(.outbounds[]|select(.tag==$t)) | any(..|strings; .==$t)' >/dev/null; then
+    json_query "$work/before.json" -e --arg t "$delete_outbound_tag" '(.outbounds|length)>1 and ([.outbounds[]|select(.tag==$t)]|length)==1' >/dev/null || { fail "出站不存在、名称重复或是最后一个出站，不能删除。"; exit 1; }
+    if json_query "$work/before.json" -e --arg t "$delete_outbound_tag" 'del(.outbounds[]|select(.tag==$t)) | any(..|strings; .==$t)' >/dev/null; then
         fail "出站仍被路由、detour 或选择器等引用，请先解除引用。"; exit 1
     fi
-    json_query "$work/before.json" --arg t "$tag" '.outbounds|=map(select(.tag!=$t))' >"$work/after.json" || exit 1
+    json_query "$work/before.json" --arg t "$delete_outbound_tag" '.outbounds|=map(select(.tag!=$t))' >"$work/after.json" || exit 1
     validate_config "$work/after.json" >"$work/check.log" 2>&1 || { fail "删除后配置未通过校验，未保存。"; exit 1; }
-    confirm "删除出站 $tag？（自动备份）" || exit 1
+    confirm "删除出站 $delete_outbound_tag？（自动备份）" || exit 1
     cmp -s "$work/before.json" "$CONFIG_FILE" || { fail "配置已变化，请重试。"; exit 1; }
     backup=$(create_backup) || exit 1
     commit_config "$work/after.json" >"$work/save.log" 2>&1 || { fail "删除失败，已执行原有回滚；请检查服务状态和备份。"; exit 1; }
@@ -3839,11 +3841,11 @@ select_outbound() {
         name:*) outbounds_tag=${outbounds_choice#name:} ;;
         *)
             if [[ $outbounds_choice =~ ^[0-9]+$ ]]; then
-                [[ $outbounds_choice =~ ^[1-9][0-9]{0,5}$ ]] && (( outbounds_choice<=outbounds_count )) || { fail "出站序号无效。"; return 1; }
+                if [[ ! $outbounds_choice =~ ^[1-9][0-9]{0,5}$ ]] || (( outbounds_choice>outbounds_count )); then fail "出站序号无效。"; return 1; fi
                 outbounds_tag=$(jq -r --argjson i "$((outbounds_choice-1))" '.[$i].tag' <<<"$outbounds_snapshot") || return
             else outbounds_tag=$outbounds_choice; fi ;;
     esac
-    valid_tag "$outbounds_tag" && jq -e --arg t "$outbounds_tag" '[.[]|select(.tag==$t)]|length==1' <<<"$outbounds_snapshot" >/dev/null || { fail "出站名称无效或重复。"; return 1; }
+    if ! valid_tag "$outbounds_tag" || ! jq -e --arg t "$outbounds_tag" '[.[]|select(.tag==$t)]|length==1' <<<"$outbounds_snapshot" >/dev/null; then fail "出站名称无效或重复。"; return 1; fi
     [[ $(config_jq -c '.outbounds // []') == "$outbounds_snapshot" ]] || { fail "出站列表已变化，请重新选择。"; return 1; }
     printf -v "$destination" '%s' "$outbounds_tag"
 }
@@ -3875,18 +3877,18 @@ import_outbound_wizard_locked() (
 
 add_outbound_wizard_locked() (
     umask 077
-    local choice kind tag server="" port=443 credential="" password="" user="" method="" security=none transport=tcp
+    local choice kind outbound_name server="" port=443 credential="" password="" user="" method="" security=none transport=tcp
     local tls_name="" key="" sid="" flow="" path="" host="" cc=cubic obfs="" work
     require_core && safe_paths || exit 1
     printf '\n添加出站\n  1. VLESS\n  2. VMess\n  3. Hysteria 2\n  4. TUIC\n  5. AnyTLS\n  6. Shadowsocks\n  7. Trojan\n  8. SOCKS5\n  9. HTTP / HTTPS\n 10. 直连\n  0. 返回\n'
     prompt choice "选择出站协议" 1 || exit 1
     case "$choice" in 0) exit 0;; 1) kind=vless;; 2) kind=vmess;; 3) kind=hysteria2;; 4) kind=tuic;; 5) kind=anytls;; 6) kind=shadowsocks;; 7) kind=trojan;; 8) kind=socks;; 9) kind=http;; 10) kind=direct;; *) fail "无效协议。"; exit 1;; esac
-    prompt tag "出站名称（字母/数字/短横线/下划线）" "out-$kind-$(date +%H%M%S)" || exit 1
-    valid_tag "$tag" || { fail "出站名称无效。"; exit 1; }
+    prompt outbound_name "出站名称（字母/数字/短横线/下划线）" "out-$kind-$(date +%H%M%S)" || exit 1
+    valid_tag "$outbound_name" || { fail "出站名称无效。"; exit 1; }
     if [[ $kind != direct ]]; then
         prompt server "远端服务器 IP/域名（不含协议前缀）" || exit 1
         prompt port "远端端口" 443 || exit 1
-        valid_host "$server" && valid_port "$port" || { fail "远端地址或端口无效。"; exit 1; }
+        if ! valid_host "$server" || ! valid_port "$port"; then fail "远端地址或端口无效。"; exit 1; fi
         port=$((10#$port))
         case "$kind" in
             vless|vmess|tuic) prompt_secret credential "远端已有用户 UUID" || exit 1 ;;
@@ -3938,7 +3940,7 @@ add_outbound_wizard_locked() (
     fi
     work=$(mktemp -d "$STATE_DIR/outbound-wizard.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
-    jq -n --arg type "$kind" --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+    jq -n --arg type "$kind" --arg tag "$outbound_name" --arg server "$server" --argjson port "$port" \
       --arg id "$credential" --arg password "$password" --arg user "$user" --arg method "$method" \
       --arg security "$security" --arg transport "$transport" --arg sni "$tls_name" --arg key "$key" \
       --arg sid "$sid" --arg flow "$flow" --arg path "$path" --arg host "$host" --arg cc "$cc" --arg obfs "$obfs" '
@@ -3963,7 +3965,7 @@ add_outbound_wizard_locked() (
 )
 
 outbounds_menu() {
-    local choice inbound target
+    local choice route_inbound route_target
     [[ $# -eq 0 ]] || { fail "用法：sing-box outbounds"; return 1; }
     [[ -t 0 ]] || { list_outbounds; return; }
     while true; do
@@ -3977,13 +3979,13 @@ outbounds_menu() {
             4) with_lock import_outbound_wizard_locked file || true ;;
             5) with_lock import_outbound_wizard_locked json || true ;;
             6|7)
-                if select_inbound inbound "设置出站" && [[ -n $inbound ]]; then
-                    target=-
-                    if [[ $choice == 7 ]] || { select_outbound target && [[ -n $target ]]; }; then
-                        with_lock bind_outbound_locked "$inbound" "$target" || true
+                if select_inbound route_inbound "设置出站" && [[ -n $route_inbound ]]; then
+                    route_target=-
+                    if [[ $choice == 7 ]] || { select_outbound route_target && [[ -n $route_target ]]; }; then
+                        with_lock bind_outbound_locked "$route_inbound" "$route_target" || true
                     fi
                 fi ;;
-            8) if select_outbound target && [[ -n $target ]]; then with_lock delete_outbound_locked "$target" || true; fi ;;
+            8) if select_outbound route_target && [[ -n $route_target ]]; then with_lock delete_outbound_locked "$route_target" || true; fi ;;
             *) warn "请输入 0–8。" ;;
         esac
         read -r -p "按回车键返回出站管理菜单..." choice || return 0
