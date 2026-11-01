@@ -40,7 +40,7 @@ class OutboundLinkParserTest(unittest.TestCase):
         uuid = "b7efdc96-87aa-4910-81b4-374b2eecc737"
         links = [
             "vless://" + uuid + "@[::1]:443?encryption=none&type=grpc&security=reality"
-            "&flow=xtls-rprx-vision&fp=chrome&sni=example.com&pbk="
+            "&fp=chrome&sni=example.com&pbk="
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef"
             "&alpn=h2&serviceName=RealityGrpc&mode=gun#vless-node",
             self.vmess({
@@ -69,7 +69,7 @@ class OutboundLinkParserTest(unittest.TestCase):
         ])
         self.assertEqual(result[0]["server"], "::1")
         self.assertEqual(result[0]["transport"], {"type": "grpc", "service_name": "RealityGrpc"})
-        self.assertEqual(result[0]["flow"], "xtls-rprx-vision")
+        self.assertNotIn("flow", result[0])
         self.assertEqual(result[0]["tls"]["reality"]["public_key"], "A" * 43)
         self.assertEqual(result[1]["transport"]["headers"]["Host"], "cdn.example.com")
         self.assertEqual(result[1]["tls"]["alpn"], ["h2", "http/1.1"])

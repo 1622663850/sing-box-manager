@@ -3314,7 +3314,7 @@ def uuid(value: str) -> str:
 
 
 def tag(raw: str, preferred: str) -> str:
-    value = unquote(preferred) if preferred else ""
+    value = preferred if preferred else ""
     if TAG_RE.fullmatch(value):
         return value
     return "import-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
@@ -3416,7 +3416,7 @@ def parse_vless(raw: str, parts, name: str) -> dict:
 def parse_vmess(raw: str, parts) -> dict:
     if parts.query:
         fail()
-    encoded = parts.path.lstrip("/") or parts.netloc
+    encoded = raw.split("://", 1)[1].split("#", 1)[0]
     value = json.loads(decode_b64_text(encoded))
     if not isinstance(value, dict):
         fail()
@@ -3428,6 +3428,8 @@ def parse_vmess(raw: str, parts) -> dict:
     if not isinstance(host, str) or not valid_host(host):
         fail()
     try:
+        if not re.fullmatch(r"[0-9]{1,5}", str(value["port"])) or not re.fullmatch(r"[0-9]+", str(value.get("aid", 0))):
+            fail()
         port = int(value["port"])
         aid = int(value.get("aid", 0))
     except (KeyError, TypeError, ValueError):
@@ -3477,17 +3479,19 @@ def parse_vmess(raw: str, parts) -> dict:
 
 def parse_hysteria2(raw: str, parts, name: str) -> dict:
     user, password = userinfo(parts)
-    credential = password or user
+    credential = unquote(parts.netloc.rsplit("@", 1)[0])
     if not credential:
         fail()
     host, port = endpoint(parts)
     query = query_values(parts, {"sni", "alpn", "obfs", "obfs-password", "insecure"})
-    if query.get("insecure", "0").lower() in {"1", "true", "yes"}:
+    if query.get("insecure", "0").lower() not in {"0", "false", ""}:
         fail()
     result = {"type": "hysteria2", "tag": name, "server": host, "server_port": port, "password": credential}
     tls_fields(result, query, host)
+    if "obfs-password" in query and "obfs" not in query:
+        fail()
     if "obfs" in query:
-        if query["obfs"] != "salamander" or not query.get("obfs-password"):
+        if query["obfs"] != "salamander" or len(query.get("obfs-password", "").encode("utf-8")) < 4:
             fail()
         result["obfs"] = {"type": "salamander", "password": query["obfs-password"]}
     return result
@@ -3499,7 +3503,7 @@ def parse_tuic(raw: str, parts, name: str) -> dict:
     query = query_values(parts, {"sni", "alpn", "congestion_control", "udp_relay_mode"})
     if query.get("congestion_control", "cubic") not in {"cubic", "new_reno", "bbr"}:
         fail()
-    if query.get("udp_relay_mode", "native") not in {"native", "quic"}:
+    if query.get("udp_relay_mode", "native") != "native":
         fail()
     if not password:
         fail()
@@ -3514,7 +3518,7 @@ def parse_tuic(raw: str, parts, name: str) -> dict:
 
 def parse_anytls(raw: str, parts, name: str) -> dict:
     user, password = userinfo(parts)
-    credential = password or user
+    credential = unquote(parts.netloc.rsplit("@", 1)[0])
     if not credential:
         fail()
     host, port = endpoint(parts)
@@ -3530,6 +3534,8 @@ def parse_ss(raw: str, parts, name: str) -> dict:
     if "@" in parts.netloc:
         method, password = userinfo(parts)
         host, port = endpoint(parts)
+        if parts.path not in {"", "/"}:
+            fail()
         if not password:
             decoded = decode_b64_text(method)
             if ":" not in decoded:
@@ -3537,8 +3543,8 @@ def parse_ss(raw: str, parts, name: str) -> dict:
             method, password = decoded.split(":", 1)
         if not method or not password:
             fail()
-    elif parts.netloc and not parts.path:
-        decoded = decode_b64_text(parts.netloc)
+    elif "@" not in raw:
+        decoded = decode_b64_text(raw.split("://", 1)[1].split("#", 1)[0])
         if "@" not in decoded:
             fail()
         credentials, address = decoded.rsplit("@", 1)
@@ -3559,17 +3565,17 @@ def parse_ss(raw: str, parts, name: str) -> dict:
     if not method or not password:
         fail()
     return {"type": "shadowsocks", "tag": name, "server": host, "server_port": port,
-            "method": unquote(method), "password": unquote(password)}
+            "method": method, "password": password}
 
 
 def parse_trojan(raw: str, parts, name: str) -> dict:
     user, password = userinfo(parts)
-    credential = password or user
+    credential = unquote(parts.netloc.rsplit("@", 1)[0])
     if not credential:
         fail()
     host, port = endpoint(parts)
     query = query_values(parts, {"security", "sni", "alpn", "fp", "type", "path", "host", "serviceName", "mode", "insecure"})
-    if query.get("security", "tls") not in {"tls", ""} or query.get("insecure", "0") in {"1", "true"}:
+    if query.get("security", "tls") not in {"tls", ""} or query.get("insecure", "0").lower() not in {"0", "false", ""}:
         fail()
     result = {"type": "trojan", "tag": name, "server": host, "server_port": port, "password": credential}
     transport = query.get("type", "tcp")
@@ -3588,6 +3594,10 @@ def parse_trojan(raw: str, parts, name: str) -> dict:
         result["transport"] = {"type": "grpc", "service_name": query["serviceName"]}
     elif transport != "tcp":
         fail()
+    for key in ("path", "host", "serviceName", "mode"):
+        if key in query and ((transport == "ws" and key not in {"path", "host"}) or
+                             (transport == "grpc" and key not in {"serviceName", "mode"}) or transport == "tcp"):
+            fail()
     tls_fields(result, query, host)
     return result
 
@@ -3631,6 +3641,10 @@ def parse_line(raw: str) -> dict:
         fail()
     scheme = parts.scheme.lower()
     preferred = unquote(parts.fragment)
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        fail()
+    if scheme not in {"vmess", "ss"} and parts.path not in {"", "/"}:
+        fail()
     if scheme == "vmess":
         result = parse_vmess(raw, parts)
         result["tag"] = tag(raw, preferred or result["tag"])
