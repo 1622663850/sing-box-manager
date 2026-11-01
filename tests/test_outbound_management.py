@@ -241,6 +241,57 @@ class OutboundManagementTest(unittest.TestCase):
         self.assertEqual(metadata.read_bytes(), before_metadata)
         self.assertTrue(self.state()["active"])
 
+    def test_manual_wizard_generates_each_supported_protocol_and_reality(self) -> None:
+        body = r'''prompt(){
+          local answer=""
+          case "$1" in
+            choice) case "$2" in
+              选择出站协议) answer=$WIZARD_PROTOCOL ;;
+              传输*) answer=${WIZARD_TRANSPORT:-1} ;;
+              安全*) answer=${WIZARD_SECURITY:-2} ;;
+              *) answer=1 ;; esac ;;
+            outbound_name) answer=manual-egress ;;
+            server) answer=127.0.0.1 ;;
+            port) answer=443 ;;
+            tls_name) answer=example.com ;;
+            key) answer=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ;;
+            sid) answer=0123456789abcdef ;;
+            path) answer=TunService ;;
+            method) answer=2022-blake3-aes-128-gcm ;;
+            *) answer="" ;;
+          esac
+          printf -v "$1" '%s' "$answer"
+        }
+        prompt_secret(){
+          if [[ $1 == credential ]]; then printf -v "$1" '%s' b7efdc96-87aa-4910-81b4-374b2eecc737
+          else printf -v "$1" '%s' AQEBAQEBAQEBAQEBAQEBAQ==; fi
+        }
+        prompt_hysteria2_obfs(){ printf -v "$1" '%s' ''; }
+        add_outbounds_file_locked(){ cp -- "$1" "$WIZARD_CAPTURE"; }
+        add_outbound_wizard_locked'''
+        expected = ["vless", "vmess", "hysteria2", "tuic", "anytls", "shadowsocks", "trojan", "socks", "http", "direct"]
+        for number, kind in enumerate(expected, 1):
+            with self.subTest(protocol=kind):
+                capture = self.root / ("manual-"+kind+".json")
+                self.env.update(WIZARD_PROTOCOL=str(number), WIZARD_CAPTURE=str(capture))
+                self.shell(body, check=True)
+                node = json.loads(capture.read_text(encoding="utf-8"))
+                self.assertEqual(node["type"], kind)
+                self.assertEqual(node["tag"], "manual-egress")
+                self.assertFalse(node.get("tls", {}).get("insecure", False))
+                if fixture.REAL_CORE:
+                    candidate = self.root / "manual-core-check.json"
+                    fixture.dump(candidate, {"inbounds":[], "outbounds":[node]})
+                    checked = subprocess.run([fixture.REAL_CORE, "check", "-c", str(candidate)], capture_output=True, text=True, timeout=20)
+                    self.assertEqual(checked.returncode, 0, "manual outbound rejected by real core: "+kind)
+        self.env.update(WIZARD_PROTOCOL="1", WIZARD_SECURITY="3", WIZARD_TRANSPORT="3")
+        self.shell(body, check=True)
+        node = json.loads(capture.read_text(encoding="utf-8"))
+        self.assertEqual(node["transport"]["type"], "grpc")
+        self.assertEqual(node["tls"]["alpn"], ["h2"])
+        self.assertTrue(node["tls"]["reality"]["enabled"])
+        self.assertNotIn("flow", node)
+
     @unittest.skipUnless(pty is not None, "PTY support is required for menu routing")
     def test_main_menu_twenty_lists_and_zero_returns(self) -> None:
         command = 'source "$1"; show_status(){ :; }; menu'

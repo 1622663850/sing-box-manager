@@ -189,6 +189,17 @@ class OutboundLinkParserTest(unittest.TestCase):
                 self.assertEqual(parsed["server"], outbound["server"])
                 self.assertEqual(parsed["server_port"], outbound["server_port"])
 
+    def test_password_percent_sequences_and_colons_are_preserved(self) -> None:
+        password = "part%41:user@pass"
+        nodes = self.parse(
+            "ss://aes-128-gcm:"+quote(password, safe="")+"@127.0.0.1:443#encoded-ss",
+            "hysteria2://user:pass@127.0.0.1:443#colon-hy2",
+            "anytls://"+quote(password, safe="")+"@127.0.0.1:443#encoded-anytls",
+        )
+        self.assertEqual(nodes[0]["password"], password)
+        self.assertEqual(nodes[1]["password"], "user:pass")
+        self.assertEqual(nodes[2]["password"], password)
+
     def test_malformed_or_unsupported_links_fail_without_echoing_credentials(self) -> None:
         cases = (
             "ftp://secret-password@example.com:443#bad",
