@@ -427,3 +427,14 @@ sudo sing-box outbound-bind hysteria2-example proxy-egress
 sudo sing-box outbound-bind hysteria2-example -
 sudo sing-box outbound-delete proxy-egress
 ```
+
+
+## Snell 入站
+
+v1.23.0 起，主菜单 **8 → 19** 添加 Snell v5（客户端配置使用 v4），**8 → 20** 添加 Snell v6。使用 sing-box 1.14+ 原生 Snell，无需另外安装 snell-server；不支持的旧核心会在保存校验时拒绝，不自动替换核心。支持自定义名称、TCP 端口、隐藏输入 PSK（回车自动生成）、v5 none/HTTP 混淆及 v6 default/unshaped/unsafe-raw 模式（unsafe-raw 不提供加密，仅用于调试或已有安全隧道内）。v6 PSK 为 12–255 UTF-8 字节；模板 PSK 上限统一为 255 字节。Snell 监听 TCP，可与 Hy2/TUIC 的同号 UDP 端口共用。UDP 转发封装在 Snell TCP 连接中。
+
+支持主菜单 11 修改 PSK（回车保留、`@new` 重新生成）和协议相关设置，保留注释、其他节点和出站绑定；按原服务状态启动/重启并在失败时回滚。添加仍会自动启动尚未运行的服务；修改不自动启动停止的服务。当前向导为单 PSK 模板，多用户 Snell JSON 不会被静默转换或丢弃用户，请使用完整 JSON 管理。
+
+查看配置时可导出 sing-box outbound JSON 及 **Surge `[Proxy]` 配置行**。Snell 没有通用标准分享 URI，不伪造 `snell://` 链接。v5 服务端使用客户端 `version=4`，不启用 Surge v5 QUIC Proxy Mode；v6 客户端使用 `version=6` 并与服务端模式一致。Surge 兼容性及客户端版本请参考[官方 Snell 文档](https://manual.nssurge.com/policies/snell.html)和[sing-box Snell 入站说明](https://sing-box.sagernet.org/configuration/inbound/snell/)。含逗号/空格等复杂字符的 PSK 保留在 JSON 中，但拒绝生成可能歧义的 Surge 行，建议使用自动生成的 PSK。
+
+批量 `export json` 包含 Snell；`export links/base64` 遇到 Snell 会拒绝混入 Surge 行并提示改用 JSON，避免输出不能按 URI 导入的混合文件。更新面板本身不会添加真实 Snell 节点或重启现有节点。

@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.22.0"
+SB_MANAGER_VERSION="1.23.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -661,7 +661,7 @@ check_inbound_conflicts() {
         if .type == "hysteria2" or .type == "tuic" or .type == "hysteria" then ["udp"]
         elif .type == "vless" or .type == "vmess" or .type == "trojan" then
           if .transport.type == "quic" then ["udp"] else ["tcp"] end
-        elif .type == "anytls" or .type == "shadowtls" or .type == "http" or
+        elif .type == "snell" or .type == "anytls" or .type == "shadowtls" or .type == "http" or
              .type == "socks" or .type == "mixed" then ["tcp"]
         elif .type == "shadowsocks" or .type == "direct" or .type == "naive" then
           if .network == "tcp" then ["tcp"] elif .network == "udp" then ["udp"]
@@ -918,6 +918,33 @@ validate_obfs_template() {
     }
 }
 
+validate_snell_template() {
+    jq -e '
+      .type=="snell" and (.version==5 or .version==6) and
+      (keys-["type","tag","listen","listen_port","version","psk","users","obfs_mode","mode"]|length==0) and
+      (.users==null or .users==[]) and
+      (.psk|type=="string" and utf8bytelength>0 and utf8bytelength<=255 and (contains("\u0000")|not)) and
+      (if .version==5 then .mode==null and ((.obfs_mode // "none")=="none" or .obfs_mode=="http")
+       else (.mode // "default") as $mode | .obfs_mode==null and (.psk|utf8bytelength>=12) and
+         (["default","unshaped","unsafe-raw"]|index($mode))!=null end)
+    ' "$1" >/dev/null 2>&1 || {
+        fail "Snell 模板无效：仅支持 v5/v6 单 PSK，v6 PSK 须为 12–255 字节；多用户或未支持字段请通过完整 JSON 管理。"; return 1;
+    }
+}
+
+prompt_snell_options() {
+    local destination=$1 protocol=$2 current=${3:-} snell_selection snell_default=1
+    if [[ $protocol == snell ]]; then
+        [[ $current != http ]] || snell_default=2
+        prompt snell_selection "Snell v5 混淆：1 不启用，2 HTTP，0 取消" "$snell_default" || return 1
+        case "$snell_selection" in 1) printf -v "$destination" '%s' none;; 2) printf -v "$destination" '%s' http;; 0) return 1;; *) fail "无效的 Snell 混淆选项。"; return 1;; esac
+    else
+        case "$current" in unshaped) snell_default=2;; unsafe-raw) snell_default=3;; esac
+        prompt snell_selection "Snell v6 模式：1 default，2 unshaped，3 unsafe-raw（明文，仅调试），0 取消" "$snell_default" || return 1
+        case "$snell_selection" in 1) printf -v "$destination" '%s' default;; 2) printf -v "$destination" '%s' unshaped;; 3) printf -v "$destination" '%s' unsafe-raw;; 0) return 1;; *) fail "无效的 Snell 模式。"; return 1;; esac
+    fi
+}
+
 generate_inbound() {
     local protocol=$1 tag=$2 port=$3 credential=${4:-} extra=${5:-} private_key=${6:-} short_id=${7:-}
     local tls_name=${8:-} certificate=${9:-} tls_key=${10:-} password=${11:-} obfs_password=${12:-} type transport="" security=""
@@ -938,10 +965,24 @@ generate_inbound() {
         vmess-grpc-tls) type=vmess; transport=grpc; security=tls ;;
         hysteria2|tuic|anytls) type=$protocol; security=tls ;;
         shadowsocks) type=shadowsocks ;;
+        snell|snell-v6) type=snell ;;
         vless-grpc-reality-vision)
             fail "Vision 不支持 gRPC 传输，请使用 TCP + REALITY + Vision。"; return 1 ;;
         *) fail "不支持的生成模板：$protocol"; return 1 ;;
     esac
+    if [[ $type == snell ]]; then
+        local snell_generated
+        if [[ $protocol == snell ]]; then
+            snell_generated=$(jq -n --arg tag "$tag" --argjson port "$port" --arg psk "$credential" --arg mode "${extra:-none}" \
+                '{type:"snell",tag:$tag,listen:"::",listen_port:$port,version:5,psk:$psk,obfs_mode:$mode}') || return 1
+        else
+            snell_generated=$(jq -n --arg tag "$tag" --argjson port "$port" --arg psk "$credential" --arg mode "${extra:-default}" \
+                '{type:"snell",tag:$tag,listen:"::",listen_port:$port,version:6,psk:$psk,mode:$mode}') || return 1
+        fi
+        validate_snell_template <(printf '%s' "$snell_generated") || return 1
+        printf '%s\n' "$snell_generated"
+        return 0
+    fi
     case "$type" in
         vless|vmess|tuic)
             [[ $credential =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || {
@@ -1518,6 +1559,7 @@ prepare_quic_bbr_wizard() {
 }
 
 validate_inbound_users() {
+    if [[ $(jq -r .type "$1") == snell ]]; then validate_snell_template "$1"; return; fi
     jq -e '
       def uuid_ok: type=="string" and test("^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$");
       if .type=="shadowsocks" then .users==null else . as $node |
@@ -1541,7 +1583,7 @@ validate_inbound_users() {
 }
 
 inbound_user_count() {
-    jq -er 'if .type=="shadowsocks" and .users==null then 1
+    jq -er 'if (.type=="shadowsocks" and .users==null) or (.type=="snell" and (.users==null or .users==[])) then 1
       elif (.users|type)=="array" and (.users|length)>0 then .users|length
       else error("invalid users") end' "$1"
 }
@@ -1551,7 +1593,7 @@ select_inbound_user() {
     printf -v "$destination" '%s' ""
     validate_inbound_users "$file" || return 1
     count=$(inbound_user_count "$file") || return 1
-    [[ $(jq -r .type "$file") != shadowsocks ]] || { fail "此 Shadowsocks 模板仅支持单密码。"; return 1; }
+    case "$(jq -r .type "$file")" in shadowsocks|snell) fail "此模板仅支持单密码/PSK，请使用修改配置。"; return 1;; esac
     jq -r '["用户序号","用户名"], (.users|to_entries[]|[.key+1,(.value.name // "未命名")]) | @tsv' "$file" || return 1
     while true; do
         prompt inbound_user_selection "选择用户序号（0 返回）" 0 || return 1
@@ -1566,6 +1608,10 @@ select_inbound_user() {
 detect_inbound_template() {
     validate_obfs_template "$1" || return
     validate_inbound_users "$1" || return
+    if [[ $(jq -r .type "$1") == snell ]]; then
+        validate_snell_template "$1" || return
+        jq -r 'if .version==5 then "snell" else "snell-v6" end' "$1"; return
+    fi
     jq -er '
       if .type == "shadowsocks" and .method == "2022-blake3-aes-128-gcm" and .users == null then "shadowsocks"
       elif (.users | length) < 1 then error("empty user list")
@@ -1746,11 +1792,13 @@ edit_wizard_locked() (
     fi
     tag=$old_tag
     port=$(jq -r .listen_port "$work/original.json")
-    credential=$(jq -jr --argjson i "$((selected_user_index - 1))" '(.users[$i].uuid // .users[$i].password // .password // "") + "."' "$work/original.json") || exit 1
+    credential=$(jq -jr --argjson i "$((selected_user_index - 1))" '(.users[$i].uuid // .users[$i].password // .password // .psk // "") + "."' "$work/original.json") || exit 1
     credential=${credential%.}
     password=$(jq -jr --argjson i "$((selected_user_index - 1))" '(.users[$i].password // "") + "."' "$work/original.json") || exit 1
     password=${password%.}
     extra=$(jq -r '.transport.path // .transport.service_name // ""' "$work/original.json")
+    if [[ $protocol == snell ]]; then extra=$(jq -r '.obfs_mode // "none"' "$work/original.json")
+    elif [[ $protocol == snell-v6 ]]; then extra=$(jq -r '.mode // "default"' "$work/original.json"); fi
     tls_name=$(jq -r '.tls.server_name // .tls.reality.handshake.server // ""' "$work/original.json")
     private_key=$(jq -r '.tls.reality.private_key // ""' "$work/original.json")
     short_id=$(jq -r '.tls.reality.short_id[0] // ""' "$work/original.json")
@@ -1799,6 +1847,7 @@ edit_wizard_locked() (
         [[ $password != @new ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
     fi
     [[ $protocol != hysteria2 ]] || prompt_hysteria2_obfs obfs_password "$obfs_password" || exit 1
+    if [[ $protocol == snell || $protocol == snell-v6 ]]; then prompt_snell_options extra "$protocol" "$extra" || exit 1; fi
     if [[ $protocol == hysteria2 || $protocol == tuic ]]; then prompt_quic_bbr quic_bbr_choice || exit 1; fi
     case "$protocol" in
         *-ws|*-ws-tls) prompt extra "WebSocket 路径" "$extra" || exit 1 ;;
@@ -1835,7 +1884,7 @@ edit_wizard_locked() (
     jq --slurpfile updated "$work/generated.json" --argjson i "$((selected_user_index - 1))" '
         . as $old | . * $updated[0]
         | .listen = $old.listen
-        | if $old.users != null then .users=$old.users | .users[$i]=($old.users[$i] * $updated[0].users[0]) else . end
+        | if $old.users != null and $old.type!="snell" then .users=$old.users | .users[$i]=($old.users[$i] * $updated[0].users[0]) else . end
         | if $old.tls.alpn != null then .tls.alpn=$old.tls.alpn else . end
         | if $old.tls.reality.handshake.server_port != null then
             .tls.reality.handshake.server_port=$old.tls.reality.handshake.server_port else . end
@@ -1893,6 +1942,13 @@ generate_client() {
     fi
     if [[ ! $user_index =~ ^[1-9][0-9]{0,5}$ ]] || (( user_index > count )); then
         fail "用户序号无效。"; return 1
+    fi
+    if [[ $(jq -r .type "$inbound") == snell ]]; then
+        validate_snell_template "$inbound" || return
+        jq --arg server "$server" '. as $node | {type:"snell",tag:"proxy",server:$server,server_port:.listen_port,psk:.psk,
+          version:(if .version==5 then 4 else 6 end)} +
+          (if $node.version==5 then {obfs_mode:($node.obfs_mode // "none")} else {mode:($node.mode // "default")} end)' "$inbound"
+        return
     fi
     # Import supports all core schemas, but export must never silently drop security options.
     jq -e '
@@ -1979,6 +2035,22 @@ client_link() {
         port=$(jq -r '.server_port' "$file") || return
     [[ $server != *:* ]] || server="[$server]"
     case "$type" in
+        snell)
+            valid_tag "$tag" || { fail "Surge 配置名称无效。"; return 1; }
+            jq -e '(keys-["type","tag","server","server_port","version","psk","obfs_mode","mode"]|length==0) and
+              (.psk|type=="string" and test("^[A-Za-z0-9_+/@.=-]+$")) and
+              ((.version==4 and .mode==null and ((.obfs_mode // "none")=="none" or .obfs_mode=="http")) or
+               (.version==6 and .obfs_mode==null and ((.mode // "default")=="default" or .mode=="unshaped" or .mode=="unsafe-raw")))' "$file" >/dev/null || {
+                fail "Snell 无统一分享 URI；此 PSK/参数无法安全生成 Surge 配置行，请使用客户端 JSON。"; return 1;
+            }
+            # Host and PSK are validated before emitting an intentional credential export.
+            if ! valid_host "$(jq -r .server "$file")" || ! valid_port "$port"; then return 1; fi
+            credential=$(jq -r .psk "$file") || return
+            query="version=$(jq -r .version "$file")"
+            if [[ $(jq -r .version "$file") == 4 && $(jq -r '.obfs_mode // "none"' "$file") == http ]]; then query+=", obfs=http"; fi
+            if [[ $(jq -r .version "$file") == 6 && $(jq -r '.mode // "default"' "$file") != default ]]; then query+=", mode=$(jq -r .mode "$file")"; fi
+            printf '%s = snell, %s, %s, psk=%s, %s\n' "$tag" "$server" "$port" "$credential" "$query"
+            ;;
         vless)
             credential=$(jq -r '.uuid' "$file")
             transport=$(jq -r '.transport.type // "tcp"' "$file")
@@ -2046,7 +2118,7 @@ add_wizard_locked() (
     local choice protocol tag port credential extra="" private_key="" public_key="" short_id="" server="" pair work file
     local tls_name="" certificate="" tls_key="" password="" obfs_password="" default_server=""
     local quic_bbr_choice="" quic_record=""
-    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n 18. VLESS + TCP + TLS\n  0. 返回\n'
+    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n 18. VLESS + TCP + TLS\n 19. Snell v5（客户端 v4）\n 20. Snell v6\n  0. 返回\n'
     prompt choice "请选择" 1 || exit 1
     case "$choice" in
         0) exit 0 ;;
@@ -2066,6 +2138,8 @@ add_wizard_locked() (
         16) protocol=vless-grpc-reality ;;
         17) protocol=vless-ws-tls ;;
         18) protocol=vless-tcp-tls ;;
+        19) protocol=snell ;;
+        20) protocol=snell-v6 ;;
         5|6)
             prompt file "请输入服务器上的 JSON 文件绝对路径" || exit 1
             if [[ $choice == 5 ]]; then add_inbound_file "$file"; else
@@ -2082,9 +2156,14 @@ add_wizard_locked() (
     if ! valid_tag "$tag" || ! valid_port "$port"; then fail "名称或端口无效。"; exit 1; fi
     case "$protocol" in
         vless-*|vmess-*|tuic) credential=$("$CORE_BIN" generate uuid) || exit 1 ;;
-        shadowsocks|hysteria2|anytls) credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
+        shadowsocks|hysteria2|anytls|snell|snell-v6) credential=$("$CORE_BIN" generate rand --base64 16) || exit 1 ;;
     esac
     [[ $protocol != tuic ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+    if [[ $protocol == snell || $protocol == snell-v6 ]]; then
+        info "Snell 需核心 1.14+；当前模板为单 PSK，无需 TLS 证书。v5 不支持 Surge QUIC Proxy Mode，客户端请选 v4。"
+        prompt_secret credential "Snell PSK（回车自动生成，输入不回显）" "$credential" || exit 1
+        prompt_snell_options extra "$protocol" || exit 1
+    fi
     [[ $protocol != hysteria2 ]] || prompt_hysteria2_obfs obfs_password || exit 1
     if [[ $protocol == hysteria2 || $protocol == tuic ]]; then prompt_quic_bbr quic_bbr_choice || exit 1; fi
     case "$protocol" in
@@ -2156,7 +2235,7 @@ list_inbound_users() (
     trap 'rm -rf -- "$work"' EXIT
     config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/node.json" || exit 1
     detect_inbound_template "$work/node.json" >/dev/null || exit 1
-    [[ $(jq -r .type "$work/node.json") != shadowsocks ]] || { fail "此 Shadowsocks 模板仅支持单密码。"; exit 1; }
+    case "$(jq -r .type "$work/node.json")" in shadowsocks|snell) fail "此模板仅支持单密码/PSK，请使用修改配置。"; exit 1;; esac
     info "$tag 的用户（不显示连接凭据）："
     jq -r '["用户序号","用户名"], (.users|to_entries[]|[.key+1,(.value.name // "未命名")]) | @tsv' "$work/node.json"
 )
@@ -2177,7 +2256,7 @@ change_inbound_user() (
     config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/original.json" || exit 1
     detect_inbound_template "$work/original.json" >/dev/null || exit 1
     type=$(jq -r .type "$work/original.json") || exit 1
-    [[ $type != shadowsocks ]] || { fail "此 Shadowsocks 模板仅支持单密码。"; exit 1; }
+    case "$type" in shadowsocks|snell) fail "此模板仅支持单密码/PSK，请使用修改配置。"; exit 1;; esac
     count=$(inbound_user_count "$work/original.json") || exit 1
     metadata="$CLIENT_DIR/$tag.json"
     [[ ! -L $metadata && ( ! -e $metadata || -f $metadata ) ]] || { fail "连接信息文件无效。"; exit 1; }
@@ -2322,7 +2401,11 @@ show_client() (
         if [[ $mode != link-only ]]; then
             info "$label 客户端 outbound JSON（包含连接凭据）："
             cat "$work/outbound.json"
-            info "分享链接："
+            if [[ $(jq -r .type "$inbound") == snell ]]; then info "Surge [Proxy] 配置行（非通用分享 URI）："
+            else info "分享链接："; fi
+        fi
+        if [[ $mode == link-only && $(jq -r .type "$inbound") == snell ]]; then
+            info "Snell 无通用分享 URI，以下为 Surge [Proxy] 配置行："
         fi
         client_link "$work/outbound.json" "$label" || exit 1
     done
@@ -2522,6 +2605,9 @@ export_clients() (
     local format=${1:-} target=${2:-} work tag tmp=""
     require_core && safe_paths || exit 1
     case "$format" in links|base64|json) ;; *) fail "格式须为 links、base64 或 json。"; exit 1;; esac
+    if [[ $format != json ]] && config_jq -e 'any(.inbounds[]?; .type=="snell")' >/dev/null; then
+        fail "Snell 无统一分享 URI，批量 links/base64 不混入 Surge 配置行；请用 json 导出或单独查看 Snell 客户端配置。"; exit 1
+    fi
     [[ $target == /* && ! -e $target && ! -L $target && -d $(dirname -- "$target") ]] || {
         fail "请提供尚不存在的绝对文件路径；不会覆盖已有文件。"; exit 1;
     }
