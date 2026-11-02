@@ -37,6 +37,23 @@ jobs:
           tar -xzOf "$RUNNER_TEMP/sing-box-test/core.tar.gz" \
             sing-box-1.14.3-linux-amd64/sing-box > "$RUNNER_TEMP/sing-box-test/sing-box"
           chmod +x "$RUNNER_TEMP/sing-box-test/sing-box"
+      - name: ShadowTLS TLS-provider comparison
+        run: |
+          PYTHONPATH=tests python3 - "$RUNNER_TEMP/sing-box-test/sing-box" <<'PY'
+          import sys
+          import smoke_snell_shadowtls as test
+          original = test.bash_json
+          def standard_tls(*args, **kwargs):
+              value = original(*args, **kwargs)
+              if isinstance(value, dict):
+                  for node in value.get("outbounds", []):
+                      if node.get("type") == "shadowtls":
+                          node.get("tls", {}).pop("utls", None)
+              return value
+          test.bash_json = standard_tls
+          sys.argv = ["tls-provider-probe", "--core", sys.argv[1]]
+          raise SystemExit(test.main())
+          PY
       - name: Real-core Snell ShadowTLS chain tests
         run: python3 tests/smoke_snell_shadowtls.py --core "$RUNNER_TEMP/sing-box-test/sing-box"
       - name: Regression tests and real-core configuration checks
