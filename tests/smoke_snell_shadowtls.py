@@ -11,6 +11,7 @@ import secrets
 import sys
 import tempfile
 import time
+import traceback
 
 from smoke_core import (
     LOOPBACK,
@@ -186,8 +187,11 @@ def main() -> int:
             environment["SB_ROOT_PREFIX"] = str(work / "source-prefix")
             certificate, private_key = tls_material(work)
             run_case(core, manager, environment, work, certificate, private_key)
-    except Exception:
-        print("FAIL snell-shadowtls smoke", file=sys.stderr)
+    except Exception as error:
+        # Only locations and exception types: core diagnostics may hold credentials.
+        frames = traceback.extract_tb(error.__traceback__)
+        locations = ",".join(Path(f.filename).name+":"+str(f.lineno) for f in frames[-3:])
+        print("FAIL snell-shadowtls smoke: "+type(error).__name__+" at "+locations, file=sys.stderr)
         return 1
     print("PASS snell-shadowtls smoke: all checks passed")
     return 0
