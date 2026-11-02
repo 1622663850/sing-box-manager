@@ -448,4 +448,4 @@ v1.24.0 起，主菜单 **8 → 21** 添加 Snell v5（客户端 v4）与 Shadow
 
 客户端需支持 **ShadowTLS v3 + Snell v4**。查看配置可导出包含两个 outbound、`detour` 和默认 route 的配置片段，必须完整保留依赖；批量 JSON 导出也会同时包含两层。另提供官方 Surge `[Proxy]` 配置行，含 `shadow-tls-password`、`shadow-tls-version=3`、`shadow-tls-sni`。不会生成通用 URI 或绕过证书验证；复杂密码不能安全写为 Surge 行时，请使用完整 JSON。详见[Surge 官方 Shadow TLS 说明](https://manual.nssurge.com/policies/tls.html)。
 
-握手站点必须可从服务器访问、支持 TLS 1.3，且证书匹配 SNI。这里的真实 TLS 握手与 Snell 内置 TLS 混淆不同；客户端默认校验证书，不使用 `insecure`。服务器全局 IPv6 优先、其他路由和节点凭据不因面板更新而改变。
+握手站点必须可从服务器访问、支持 TLS 1.3 且兼容 ShadowTLS v3，证书须匹配 SNI；仅确认 TLS 1.3 能力不等于链路已可用，仍需客户端实际连接验证。这里的真实 TLS 握手与 Snell 内置 TLS 混淆不同；客户端默认校验证书，不使用 `insecure`。服务器全局 IPv6 优先、其他路由和节点凭据不因面板更新而改变。

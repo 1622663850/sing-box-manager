@@ -1141,7 +1141,7 @@ snell_shadowtls_wizard_locked() (
     [[ $psk != @new ]] || psk=$("$CORE_BIN" generate rand --base64 16) || exit 1
     prompt_secret shadow_password "ShadowTLS v3 密码（回车保留/自动生成，@new 重新生成）" "$shadow_password" || exit 1
     [[ $shadow_password != @new ]] || shadow_password=$("$CORE_BIN" generate rand --base64 16) || exit 1
-    info "握手站点须可达、支持 TLS 1.3，证书须匹配 SNI；不使用本地证书。"
+    info "握手站点须可达、兼容 ShadowTLS v3 并支持 TLS 1.3，证书须匹配 SNI；不使用本地证书。"
     prompt hs "TLS 握手站点 IP/域名" "$hs" || exit 1
     prompt hp "TLS 握手站点端口" "$hp" || exit 1
     prompt sni "TLS SNI（必须匹配握手站点证书）" "${sni:-$hs}" || exit 1
