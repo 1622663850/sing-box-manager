@@ -122,7 +122,11 @@ class SnellShadowTlsTest(unittest.TestCase):
         saved = copy.deepcopy(group)
         saved["sni"] = "new-sni.example"
         saved_path = self._write_group(saved, "saved-group.json")
+        config_before_client_only = self.config.read_bytes()
+        calls_before_client_only = len(self.calls())
         self.shell('confirm() { return 0; }; save_snell_shadowtls_locked "$1" "$2" "$3"', "save-stls", str(saved_path), "example.com", check=True)
+        self.assertEqual(self.config.read_bytes(), config_before_client_only)
+        self.assertFalse(any(action in call for call in self.calls()[calls_before_client_only:] for action in ("start", "stop", "restart")))
         self.assertIn("// keep pair comment", self.config.read_text(encoding="utf-8"))
         metadata_after = json.loads(metadata_path.read_text(encoding="utf-8"))
         self.assertEqual(metadata_after["outbound_route"], metadata["outbound_route"])
@@ -147,6 +151,7 @@ class SnellShadowTlsTest(unittest.TestCase):
         metadata = self.state_dir / "clients/active-save-stls.json"
         changed = copy.deepcopy(group)
         changed["sni"] = "changed.example"
+        changed["backend"]["psk"] = "changed-snell-psk"
         changed_path = self._write_group(changed, "active-save-changed.json")
         self.state(active=True, enabled=True, restart_failures=1)
         before_config = self.config.read_bytes()
