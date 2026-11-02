@@ -37,6 +37,8 @@ jobs:
           tar -xzOf "$RUNNER_TEMP/sing-box-test/core.tar.gz" \
             sing-box-1.14.3-linux-amd64/sing-box > "$RUNNER_TEMP/sing-box-test/sing-box"
           chmod +x "$RUNNER_TEMP/sing-box-test/sing-box"
+      - name: Real-core Snell ShadowTLS chain tests
+        run: python3 tests/smoke_snell_shadowtls.py --core "$RUNNER_TEMP/sing-box-test/sing-box"
       - name: Regression tests and real-core configuration checks
         env:
           SB_TEST_CORE: ${{ runner.temp }}/sing-box-test/sing-box
@@ -51,5 +53,3 @@ jobs:
         run: python3 tests/smoke_outbound_routes.py --core "$RUNNER_TEMP/sing-box-test/sing-box" --manager "$GITHUB_WORKSPACE/sing-box-manager.sh"
       - name: Real-core Snell server and client tests
         run: python3 tests/smoke_snell.py --core "$RUNNER_TEMP/sing-box-test/sing-box"
-      - name: Real-core Snell ShadowTLS chain tests
-        run: python3 tests/smoke_snell_shadowtls.py --core "$RUNNER_TEMP/sing-box-test/sing-box"

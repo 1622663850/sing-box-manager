@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
+import re
 import os
 from pathlib import Path
 import secrets
@@ -53,7 +55,7 @@ def find_outbound(config: dict, outbound_type: str) -> dict:
 
 def group_client_config(group: dict, port: int) -> dict:
     return {
-        "log": {"level": "warn"},
+        "log": {"level": "debug"},
         "inbounds": [{"type": "mixed", "tag": "local", "listen": LOOPBACK, "listen_port": port}],
         "outbounds": group["outbounds"],
         "route": group["route"],
@@ -93,7 +95,7 @@ def run_case(
     group_file = work / "snell-shadowtls-group.json"
     write_json(group_file, group)
     write_json(server_file, {
-        "log": {"level": "warn"},
+        "log": {"level": "debug"},
         "inbounds": [backend, front],
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "route": {"final": "direct"},
@@ -171,6 +173,34 @@ def run_case(
     print("PASS snell-shadowtls: chained HTTP/UDP, wrong PSK/password/certificate rejected", flush=True)
 
 
+def safe_diagnostics(work: Path) -> None:
+    secrets_to_hide = []
+    def collect(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"password", "psk", "userkey", "private_key"} and isinstance(item, str):
+                    secrets_to_hide.append(item)
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+    for path in work.glob("*.json"):
+        try:
+            collect(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            pass
+    for path in work.glob("*.log"):
+        lines = []
+        for line in path.read_text(errors="replace").splitlines():
+            if re.search(r"error|failed|hijacked|certificate", line, re.I):
+                for value in secrets_to_hide:
+                    if value:
+                        line = line.replace(value, "<REDACTED>")
+                lines.append(line[:600])
+        for line in lines[-6:]:
+            print("DIAG " + path.name + ": " + line, file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--core", required=True, type=Path)
@@ -186,7 +216,11 @@ def main() -> int:
             environment = os.environ.copy()
             environment["SB_ROOT_PREFIX"] = str(work / "source-prefix")
             certificate, private_key = tls_material(work)
-            run_case(core, manager, environment, work, certificate, private_key)
+            try:
+                run_case(core, manager, environment, work, certificate, private_key)
+            except Exception:
+                safe_diagnostics(work)
+                raise
     except Exception as error:
         # Only locations and exception types: core diagnostics may hold credentials.
         frames = traceback.extract_tb(error.__traceback__)
