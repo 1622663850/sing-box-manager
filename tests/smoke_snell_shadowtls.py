@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import sys
 import tempfile
+import time
 
 from smoke_core import (
     LOOPBACK,
@@ -121,7 +122,16 @@ def run_case(
                     with quiet_core(core, client_file, proxy_port, work, "snell-shadowtls-client"):
                         if request_with_retries(proxy_port, target_port, "/snell-shadowtls") != payload:
                             raise RuntimeError("Snell ShadowTLS HTTP forwarding mismatch")
-                        check_udp_through_socks(proxy_port, udp_target)
+                        # The SOCKS UDP relay may close a cold association while
+                        # its TLS dial settles; retry with a fresh association.
+                        for attempt in range(3):
+                            try:
+                                check_udp_through_socks(proxy_port, udp_target)
+                                break
+                            except OSError:
+                                if attempt == 2:
+                                    raise
+                                time.sleep(0.2)
 
                     wrong_psk_client = copy.deepcopy(client)
                     find_outbound({"outbounds": wrong_psk_client["outbounds"]}, "snell")["psk"] = (

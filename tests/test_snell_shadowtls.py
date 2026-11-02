@@ -163,7 +163,7 @@ class SnellShadowTlsTest(unittest.TestCase):
         self.assertTrue(self.state()["active"])
         self.assertTrue(self.state()["enabled"])
         result = self.shell('confirm() { return 1; }; save_snell_shadowtls_locked "$1" "$2" "$3"', "active-save-stls", str(changed_path), "example.com")
-        self.assertEqual(result.returncode, 0)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.config.read_bytes(), before_config)
         self.assertEqual(metadata.read_bytes(), before_metadata)
 
