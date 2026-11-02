@@ -438,3 +438,14 @@ v1.23.0 起，主菜单 **8 → 19** 添加 Snell v5（客户端配置使用 v4�
 查看配置时可导出 sing-box outbound JSON 及 **Surge `[Proxy]` 配置行**。Snell 没有通用标准分享 URI，不伪造 `snell://` 链接。v5 服务端使用客户端 `version=4`，不启用 Surge v5 QUIC Proxy Mode；v6 客户端使用 `version=6` 并与服务端模式一致。Surge 兼容性及客户端版本请参考[官方 Snell 文档](https://manual.nssurge.com/policies/snell.html)和[sing-box Snell 入站说明](https://sing-box.sagernet.org/configuration/inbound/snell/)。含逗号/空格等复杂字符的 PSK 保留在 JSON 中，但拒绝生成可能歧义的 Surge 行，建议使用自动生成的 PSK。
 
 批量 `export json` 包含 Snell；`export links/base64` 遇到 Snell 会拒绝混入 Surge 行并提示改用 JSON，避免输出不能按 URI 导入的混合文件。更新面板本身不会添加真实 Snell 节点或重启现有节点。
+
+
+## Snell + ShadowTLS v3
+
+v1.24.0 起，主菜单 **8 → 21** 添加 Snell v5（客户端 v4）与 ShadowTLS v3 组合。输入组合名称、公网 TCP 端口、Snell PSK、ShadowTLS 密码、TLS 1.3 握手站点/端口、匹配证书的 SNI 及本机公网连接地址。两层密码可分别自动生成；无需本地证书，也无需安装额外服务。公网只开放 ShadowTLS 端口，内部 Snell 固定绑定 `127.0.0.1:0`（由系统分配随机本机端口），由 ShadowTLS 的 `detour` 注入 Snell。
+
+列表中组合显示为一个逻辑节点及其公网端口，自动隐藏受管外层组件。修改配置会同时更新两层；当前组合名称固定，如需改名请新建后迁移。删除时成对移除，若被路由引用则先取消绑定；不允许单独修改/删除外层组件。面板只处理与元数据完整匹配的受管组合，缺失或被手动改过的组件会拒绝自动修改，避免误删。全部写入复用成套备份、JSONC 保留及事务回滚；原本停止的服务只在新增时自动启动。
+
+客户端需支持 **ShadowTLS v3 + Snell v4**。查看配置可导出包含两个 outbound、`detour` 和默认 route 的配置片段，必须完整保留依赖；批量 JSON 导出也会同时包含两层。另提供官方 Surge `[Proxy]` 配置行，含 `shadow-tls-password`、`shadow-tls-version=3`、`shadow-tls-sni`。不会生成通用 URI 或绕过证书验证；复杂密码不能安全写为 Surge 行时，请使用完整 JSON。详见[Surge 官方 Shadow TLS 说明](https://manual.nssurge.com/policies/tls.html)。
+
+握手站点必须可从服务器访问、支持 TLS 1.3，且证书匹配 SNI。这里的真实 TLS 握手与 Snell 内置 TLS 混淆不同；客户端默认校验证书，不使用 `insecure`。服务器全局 IPv6 优先、其他路由和节点凭据不因面板更新而改变。

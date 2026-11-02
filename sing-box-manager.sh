@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.23.0"
+SB_MANAGER_VERSION="1.24.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -918,6 +918,238 @@ validate_obfs_template() {
     }
 }
 
+generate_snell_shadowtls() {
+    local group_tag=$1 port=$2 psk=$3 shadow_password=$4 handshake=$5 handshake_port=${6:-443} sni=${7:-$5}
+    if ! valid_tag "$group_tag" || [[ ${#group_tag} -gt 59 ]] || ! valid_port "$port" ||
+       ! valid_port "$handshake_port" || ! valid_host "$handshake" || ! valid_host "$sni" || [[ -z $shadow_password ]]; then
+        fail "Snell/ShadowTLS 名称、端口、握手地址、SNI 或密码无效。"; return 1
+    fi
+    jq -n --arg tag "$group_tag" --argjson port "$((10#$port))" --arg psk "$psk" --arg password "$shadow_password" \
+      --arg hs "$handshake" --argjson hp "$((10#$handshake_port))" --arg sni "$sni" '
+      {format:"sing-box-manager-snell-shadowtls-v1",sni:$sni,
+       backend:{type:"snell",tag:$tag,listen:"127.0.0.1",listen_port:0,version:5,psk:$psk,obfs_mode:"none"},
+       front:{type:"shadowtls",tag:($tag+"-stls"),listen:"::",listen_port:$port,version:3,
+         users:[{name:"default",password:$password}],handshake:{server:$hs,server_port:$hp},strict_mode:true,detour:$tag}}' |
+      { local generated_group; generated_group=$(cat) || return 1
+        validate_snell_shadowtls_group <(printf '%s' "$generated_group") || return 1
+        printf '%s\n' "$generated_group"; }
+}
+
+validate_snell_shadowtls_group() {
+    jq -e '
+      .format=="sing-box-manager-snell-shadowtls-v1" and
+      (keys==["backend","format","front","sni"]) and
+      (.backend|keys==["listen","listen_port","obfs_mode","psk","tag","type","version"]) and
+      .backend.type=="snell" and .backend.version==5 and .backend.listen=="127.0.0.1" and
+      .backend.listen_port==0 and .backend.obfs_mode=="none" and
+      (.backend.tag|type=="string" and test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,58}$")) and
+      (.backend.psk|type=="string" and utf8bytelength>0 and utf8bytelength<=255 and (contains("\u0000")|not)) and
+      (.front|keys==["detour","handshake","listen","listen_port","strict_mode","tag","type","users","version"]) and
+      .front.type=="shadowtls" and .front.version==3 and .front.strict_mode==true and
+      (.front.listen=="::" or .front.listen=="127.0.0.1") and
+      (.front.listen_port|type=="number" and .==floor and .>0 and .<=65535) and
+      .front.tag==(.backend.tag+"-stls") and .front.detour==.backend.tag and
+      (.front.users|type=="array" and length==1) and
+      (.front.users[0]|keys==["name","password"] and .name=="default" and
+         (.password|type=="string" and utf8bytelength>0 and (contains("\u0000")|not))) and
+      (.front.handshake|keys==["server","server_port"] and (.server|type=="string") and
+        (.server_port|type=="number" and .==floor and .>0 and .<=65535)) and
+      (.sni|type=="string")' "$1" >/dev/null 2>&1 || { fail "Snell + ShadowTLS 组合模板无效，未保存。"; return 1; }
+    valid_host "$(jq -r .front.handshake.server "$1")" && valid_host "$(jq -r .sni "$1")"
+}
+
+read_snell_shadowtls_group() (
+    umask 077
+    local group_tag=$1 work front_tag
+    valid_tag "$group_tag" || exit 1
+    [[ -f $CLIENT_DIR/$group_tag.json && ! -L $CLIENT_DIR/$group_tag.json ]] || { fail "组合节点连接信息缺失。"; exit 1; }
+    work=$(mktemp -d "$STATE_DIR/shadowtls-read.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    jq -e '.shadowtls_group' "$CLIENT_DIR/$group_tag.json" >"$work/group.json" || exit 1
+    validate_snell_shadowtls_group "$work/group.json" || exit 1
+    front_tag=$(jq -r .front.tag "$work/group.json") || exit 1
+    [[ ! -e $CLIENT_DIR/$front_tag.json && ! -L $CLIENT_DIR/$front_tag.json ]] || { fail "组合组件存在独立连接信息，请先核对。"; exit 1; }
+    config_jq . >"$work/config.json" || exit 1
+    jq -e --arg t "$group_tag" --slurpfile g "$work/group.json" --slurpfile meta "$CLIENT_DIR/$group_tag.json" '
+      $g[0].backend.tag==$t and $meta[0].inbound==$g[0].backend and
+      ([.inbounds[]? | select(.tag==$t)]==[$g[0].backend]) and
+      ([.inbounds[]? | select(.tag==$g[0].front.tag)]==[$g[0].front])' "$work/config.json" >/dev/null || {
+        fail "Snell/ShadowTLS 组件或元数据已被外部修改，已取消操作。"; exit 1;
+    }
+    cat -- "$work/group.json"
+)
+
+is_snell_shadowtls() {
+    [[ -f $CLIENT_DIR/$1.json && ! -L $CLIENT_DIR/$1.json ]] && jq -e 'has("shadowtls_group")' "$CLIENT_DIR/$1.json" >/dev/null 2>&1
+}
+
+check_shadowtls_component() {
+    local component_tag=$1 file
+    for file in "$CLIENT_DIR"/*.json; do
+        [[ -f $file && ! -L $file ]] || continue
+        if jq -e --arg t "$component_tag" '.shadowtls_group.front.tag==$t' "$file" >/dev/null 2>&1; then
+            fail "此入站是受管 ShadowTLS 组件，请操作对应的 Snell 逻辑节点。"; return 1
+        fi
+    done
+    return 0
+}
+
+logical_inbounds() {
+    config_jq . | python3 -c '
+import json, pathlib, sys
+cfg=json.load(sys.stdin); nodes=cfg.get("inbounds",[]); views={}; hidden=set()
+for p in pathlib.Path(sys.argv[1]).glob("*.json"):
+    if p.is_symlink(): continue
+    try:
+        m=json.loads(p.read_text()); g=m.get("shadowtls_group")
+        if not isinstance(g,dict) or g.get("format")!="sing-box-manager-snell-shadowtls-v1": continue
+        backend=g["backend"]; front=g["front"]
+        if m.get("inbound")!=backend or [n for n in nodes if n.get("tag")==backend["tag"]]!=[backend] or [n for n in nodes if n.get("tag")==front["tag"]]!=[front]: continue
+        views[backend["tag"]]=dict(backend,listen=front["listen"],listen_port=front["listen_port"],_manager_type="snell+shadowtls-v3")
+        hidden.add(front["tag"])
+    except (OSError,ValueError,KeyError,TypeError,AttributeError): continue
+json.dump([views.get(n.get("tag"),n) for n in nodes if n.get("tag") not in hidden],sys.stdout)
+' "$CLIENT_DIR"
+}
+
+# shellcheck disable=SC2016 # jq bundle filters use literal variables.
+change_snell_shadowtls_locked() (
+    umask 077
+    local action=$1 group_tag=$2 group_file=${3:-} server=${4:-} work front_tag activation=preserve
+    require_core && safe_paths || exit 1
+    if ! valid_tag "$group_tag" || { [[ -n $server ]] && ! valid_host "$server"; }; then fail "节点名称或连接地址无效。"; exit 1; fi
+    work=$(mktemp -d "$STATE_DIR/shadowtls-save.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before.json" || exit 1
+    if [[ $action == add ]]; then
+        cp -- "$group_file" "$work/new.json" || exit 1
+        validate_snell_shadowtls_group "$work/new.json" || exit 1
+        front_tag=$(jq -r .front.tag "$work/new.json")
+        [[ $(jq -r .backend.tag "$work/new.json") == "$group_tag" && ! -e $CLIENT_DIR/$group_tag.json && ! -L $CLIENT_DIR/$group_tag.json && ! -e $CLIENT_DIR/$front_tag.json && ! -L $CLIENT_DIR/$front_tag.json ]] || { fail "组合名称或连接信息已存在。"; exit 1; }
+        if jq -e --arg t "$group_tag" --arg f "$front_tag" 'any(.config.inbounds[]?; .tag==$t or .tag==$f)' "$work/before.json" >/dev/null; then fail "组件名称已存在。"; exit 1; fi
+        jq .front "$work/new.json" >"$work/front.json" || exit 1
+        check_inbound_conflicts "$work/front.json" || exit 1
+        jq --slurpfile g "$work/new.json" --arg server "$server" --arg t "$group_tag" '
+          .config.inbounds+=[$g[0].backend,$g[0].front] |
+          .clients[$t]={server:$server,public_key:"",inbound:$g[0].backend,shadowtls_group:$g[0]}' "$work/before.json" >"$work/after.json" || exit 1
+        activation=start
+    else
+        read_snell_shadowtls_group "$group_tag" >"$work/old.json" || exit 1
+        front_tag=$(jq -r .front.tag "$work/old.json")
+        if [[ $action == delete ]]; then
+            jq --arg t "$group_tag" --arg f "$front_tag" '.config.inbounds|=map(select(.tag!=$t and .tag!=$f))' "$work/before.json" >"$work/after.json" || exit 1
+            if jq -e --arg t "$group_tag" --arg f "$front_tag" '.config|any(..|strings; .==$t or .==$f)' "$work/after.json" >/dev/null; then
+                fail "组合节点被路由或其他配置引用，请先取消绑定/引用。"; exit 1
+            fi
+            jq --arg t "$group_tag" 'del(.clients[$t])' "$work/after.json" >"$work/next.json" && mv "$work/next.json" "$work/after.json" || exit 1
+        elif [[ $action == edit ]]; then
+            cp -- "$group_file" "$work/new.json" || exit 1
+            validate_snell_shadowtls_group "$work/new.json" || exit 1
+            [[ $(jq -r .backend.tag "$work/new.json") == "$group_tag" && $(jq -r .front.tag "$work/new.json") == "$front_tag" ]] || { fail "组合节点请保留名称；如需改名，请新增后迁移。"; exit 1; }
+            jq .front "$work/new.json" >"$work/front.json" || exit 1
+            check_inbound_conflicts "$work/front.json" "$front_tag" || exit 1
+            jq --arg t "$group_tag" --arg f "$front_tag" --arg server "$server" --slurpfile g "$work/new.json" '
+              .config.inbounds|=map(if .tag==$t then $g[0].backend elif .tag==$f then $g[0].front else . end) |
+              .clients[$t].inbound=$g[0].backend | .clients[$t].shadowtls_group=$g[0] | .clients[$t].server=$server' "$work/before.json" >"$work/after.json" || exit 1
+        else exit 1; fi
+    fi
+    if [[ $(jq -Sc '{config,clients}' "$work/before.json") == "$(jq -Sc '{config,clients}' "$work/after.json")" ]]; then info "组合配置未变化，无需保存或重启。"; exit 0; fi
+    jq .config "$work/after.json" >"$work/candidate.json" || exit 1
+    validate_config "$work/candidate.json" >"$work/check.log" 2>&1 || { fail "Snell/ShadowTLS 组合未通过核心校验，未保存。"; exit 1; }
+    info "将同时${action} Snell 和 ShadowTLS 两层；现有其他节点、自启和默认出站保留。"
+    confirm "保存组合节点操作？（成套备份，运行中的服务短暂重启）" || exit 1
+    snapshot_bundle >"$work/current.json" || exit 1
+    [[ $(jq -Sc . "$work/before.json") == "$(jq -Sc . "$work/current.json")" ]] || { fail "配置或元数据已变化，请重试。"; exit 1; }
+    apply_bundle "$work/after.json" preserve "$activation" >"$work/save.log" 2>&1 || { fail "组合保存失败，已执行成套回滚，请核对服务状态和备份。"; exit 1; }
+    info "Snell + ShadowTLS v3 组合已保存。"
+)
+
+add_snell_shadowtls_locked() {
+    local group_file=$1 server=${2:-} group_tag
+    group_tag=$(jq -er .backend.tag "$group_file") || return 1
+    change_snell_shadowtls_locked add "$group_tag" "$group_file" "$server"
+}
+save_snell_shadowtls_locked() { change_snell_shadowtls_locked edit "$@"; }
+delete_snell_shadowtls_locked() { change_snell_shadowtls_locked delete "$1"; }
+
+generate_snell_shadowtls_clients() {
+    local group_file=$1 server=$2 label=$3
+    if ! validate_snell_shadowtls_group "$group_file" || ! valid_host "$server" || ! valid_tag "$label"; then return 1; fi
+    jq --arg server "$server" --arg label "$label" '
+      {outbounds:[{type:"snell",tag:$label,version:4,server:$server,server_port:.front.listen_port,psk:.backend.psk,
+        obfs_mode:"none",detour:($label+":shadowtls")},
+        {type:"shadowtls",tag:($label+":shadowtls"),server:$server,server_port:.front.listen_port,version:3,
+         password:.front.users[0].password,tls:{enabled:true,server_name:.sni,utls:{enabled:true,fingerprint:"chrome"}}}],route:{final:$label}}' "$group_file"
+}
+
+snell_shadowtls_surge() {
+    local group_file=$1 server=$2 label=$3
+    if ! validate_snell_shadowtls_group "$group_file" || ! valid_host "$server" || ! valid_tag "$label"; then return 1; fi
+    jq -e '(.backend.psk|test("^[A-Za-z0-9_+/@.=-]+$")) and (.front.users[0].password|test("^[A-Za-z0-9_+/@.=-]+$"))' "$group_file" >/dev/null || {
+        fail "密码含无法安全表示为 Surge 行的字符，请导出完整双层 JSON。"; return 1;
+    }
+    jq -r --arg server "$server" --arg label "$label" '"\($label) = snell, \($server), \(.front.listen_port), psk=\(.backend.psk), version=4, shadow-tls-password=\(.front.users[0].password), shadow-tls-version=3, shadow-tls-sni=\(.sni)"' "$group_file"
+}
+
+show_snell_shadowtls_client() (
+    umask 077
+    local group_tag=$1 server=${2:-} mode=${3:-full} work
+    work=$(mktemp -d "$STATE_DIR/shadowtls-client.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    read_snell_shadowtls_group "$group_tag" >"$work/group.json" || exit 1
+    [[ -n $server ]] || server=$(jq -r '.server // ""' "$CLIENT_DIR/$group_tag.json")
+    [[ -n $server ]] || server=$(read_default_server) || exit 1
+    if [[ -z $server ]]; then
+        [[ $mode == full ]] || { fail "缺少组合节点公网地址，请设置默认连接地址。"; exit 1; }
+        prompt server "服务器公网 IP/域名（不是握手站点）" || exit 1
+    fi
+    generate_snell_shadowtls_clients "$work/group.json" "$server" "$group_tag" >"$work/client.json" || exit 1
+    if [[ $mode == json-only ]]; then jq '.outbounds[]' "$work/client.json"; exit; fi
+    if [[ $mode == full ]]; then
+        info "客户端配置片段（包含双层凭据；须完整保留两个 outbound 和 detour）："
+        cat "$work/client.json"
+    fi
+    info "Surge [Proxy] 配置行（非通用 URI）："
+    snell_shadowtls_surge "$work/group.json" "$server" "$group_tag"
+)
+
+snell_shadowtls_wizard_locked() (
+    umask 077
+    local group_tag=${1:-} work port=443 psk shadow_password hs="" hp=443 sni="" server="" action=add
+    require_core && safe_paths || exit 1
+    work=$(mktemp -d "$STATE_DIR/shadowtls-wizard.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    if [[ -n $group_tag ]]; then
+        action=edit
+        read_snell_shadowtls_group "$group_tag" >"$work/original.json" || exit 1
+        port=$(jq -r .front.listen_port "$work/original.json")
+        psk=$(jq -jr '.backend.psk+"."' "$work/original.json"); psk=${psk%.}
+        shadow_password=$(jq -jr '.front.users[0].password+"."' "$work/original.json"); shadow_password=${shadow_password%.}
+        hs=$(jq -r .front.handshake.server "$work/original.json"); hp=$(jq -r .front.handshake.server_port "$work/original.json"); sni=$(jq -r .sni "$work/original.json")
+        server=$(jq -r '.server // ""' "$CLIENT_DIR/$group_tag.json")
+        info "修改组合 $group_tag（保留名称，回车保留两层密码，@new 重新生成）。"
+    else
+        prompt group_tag "组合节点名称（字母/数字/短横线/下划线，最多 59 位）" "snell-stls-$(date +%H%M%S)" || exit 1
+        psk=$("$CORE_BIN" generate rand --base64 16) || exit 1
+        shadow_password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+    fi
+    prompt port "ShadowTLS 公网 TCP 端口" "$port" || exit 1
+    prompt_secret psk "Snell PSK（回车保留/自动生成，@new 重新生成）" "$psk" || exit 1
+    [[ $psk != @new ]] || psk=$("$CORE_BIN" generate rand --base64 16) || exit 1
+    prompt_secret shadow_password "ShadowTLS v3 密码（回车保留/自动生成，@new 重新生成）" "$shadow_password" || exit 1
+    [[ $shadow_password != @new ]] || shadow_password=$("$CORE_BIN" generate rand --base64 16) || exit 1
+    info "握手站点须可达、支持 TLS 1.3，证书须匹配 SNI；不使用本地证书。"
+    prompt hs "TLS 握手站点 IP/域名" "$hs" || exit 1
+    prompt hp "TLS 握手站点端口" "$hp" || exit 1
+    prompt sni "TLS SNI（必须匹配握手站点证书）" "${sni:-$hs}" || exit 1
+    [[ -n $server ]] || server=$(read_default_server) || exit 1
+    prompt server "服务器公网 IP/域名（客户端连接地址；- 清除独立地址）" "$server" || exit 1
+    [[ $server != - ]] || server=""
+    generate_snell_shadowtls "$group_tag" "$port" "$psk" "$shadow_password" "$hs" "$hp" "$sni" >"$work/new.json" || exit 1
+    if [[ $action == add ]]; then add_snell_shadowtls_locked "$work/new.json" "$server"
+    else save_snell_shadowtls_locked "$group_tag" "$work/new.json" "$server"; fi
+)
+
 validate_snell_template() {
     jq -e '
       .type=="snell" and (.version==5 or .version==6) and
@@ -1444,11 +1676,11 @@ select_inbound() {
     local destination=$1 operation=${2:-操作} snapshot count inbound_selection candidate_tag current
     # Caller owns tag/old_tag/selected_tag, as with prompt's dynamic assignment.
     printf -v "$destination" '%s' ""
-    snapshot=$(config_jq -ce '(.inbounds // []) | if type=="array" then . else error("inbounds must be an array") end') || return 1
+    snapshot=$(logical_inbounds | jq -ce 'if type=="array" then . else error("inbounds must be an array") end') || return 1
     count=$(jq 'length' <<<"$snapshot") || return 1
     [[ $count -gt 0 ]] || { info "暂无入站配置。"; return 0; }
     jq -r '["序号","名称","协议","端口"],
-        (to_entries[] | [.key+1,.value.tag,.value.type,(.value.listen_port // "-")])
+        (to_entries[] | [.key+1,.value.tag,(.value._manager_type // .value.type),(.value.listen_port // "-")])
         | map(if type=="string" then gsub("[[:cntrl:]]"; "?") else . end) | @tsv' <<<"$snapshot" || return 1
     info "可输入序号或配置名；纯数字配置名请使用 name:名称。"
     while true; do
@@ -1472,7 +1704,7 @@ select_inbound() {
             warn "配置不存在、名称不支持或名称重复，请重新选择。"
             continue
         fi
-        current=$(config_jq -Sc '.inbounds // []') || return 1
+        current=$(logical_inbounds | jq -Sc .) || return 1
         if [[ $current != "$(jq -Sc . <<<"$snapshot")" ]]; then
             fail "配置列表已被其他操作修改，请重新进入选择，避免序号对应错误。"; return 1
         fi
@@ -1779,6 +2011,8 @@ edit_wizard_locked() (
         [[ -n $old_tag ]] || exit 0
     fi
     valid_tag "$old_tag" || { fail "配置名称无效。"; exit 1; }
+    check_shadowtls_component "$old_tag" || exit 1
+    if is_snell_shadowtls "$old_tag"; then snell_shadowtls_wizard_locked "$old_tag"; exit $?; fi
     work=$(mktemp -d "$STATE_DIR/edit-wizard.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     config_jq -e --arg tag "$old_tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' \
@@ -2118,7 +2352,7 @@ add_wizard_locked() (
     local choice protocol tag port credential extra="" private_key="" public_key="" short_id="" server="" pair work file
     local tls_name="" certificate="" tls_key="" password="" obfs_password="" default_server=""
     local quic_bbr_choice="" quic_record=""
-    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n 18. VLESS + TCP + TLS\n 19. Snell v5（客户端 v4）\n 20. Snell v6\n  0. 返回\n'
+    printf '\n添加配置\n  1. VLESS + TCP + REALITY + Vision\n  2. VLESS + WebSocket（无 TLS）\n  3. VLESS TCP（无 TLS）\n  4. Shadowsocks 2022\n  5. 导入单个 inbound JSON 文件\n  6. 导入完整配置 JSON（替换当前配置）\n  7. Hysteria 2\n  8. TUIC\n  9. AnyTLS\n 10. VLESS + gRPC + TLS\n 11. VMess + TCP\n 12. VMess + TCP + TLS\n 13. VMess + WebSocket\n 14. VMess + WebSocket + TLS\n 15. VMess + gRPC + TLS\n 16. VLESS + gRPC + REALITY（不使用 Vision）\n 17. VLESS + WebSocket + TLS\n 18. VLESS + TCP + TLS\n 19. Snell v5（客户端 v4）\n 20. Snell v6\n 21. Snell + ShadowTLS v3（客户端 v4）\n  0. 返回\n'
     prompt choice "请选择" 1 || exit 1
     case "$choice" in
         0) exit 0 ;;
@@ -2140,6 +2374,7 @@ add_wizard_locked() (
         18) protocol=vless-tcp-tls ;;
         19) protocol=snell ;;
         20) protocol=snell-v6 ;;
+        21) snell_shadowtls_wizard_locked; exit $? ;;
         5|6)
             prompt file "请输入服务器上的 JSON 文件绝对路径" || exit 1
             if [[ $choice == 5 ]]; then add_inbound_file "$file"; else
@@ -2345,6 +2580,11 @@ show_client() (
     case "$mode" in full|json-only|link-only) ;; *) fail "无效的客户端导出方式。"; exit 1;; esac
     require_core || exit 1
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
+    check_shadowtls_component "$tag" || exit 1
+    if is_snell_shadowtls "$tag"; then
+        [[ -z $user_index || $user_index == 1 || $user_index == all ]] || { fail "组合模板仅支持单 PSK。"; exit 1; }
+        show_snell_shadowtls_client "$tag" "$server" "$mode"; exit $?
+    fi
     work=$(mktemp -d "$STATE_DIR/view.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     config_jq -e --arg tag "$tag" '.inbounds[]? | select(.tag==$tag)' >"$work/inbound.json" || {
@@ -2551,6 +2791,8 @@ delete_inbound() (
         [[ -n $tag ]] || exit 0
     fi
     valid_tag "$tag" || { fail "配置名称无效。"; exit 1; }
+    check_shadowtls_component "$tag" || exit 1
+    if is_snell_shadowtls "$tag"; then delete_snell_shadowtls_locked "$tag"; exit $?; fi
     config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | length==1' >/dev/null || {
         fail "配置不存在或名称重复。"; exit 1;
     }
@@ -2619,7 +2861,7 @@ export_clients() (
         if [[ $format == json ]]; then
             show_client "$tag" "" json-only all >>"$work/nodes" || exit 1
         else show_client "$tag" "" link-only all >>"$work/nodes" || exit 1; fi
-    done < <(config_jq -r '.inbounds[].tag')
+    done < <(logical_inbounds | jq -r '.[].tag')
     case "$format" in
         links) cp -- "$work/nodes" "$work/result" ;;
         base64) base64 -w 0 "$work/nodes" >"$work/result" ;;
@@ -2671,7 +2913,7 @@ diagnose() (
         fi
         if show_client "$tag" "" link-only all >"$work/client" 2>"$work/client-error"; then info "客户端链接生成检查通过（不显示凭据）。"
         else warn "客户端链接不能生成，请检查连接地址、公钥元数据或模板支持范围。"; issue=1; fi
-    done < <(config_jq -c '.inbounds[]?')
+    done < <(logical_inbounds | jq -c '.[]')
     info "此检查不探测公网，不修改防火墙；云平台入站规则、DNS 解析及实际客户端连接需分别验证。"
     exit "$issue"
 )
@@ -2696,8 +2938,8 @@ management_menu() {
 
 show_config_list() {
     local tag
-    config_jq -r '["序号","名称","协议","监听地址","端口"],
-        ((.inbounds // []) | to_entries[] | [.key+1,.value.tag,.value.type,(.value.listen // "-"),(.value.listen_port // "-")])
+    logical_inbounds | jq -r '["序号","名称","协议","监听地址","端口"],
+        (to_entries[] | [.key+1,.value.tag,(.value._manager_type // .value.type),(.value.listen // "-"),(.value.listen_port // "-")])
         | map(if type=="string" then gsub("[[:cntrl:]]"; "?") else . end) | @tsv' || return
     if ! config_jq -e '.inbounds | length > 0' >/dev/null; then
         info "暂无入站配置。"
@@ -2707,7 +2949,7 @@ show_config_list() {
     while IFS= read -r tag; do
         printf '\n[%s]\n' "$(jq -rn --arg tag "$tag" '$tag | gsub("[[:cntrl:]]"; "?")')"
         show_client "$tag" "" link-only all || warn "此配置暂时无法生成分享链接，其他配置仍会继续显示。"
-    done < <(config_jq -r '.inbounds[]?.tag')
+    done < <(logical_inbounds | jq -r '.[].tag')
 }
 
 show_config() {
@@ -3832,6 +4074,8 @@ bind_outbound_locked() (
     if ! valid_tag "$bind_inbound" || { [[ $bind_target != - ]] && ! valid_tag "$bind_target"; }; then
         fail "入站或出站名称无效。"; exit 1
     fi
+    check_shadowtls_component "$bind_inbound" || exit 1
+    if is_snell_shadowtls "$bind_inbound"; then read_snell_shadowtls_group "$bind_inbound" >/dev/null || exit 1; fi
     work=$(mktemp -d "$STATE_DIR/outbound-bind.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     snapshot_bundle >"$work/before.json" || exit 1
