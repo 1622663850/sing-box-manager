@@ -2179,6 +2179,7 @@ generate_client() {
     fi
     if [[ $(jq -r .type "$inbound") == snell ]]; then
         validate_snell_template "$inbound" || return
+        valid_port "$(jq -r .listen_port "$inbound")" || { fail "内部 Snell 不可单独导出，请从逻辑节点导出完整组合。"; return 1; }
         jq --arg server "$server" '. as $node | {type:"snell",tag:"proxy",server:$server,server_port:.listen_port,psk:.psk,
           version:(if .version==5 then 4 else 6 end)} +
           (if $node.version==5 then {obfs_mode:($node.obfs_mode // "none")} else {mode:($node.mode // "default")} end)' "$inbound"

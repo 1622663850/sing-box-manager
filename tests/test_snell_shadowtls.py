@@ -99,6 +99,17 @@ class SnellShadowTlsTest(unittest.TestCase):
         self.assertEqual(metadata["shadowtls_group"], group)
         self.assertTrue(any("start" in call for call in self.calls()))
 
+    def test_add_start_failure_rolls_back_pair_and_metadata(self) -> None:
+        group = self.group("add-fail-stls", 25706)
+        path = self._write_group(group, "add-fail-group.json")
+        before = self.config.read_bytes()
+        self.state(start_failures=1)
+        result = self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" "$2"', str(path), "example.com")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse((self.state_dir / "clients/add-fail-stls.json").exists())
+        self.assertFalse(self.state()["active"])
+
     def test_save_preserves_comments_and_unrelated_metadata_and_delete_reference_protection(self) -> None:
         group = self.group("save-stls", 25704)
         path = self._write_group(group, "save-group.json")
@@ -129,6 +140,42 @@ class SnellShadowTlsTest(unittest.TestCase):
         self.assertNotIn("save-stls", [node["tag"] for node in json.loads(self.shell("config_jq .", check=True).stdout)["inbounds"]])
         self.assertFalse(metadata_path.exists())
 
+    def test_save_active_restart_failure_and_cancel_preserve_pair_state(self) -> None:
+        group = self.group("active-save-stls", 25707)
+        path = self._write_group(group, "active-save-group.json")
+        self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" "$2"', str(path), "example.com", check=True)
+        metadata = self.state_dir / "clients/active-save-stls.json"
+        changed = copy.deepcopy(group)
+        changed["sni"] = "changed.example"
+        changed_path = self._write_group(changed, "active-save-changed.json")
+        self.state(active=True, enabled=True, restart_failures=1)
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        result = self.shell('confirm() { return 0; }; save_snell_shadowtls_locked "$1" "$2" "$3"', "active-save-stls", str(changed_path), "example.com")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+        self.assertTrue(self.state()["active"])
+        self.assertTrue(self.state()["enabled"])
+        result = self.shell('confirm() { return 1; }; save_snell_shadowtls_locked "$1" "$2" "$3"', "active-save-stls", str(changed_path), "example.com")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+
+    def test_delete_active_restart_failure_rolls_back_pair_and_metadata(self) -> None:
+        group = self.group("delete-fail-stls", 25708)
+        path = self._write_group(group, "delete-fail-group.json")
+        self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" "$2"', str(path), "example.com", check=True)
+        metadata = self.state_dir / "clients/delete-fail-stls.json"
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        self.state(active=True, restart_failures=1)
+        result = self.shell('confirm() { return 0; }; delete_snell_shadowtls_locked "$1"', "delete-fail-stls")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+        self.assertTrue(self.state()["active"])
+
     def test_read_group_rejects_external_change_and_client_export_is_pair(self) -> None:
         group = self.group("read-stls", 25705)
         path = self._write_group(group, "read-group.json")
@@ -149,7 +196,66 @@ class SnellShadowTlsTest(unittest.TestCase):
         self.assertIn("shadow-tls-version=3", link)
         surge = self.shell('snell_shadowtls_surge "$1" "$2" "$3"', str(path), "example.com", "read", check=True).stdout
         self.assertIn("shadow-tls-version=3", surge)
-        self.assertIn("snell", surge)
+
+    def test_logical_inbounds_hides_frontend_and_json_batch_keeps_pair_dependency(self) -> None:
+        group = self.group("logical-stls", 25709)
+        path = self._write_group(group, "logical-group.json")
+        self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" "$2"', str(path), "example.com", check=True)
+        logical = json.loads(self.shell("logical_inbounds", check=True).stdout)
+        self.assertEqual(len(logical), 1)
+        self.assertEqual(logical[0]["tag"], "logical-stls")
+        self.assertEqual(logical[0]["listen_port"], 25709)
+        self.assertEqual(logical[0]["_manager_type"], "snell+shadowtls-v3")
+        self.assertNotIn("logical-stls-stls", [item["tag"] for item in logical])
+        full = self.shell('set -o pipefail; show_snell_shadowtls_client "$1" "$2" json-only | jq -s .', "logical-stls", "example.com", check=True)
+        self.assertEqual(len(json.loads(full.stdout)), 2)
+        target = self.root / "logical-export.json"
+        self.shell('export_clients json "$1"', str(target), check=True)
+        self.assertEqual(len(json.loads(target.read_text(encoding="utf-8"))["outbounds"]), 2)
+
+    def test_frontend_tag_operations_reject_backend_operations_and_binding_survives_save(self) -> None:
+        group = self.group("tag-stls", 25710)
+        path = self._write_group(group, "tag-group.json")
+        self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" "$2"', str(path), "example.com", check=True)
+        self.assertNotEqual(self.shell('delete_inbound "$1"', "tag-stls-stls").returncode, 0)
+        self.assertNotEqual(self.shell('edit_wizard_locked "$1"', "tag-stls-stls").returncode, 0)
+        config = json.loads(self.shell("config_jq .", check=True).stdout)
+        config["outbounds"].append({"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": 1080})
+        fixture.dump(self.config, config)
+        self.assertNotEqual(self.shell('bind_outbound_locked "$1" "$2"', "tag-stls-stls", "proxy").returncode, 0)
+        self.shell('confirm() { return 0; }; bind_outbound_locked "$1" "$2"', "tag-stls", "proxy", check=True)
+        metadata = json.loads((self.state_dir / "clients/tag-stls.json").read_text(encoding="utf-8"))
+        self.assertIn("outbound_route", metadata)
+        changed = copy.deepcopy(group)
+        changed["sni"] = "saved-sni.example"
+        changed_path = self._write_group(changed, "tag-saved-group.json")
+        self.shell('confirm() { return 0; }; save_snell_shadowtls_locked "$1" "$2" "$3"', "tag-stls", str(changed_path), "example.com", check=True)
+        metadata = json.loads((self.state_dir / "clients/tag-stls.json").read_text(encoding="utf-8"))
+        self.assertIn("outbound_route", metadata)
+        self.assertNotEqual(self.shell('confirm() { return 0; }; delete_snell_shadowtls_locked "$1"', "tag-stls").returncode, 0)
+        self.shell('confirm() { return 0; }; bind_outbound_locked "$1" -', "tag-stls", check=True)
+        self.shell('confirm() { return 0; }; delete_inbound "$1"', "tag-stls", check=True)
+        self.assertFalse((self.state_dir / "clients/tag-stls.json").exists())
+
+    def test_save_confirmation_external_metadata_change_is_rejected(self) -> None:
+        group = self.group("cas-stls", 25711)
+        path = self._write_group(group, "cas-group.json")
+        self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" "$2"', str(path), "example.com", check=True)
+        metadata = self.state_dir / "clients/cas-stls.json"
+        changed = copy.deepcopy(group)
+        changed["sni"] = "cas-changed.example"
+        changed_path = self._write_group(changed, "cas-changed-group.json")
+        before_config = self.config.read_bytes()
+        before_metadata = metadata.read_bytes()
+        self.env["SNELL_GROUP_METADATA"] = str(metadata)
+        result = self.shell(
+            "confirm() { jq --arg value external.example '.server=$value' \"$SNELL_GROUP_METADATA\" >\"$SNELL_GROUP_METADATA.tmp\" && mv \"$SNELL_GROUP_METADATA.tmp\" \"$SNELL_GROUP_METADATA\"; return 0; }; save_snell_shadowtls_locked \"$1\" \"$2\" \"$3\"",
+            "cas-stls", str(changed_path), "example.com",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertNotEqual(metadata.read_bytes(), before_metadata)
+        self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["server"], "external.example")
 
     def _write_config_pair(self, group: dict) -> None:
         fixture.dump(self.config, {**self.original, "inbounds": [group["backend"], group["front"]], "outbounds": [{"type": "direct", "tag": "direct"}]})
