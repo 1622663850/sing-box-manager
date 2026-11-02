@@ -9,6 +9,7 @@ import json
 import re
 import os
 from pathlib import Path
+from contextlib import contextmanager
 import secrets
 import sys
 import tempfile
@@ -23,13 +24,28 @@ from smoke_core import (
     command,
     free_port,
     http_target,
-    running_tls_target,
     server_config,
     tls_material,
     udp_echo_target,
     write_json,
 )
 from smoke_multiusers import expect_rejected, quiet_core, request_with_retries
+
+
+@contextmanager
+def core_tls_target(core: Path, certificate: Path, private_key: Path, port: int, work: Path):
+    target = work / "tls-handshake-target.json"
+    write_json(target, {
+        "log": {"level": "debug"},
+        "inbounds": [{"type": "http", "tag": "tls-target", "listen": LOOPBACK, "listen_port": port,
+            "users": [{"username": "fixture", "password": secrets.token_urlsafe(16)}],
+            "tls": {"enabled": True, "certificate_path": str(certificate), "key_path": str(private_key),
+                    "min_version": "1.3", "max_version": "1.3"}}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+    })
+    check(core, target, work)
+    with quiet_core(core, target, port, work, "tls-handshake-target"):
+        yield
 
 
 def make_wrong_certificate(work: Path) -> Path:
@@ -120,7 +136,7 @@ def run_case(
     payload = b"SNELL_SHADOWTLS_LOOPBACK"
     with http_target(payload) as target_port:
         with udp_echo_target() as udp_target:
-            with running_tls_target(certificate, private_key, handshake_port, work):
+            with core_tls_target(core, certificate, private_key, handshake_port, work):
                 with quiet_core(core, server_file, front_port, work, "snell-shadowtls-server"):
                     with quiet_core(core, client_file, proxy_port, work, "snell-shadowtls-client"):
                         if request_with_retries(proxy_port, target_port, "/snell-shadowtls") != payload:
