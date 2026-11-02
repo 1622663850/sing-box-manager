@@ -1149,6 +1149,10 @@ snell_shadowtls_wizard_locked() (
     prompt server "服务器公网 IP/域名（客户端连接地址；- 清除独立地址）" "$server" || exit 1
     [[ $server != - ]] || server=""
     generate_snell_shadowtls "$group_tag" "$port" "$psk" "$shadow_password" "$hs" "$hp" "$sni" >"$work/new.json" || exit 1
+    if [[ $action == edit ]]; then
+        jq --slurpfile old "$work/original.json" '.front.listen=$old[0].front.listen' "$work/new.json" >"$work/retained.json" &&
+            mv "$work/retained.json" "$work/new.json" || exit 1
+    fi
     if [[ $action == add ]]; then add_snell_shadowtls_locked "$work/new.json" "$server"
     else save_snell_shadowtls_locked "$group_tag" "$work/new.json" "$server"; fi
 )

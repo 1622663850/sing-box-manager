@@ -262,6 +262,15 @@ class SnellShadowTlsTest(unittest.TestCase):
         self.assertNotEqual(metadata.read_bytes(), before_metadata)
         self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["server"], "external.example")
 
+    def test_wizard_keeps_existing_frontend_listen_address(self) -> None:
+        group = self.group("local-stls", 25712)
+        group["front"]["listen"] = "127.0.0.1"
+        path = self._write_group(group, "local-group.json")
+        self.shell('confirm() { return 0; }; add_snell_shadowtls_locked "$1" example.com', str(path), check=True)
+        before = self.config.read_bytes()
+        self.shell('prompt(){ printf -v "$1" "%s" "${3:-}"; }; prompt_secret(){ printf -v "$1" "%s" "${3:-}"; }; confirm(){ return 0; }; snell_shadowtls_wizard_locked local-stls', check=True)
+        self.assertEqual(self.config.read_bytes(), before)
+
     def _write_config_pair(self, group: dict) -> None:
         fixture.dump(self.config, {**self.original, "inbounds": [group["backend"], group["front"]], "outbounds": [{"type": "direct", "tag": "direct"}]})
 
