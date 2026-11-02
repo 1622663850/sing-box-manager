@@ -936,6 +936,8 @@ generate_snell_shadowtls() {
 }
 
 validate_snell_shadowtls_group() {
+    local group_json
+    group_json=$(cat -- "$1") || return 1
     jq -e '
       .format=="sing-box-manager-snell-shadowtls-v1" and
       (keys==["backend","format","front","sni"]) and
@@ -954,8 +956,8 @@ validate_snell_shadowtls_group() {
          (.password|type=="string" and utf8bytelength>0 and (contains("\u0000")|not))) and
       (.front.handshake|keys==["server","server_port"] and (.server|type=="string") and
         (.server_port|type=="number" and .==floor and .>0 and .<=65535)) and
-      (.sni|type=="string")' "$1" >/dev/null 2>&1 || { fail "Snell + ShadowTLS 组合模板无效，未保存。"; return 1; }
-    valid_host "$(jq -r .front.handshake.server "$1")" && valid_host "$(jq -r .sni "$1")"
+      (.sni|type=="string")' <<<"$group_json" >/dev/null 2>&1 || { fail "Snell + ShadowTLS 组合模板无效，未保存。"; return 1; }
+    valid_host "$(jq -r .front.handshake.server <<<"$group_json")" && valid_host "$(jq -r .sni <<<"$group_json")"
 }
 
 read_snell_shadowtls_group() (
@@ -997,7 +999,8 @@ check_shadowtls_component() {
 logical_inbounds() {
     config_jq . | python3 -c '
 import json, pathlib, sys
-cfg=json.load(sys.stdin); nodes=cfg.get("inbounds",[]); views={}; hidden=set()
+cfg=json.load(sys.stdin); nodes=cfg.get("inbounds") or []; views={}; hidden=set()
+if not isinstance(nodes,list): sys.exit("入站列表格式无效。")
 for p in pathlib.Path(sys.argv[1]).glob("*.json"):
     if p.is_symlink(): continue
     try:
