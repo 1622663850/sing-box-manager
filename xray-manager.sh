@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# shellcheck disable=SC2030,SC2031 # Subshell handlers declare independent locals; shared state is committed through files.
+# shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
 XR_MANAGER_VERSION="1.0.0"
@@ -29,9 +31,9 @@ fail(){ printf '[错误] %s\n' "$*" >&2; return 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 require_root(){ [[ $EUID -eq 0 ]] || fail "请使用 sudo xray 或 sudo bash $SCRIPT_FILE。"; }
 require_systemd(){
-    [[ $(uname -s) == Linux && -d /run/systemd/system ]] && have systemctl || {
-        fail "需要 Linux、Bash 4+ 和正在运行的 systemd。"; return 1;
-    }
+    if [[ $(uname -s) != Linux || ! -d /run/systemd/system ]] || ! have systemctl; then
+        fail "需要 Linux、Bash 4+ 和正在运行的 systemd。"; return 1
+    fi
 }
 is_managed(){ [[ -f $MANAGED_MARKER && ! -L $MANAGED_MARKER && $(cat "$MANAGED_MARKER") == xray-manager-v1 ]]; }
 require_core(){ [[ -x $CORE_BIN && -f $CONFIG_FILE ]] || { fail "尚未安装 Xray 核心，请先选择安装。"; return 1; }; }
@@ -1282,6 +1284,13 @@ enable_bbr() {
 }
 
 disable_bbr() {
+    local other
+    for other in "$BBR_SYSCTL_DIR"/*.conf "${XR_ROOT_PREFIX}/etc/sysctl.conf"; do
+        [[ -f $other && $other != "$BBR_SYSCTL_FILE" ]] || continue
+        if awk '/^[[:space:]]*net[.]ipv4[.]tcp_congestion_control[[:space:]]*=[[:space:]]*bbr([[:space:]#]|$)/ {found=1} END{exit !found}' "$other";then
+            fail "其他持久化配置仍管理系统 BBR，请先通过对应管理方式恢复；未修改内核。";return 1
+        fi
+    done
     [[ $# -eq 0 ]] || { fail "用法：xray bbr-disable"; return 1; }
     have sysctl || { fail "缺少 sysctl，请重新运行 setup 安装依赖。"; return 1; }
     with_lock disable_bbr_locked
@@ -2080,7 +2089,7 @@ select_inbound_user(){
     jq -r '["用户序号","名称"], ((.settings.users // .settings.clients)|to_entries[]|[.key+1,(.value.email // "未命名")])|map(if type=="string" then gsub("[[:cntrl:]]";"?") else . end)|@tsv' "$file"
     prompt choice "选择用户（0 返回）" 0 || return
     [[ $choice != 0 ]] || return 0
-    [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && ((choice<=count)) || { fail "用户序号无效。"; return 1; }
+    if [[ ! $choice =~ ^[1-9][0-9]{0,5}$ ]] || ((choice>count)); then fail "用户序号无效。";return 1;fi
     printf -v "$destination" '%s' "$choice"
 }
 
@@ -2177,7 +2186,10 @@ show_client() (
         public_key=$(jq -r '.public_key // ""' "$CLIENT_DIR/$tag.json")
     fi
     [[ -n $server ]] || server=$(read_default_server) || exit 1
-    if [[ -z $server ]]; then [[ $mode == full && -t 0 ]] && prompt server "服务器公网 IP/域名" || { fail "请先设置默认公网地址或显式传入服务器地址。"; exit 1; }; fi
+    if [[ -z $server ]]; then
+        if [[ $mode != full || ! -t 0 ]];then fail "请先设置默认公网地址或显式传入服务器地址。";exit 1;fi
+        prompt server "服务器公网 IP/域名" || exit 1
+    fi
     validate_inbound_users "$work/node" || { fail "节点超出安全导出模板范围。"; exit 1; }
     count=$(inbound_user_count "$work/node") || exit 1
     if [[ $user_index == all ]]; then for ((index=1;index<=count;index++)); do indices+=("$index"); done
@@ -3139,7 +3151,7 @@ main(){
       server)with_lock set_default_server "$@";;backup)with_lock create_backup;;backups)list_backups;;restore)[[ $# -eq 1 ]] && with_lock restore_backup "$1";;
       export)[[ $# -eq 2 ]] && with_lock exports "$1" "$2";;diagnose)diagnose;;
       outbounds)outbounds_menu;;outbound-add)[[ $# -eq 1 ]] && with_lock add_outbounds_file_locked "$1";;outbound-bind)[[ $# -eq 2 ]] && with_lock bind_outbound_locked "$1" "$2";;outbound-delete)[[ $# -eq 1 ]] && with_lock delete_outbound_locked "$1";;
-      ip-preference)[[ $# -le 1 ]] && set_outbound_preference "$@";;bbr)enable_bbr;;bbr-disable)disable_bbr;;bbr-status)show_bbr_status;;acme)open_acme_menu;;
+      ip-preference)[[ $# -le 1 ]] && set_outbound_preference "$@";;bbr)enable_bbr "$@";;bbr-disable)disable_bbr "$@";;bbr-status)show_bbr_status "$@";;acme)open_acme_menu "$@";;
       remove-panel)[[ ! -e $CORE_BIN ]] && confirm "删除独立 Xray 菜单入口？" && rm -f -- "$WRAPPER";;
     esac
 }
