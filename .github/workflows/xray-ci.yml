@@ -1,0 +1,44 @@
+name: Validate standalone Xray manager
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  xray:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck openssl
+      - name: Syntax and static analysis
+        run: |
+          bash -n xray-manager.sh
+          shellcheck -x xray-manager.sh
+      - name: Download pinned official Xray core
+        run: |
+          mkdir -p "$RUNNER_TEMP/xray-test"
+          curl --fail --silent --show-error --location --retry 3 --proto '=https' --proto-redir '=https' \
+            https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip \
+            -o "$RUNNER_TEMP/xray-test/core.zip"
+          printf '%s  %s\n' e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214 "$RUNNER_TEMP/xray-test/core.zip" | sha256sum --check
+          python3 - "$RUNNER_TEMP/xray-test" <<'PY'
+          from pathlib import Path
+          import sys, zipfile
+          root=Path(sys.argv[1])
+          with zipfile.ZipFile(root/'core.zip') as archive:
+              (root/'xray').write_bytes(archive.read('xray'))
+          (root/'xray').chmod(0o755)
+          PY
+      - name: Isolated management and protocol regression
+        env:
+          XR_REAL_CORE: ${{ runner.temp }}/xray-test/xray
+        run: python3 -m unittest discover -s tests -p 'test_xray*.py' -v
+      - name: Real Xray protocol forwarding
+        run: python3 tests/smoke_xray.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
