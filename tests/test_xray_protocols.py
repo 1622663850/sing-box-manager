@@ -87,7 +87,7 @@ class XrayProtocolsTest(fixture.XrayFixture):
         invalid["settings"]["users"][1]["id"] = "bad"
         invalid_path = self.write("invalid-users.json", invalid)
         self.assertNotEqual(self.shell('validate_inbound_users "$1"', str(invalid_path)).returncode, 0)
-        ss = self.generate("shadowsocks")
+        ss = self.generate("shadowsocks", "8JCsPssfgS8tiRwiMlhARg==")
         self.assertEqual(ss["settings"]["network"], "tcp,udp")
         self.assertEqual(self.shell('inbound_user_count "$1"', str(self.write("ss.json", ss)), check=True).stdout.strip(), "1")
 

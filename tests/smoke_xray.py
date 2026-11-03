@@ -10,8 +10,8 @@ test cannot accidentally use a production private address.
 Example (Linux):
     python3 tests/smoke_xray.py --core /usr/local/bin/xray
 
-The optional VLESS REALITY case is attempted when the Xray binary exposes the
-``x25519`` command and is reported as a fixed ``SKIP`` otherwise.
+VLESS REALITY is required for the pinned official core. Missing key output
+fails the test rather than hiding an untested template behind a skip.
 """
 
 from __future__ import annotations
@@ -410,7 +410,7 @@ def _x25519(core: Path) -> tuple[str, str]:
     if result.returncode:
         raise OptionalRealityUnavailable("Xray x25519 is unavailable")
     private_match = re.search(r"(?im)^\s*private\s*key\s*:\s*(\S+)", result.stdout)
-    public_match = re.search(r"(?im)^\s*public\s*key\s*:\s*(\S+)", result.stdout)
+    public_match = re.search(r"(?im)^\s*Password \(PublicKey\)\s*:\s*(\S+)", result.stdout) or re.search(r"(?im)^\s*public\s*key\s*:\s*(\S+)", result.stdout)
     if not private_match or not public_match:
         raise OptionalRealityUnavailable("Xray x25519 output is unavailable")
     return private_match.group(1), public_match.group(1)
@@ -497,7 +497,7 @@ def run(core: Path, manager: Path) -> None:
         work = Path(temporary)
         root_prefix = work / "manager-prefix"
         environment = os.environ.copy()
-        environment["SB_ROOT_PREFIX"] = str(root_prefix)
+        environment["XR_ROOT_PREFIX"] = str(root_prefix)
         environment["CORE_BIN"] = str(core)
         certificate, private_key = tls_material(work)
         with http_target(HTTP_PAYLOAD) as http_port:
@@ -529,10 +529,7 @@ def run(core: Path, manager: Path) -> None:
                         credential, extra, use_tls, use_udp, http_port, None,
                         certificate, private_key,
                     )
-            try:
-                run_reality_case(core, manager, environment, work, certificate, private_key, http_port)
-            except OptionalRealityUnavailable:
-                print("SKIP xray vless-reality: optional x25519/REALITY fixture unavailable", flush=True)
+            run_reality_case(core, manager, environment, work, certificate, private_key, http_port)
 
 
 def main() -> int:
