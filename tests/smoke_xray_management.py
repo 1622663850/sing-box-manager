@@ -294,8 +294,9 @@ def run(core: Path, manager: Path) -> None:
                 xray_smoke.check_xray(core, config, work)
 
                 unit_bytes = unit_source(core, state, config)
-                runtime_unit.write_bytes(unit_bytes)
-                unit_created = True
+                with runtime_unit.open("xb") as stream:
+                    unit_created = True
+                    stream.write(unit_bytes)
                 runtime_unit.chmod(0o644)
                 systemd(real_systemctl, "daemon-reload")
                 require(

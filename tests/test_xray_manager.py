@@ -684,7 +684,7 @@ class XrayManagerTest(XrayFixture):
             ("no-finalmask", None),
             ("missing-quic-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}]}),
             ("null-quic-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}], "quicParams": None}),
-            ("existing-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}], "quicParams": {"congestion": "cubic", "bbrProfile": "edge", "other": "keep"}}),
+            ("existing-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}], "quicParams": {"congestion": "reno", "bbrProfile": "conservative", "brutalUp": 0}}),
         )
         for suffix, finalmask in variants:
             with self.subTest(variant=suffix):
