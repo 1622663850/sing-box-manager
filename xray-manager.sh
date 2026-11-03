@@ -1219,7 +1219,7 @@ configure_bbr_locked() (
     else
         info "将设置整台 VPS 的 TCP 默认拥塞控制为 bbr，默认队列规则为 fq，并写入 $BBR_SYSCTL_FILE。"
     fi
-    info "只影响 TCP；Hy2/TUIC 的 UDP/QUIC 拥塞控制不受此设置直接控制。"
+    info "只影响 TCP；Hy2 的 UDP/QUIC 拥塞控制不受此设置直接控制。"
     info "已有连接和监听可能沿用旧算法；本操作不重启服务、不重建现有网卡队列。"
     if [[ $action == disable ]]; then
         confirm "确认关闭并恢复开启前的设置？（先备份，失败尝试恢复）" || exit 0
@@ -2096,6 +2096,7 @@ select_inbound_user(){
 node_wizard_locked() (
     umask 077
     local certificate="" tls_key=""
+    local obfs="" obfs_choice
     local old=${1:-} protocol="" tag port=443 credential="" extra="" private_key="" public_key="" sid="" tls_name="" cert="" key="" server="" pair work index=1 count=1 old_tls="" choice file
     require_core && safe_paths || exit 1
     work=$(mktemp -d "$STATE_DIR/node-wizard.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
@@ -2148,16 +2149,25 @@ node_wizard_locked() (
             cert=$certificate; key=$tls_key
             ;;
     esac
+    if [[ $protocol == hysteria ]];then
+        if [[ -n $old ]];then obfs=$(jq -jr '(.streamSettings.finalmask.udp[0].settings.password // "")+"."' "$work/original");obfs=${obfs%.};fi
+        if [[ -n $obfs ]];then obfs_choice=2;else obfs_choice=1;fi
+        prompt obfs_choice "Hy2 混淆：1 无，2 Salamander，0 取消" "$obfs_choice" || exit 1
+        case "$obfs_choice" in 0)exit 0;;1)obfs="";;2)prompt_secret obfs "Salamander 密码（至少 4 字节，回车保留/自动生成）" "${obfs:-$(openssl rand -base64 16)}" || exit 1;;*)exit 1;;esac
+    fi
     [[ -n $server ]] || server=$(read_default_server) || exit 1
     prompt server "客户端服务器 IP/域名（- 清除独立地址）" "$server" || exit 1
     [[ $server != - ]] || server=""
-    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$sid" "$tls_name" "$cert" "$key" "" "" >"$work/generated" || exit 1
+    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$sid" "$tls_name" "$cert" "$key" "" "$obfs" >"$work/generated" || exit 1
     if [[ -n $old ]]; then
         jq --slurpfile update "$work/generated" --argjson i "$((index-1))" '
           . as $old | (.settings.users // .settings.clients // null) as $users | . * $update[0] |
           .listen=$old.listen | if $users!=null then .settings.users=$users | .settings.users[$i]=($users[$i]*$update[0].settings.users[0]) | del(.settings.clients) else . end' "$work/original" >"$work/updated" || exit 1
         if [[ $protocol == *reality* && $tls_name == "$old_tls" ]]; then
             jq --slurpfile old "$work/original" 'if $old[0].streamSettings.realitySettings.target!=null then .streamSettings.realitySettings.target=$old[0].streamSettings.realitySettings.target else . end' "$work/updated" >"$work/retained" && mv "$work/retained" "$work/updated" || exit 1
+        fi
+        if [[ $protocol == hysteria && -z $obfs ]];then
+            jq 'del(.streamSettings.finalmask.udp)' "$work/updated" >"$work/unmasked" && mv "$work/unmasked" "$work/updated" || exit 1
         fi
         confirm "保存修改？（其他用户保留，配置和连接信息成套备份）" || exit 0
         snapshot_bundle >"$work/current" || exit 1
@@ -2426,9 +2436,9 @@ management_menu(){
 bbr_menu(){
     local choice
     while true; do
-        printf '\nBBR 设置（系统 TCP 为整机共享）\n  1. 开启系统 TCP BBR\n  2. 恢复本脚本开启前的 TCP 设置\n  3. 查看 TCP 状态\n  0. 返回\n'
+        printf '\nBBR 设置（系统 TCP 为整机共享）\n  1. 开启系统 TCP BBR\n  2. 恢复本脚本开启前的 TCP 设置\n  3. 查看 TCP 状态\n  4. 为 Hy2 显式启用 QUIC BBR\n  5. 恢复 Hy2 QUIC 开启前设置\n  6. 查看 Hy2 QUIC 状态\n  0. 返回\n'
         prompt choice "请选择 BBR 操作" 0 || return
-        case "$choice" in 0) return 0;; 1) enable_bbr;; 2) disable_bbr;; 3) show_bbr_status;; *) warn "无效选项。";; esac || true
+        case "$choice" in 0) return 0;; 1) enable_bbr;; 2) disable_bbr;; 3) show_bbr_status;;4) with_lock quic_bbr_change_locked enable;;5) with_lock quic_bbr_change_locked disable;;6)show_quic_bbr_status;; *) warn "无效选项。";; esac || true
         prompt choice "按回车返回 BBR" "" || return
     done
 }
@@ -3076,6 +3086,46 @@ outbounds_menu(){
     done
 }
 
+quic_bbr_change_locked() (
+    umask 077
+    local action=$1 selected=${2:-} work
+    require_core && safe_paths || exit 1
+    if [[ -z $selected ]];then select_inbound selected "设置 Hy2 QUIC BBR" || exit 1;[[ -n $selected ]] || exit 0;fi
+    work=$(mktemp -d "$STATE_DIR/quic-bbr.XXXXXX") || exit 1;trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before" || exit 1
+    jq --arg t "$selected" --arg a "$action" '
+      (.config.inbounds|map(select(.tag==$t))) as $nodes |
+      if ($nodes|length)!=1 or $nodes[0].protocol!="hysteria" or $nodes[0].settings.version!=2 then error("Hy2 required") else . end |
+      $nodes[0] as $node | (.clients[$t].quic_bbr_restore // null) as $old |
+      if $old!=null and (.clients[$t].inbound!=$node or $old.format!="xray-manager-quic-bbr-v1") then error("stale record") else . end |
+      if $a=="enable" then
+        (if $old!=null then $old else
+          {format:"xray-manager-quic-bbr-v1",settings:(($node.streamSettings.finalmask.quicParams // {})|with_entries(select(.key=="congestion" or .key=="bbrProfile"))),
+           qp_present:($node.streamSettings.finalmask // {}|has("quicParams")),qp_null:($node.streamSettings.finalmask.quicParams==null),
+           fm_present:($node.streamSettings|has("finalmask")),fm_null:($node.streamSettings.finalmask==null)} end) as $record |
+        ($node|.streamSettings.finalmask.quicParams.congestion="bbr"|.streamSettings.finalmask.quicParams.bbrProfile="standard") as $new |
+        .config.inbounds|=map(if .tag==$t then $new else . end) | .clients[$t]=((.clients[$t] // {})+{inbound:$new,quic_bbr_restore:$record})
+      elif $a=="disable" then
+        if $old==null or $node.streamSettings.finalmask.quicParams.congestion!="bbr" or $node.streamSettings.finalmask.quicParams.bbrProfile!="standard" then error("no matching record") else . end |
+        ($node|del(.streamSettings.finalmask.quicParams.congestion,.streamSettings.finalmask.quicParams.bbrProfile)|
+          .streamSettings.finalmask.quicParams+=($old.settings // {}) |
+          if .streamSettings.finalmask.quicParams=={} then
+            if $old.qp_present==false then del(.streamSettings.finalmask.quicParams) elif $old.qp_null==true then .streamSettings.finalmask.quicParams=null else . end
+          else . end |
+          if .streamSettings.finalmask=={} then
+            if $old.fm_present==false then del(.streamSettings.finalmask) elif $old.fm_null==true then .streamSettings.finalmask=null else . end
+          else . end) as $new |
+        .config.inbounds|=map(if .tag==$t then $new else . end) | .clients[$t].inbound=$new|del(.clients[$t].quic_bbr_restore)
+      else error("unknown operation") end' "$work/before" >"$work/after" 2>/dev/null || { fail "仅支持 Hy2；缺失、过期或被外部修改的恢复记录不会猜测恢复。";exit 1; }
+    [[ $(jq -Sc '{config,clients}' "$work/before") != "$(jq -Sc '{config,clients}' "$work/after")" ]] || { info "QUIC 设置未变化。";exit 0; }
+    info "恢复是撤销显式 BBR 设置；原来未指定时，核心仍可能默认使用 BBR。"
+    confirm "保存 Hy2 QUIC 设置（备份、按需重启，其他认证和混淆不变）？" || exit 0
+    snapshot_bundle >"$work/current" || exit 1
+    [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/before")" ]] || { fail "配置已变化。";exit 1; }
+    apply_bundle "$work/after"
+)
+show_quic_bbr_status(){ config_jq -r '["节点","拥塞控制","BBR profile"],(.inbounds[]?|select(.protocol=="hysteria")|[.tag,(.streamSettings.finalmask.quicParams.congestion // "核心默认"),(.streamSettings.finalmask.quicParams.bbrProfile // "默认")])|@tsv'; }
+
 usage(){
 cat <<'HELP'
 Xray 中文终端管理面板
@@ -3105,6 +3155,8 @@ Xray 中文终端管理面板
   xray outbound-delete TAG                 删除未引用出站
   xray ip-preference [ipv6|ipv4|status]     freedom 地址解析优先级
   xray bbr | bbr-disable | bbr-status       系统 TCP BBR（内核为整机共享）
+  xray quic-bbr [TAG] | quic-bbr-disable [TAG] | quic-bbr-status
+                                            Hy2 显式 BBR 及开启前设置恢复
   xray acme                               安装/打开独立 ACME 项目菜单
   xray uninstall                          卸载此面板拥有的 Xray 核心和服务
   xray remove-panel                       核心卸载后移除菜单入口
@@ -3118,7 +3170,7 @@ menu(){
     while true;do
       printf '\n========== Xray 管理面板 v%s ==========\n' "$XR_MANAGER_VERSION"
       show_status
-      printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray 核心\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. 系统 TCP BBR 设置\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n  0. 退出\n'
+      printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray 核心\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / Hy2 QUIC）\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n  0. 退出\n'
       read -r -p "请输入选项 [0-20]: " choice || return 0
       case "$choice" in
         0)return 0;;1)install_core;;2)uninstall_core;;3)with_lock service_action start;;4)autostart_menu;continue;;5)with_lock service_action restart;;6)with_lock service_action disable;;7)show_logs;;
@@ -3135,7 +3187,7 @@ main(){
     (( BASH_VERSINFO[0]>=4 )) || { fail "需要 Bash 4+。";return 1; }
     local command=${1:-menu};[[ $# -eq 0 ]] || shift
     case "$command" in help|-h|--help)usage;return;;core|bin)core_passthrough "$@";return;;
-      menu|setup|install|update|update-panel|uninstall|start|restart|stop|enable|disable-autostart|disable|status|log|logs|add|edit|delete|add-file|import|info|validate|format-config|client|users|user-add|user-delete|server|backup|backups|restore|export|diagnose|outbounds|outbound-add|outbound-bind|outbound-delete|ip-preference|bbr|bbr-disable|bbr-status|acme|remove-panel);;
+      menu|setup|install|update|update-panel|uninstall|start|restart|stop|enable|disable-autostart|disable|status|log|logs|add|edit|delete|add-file|import|info|validate|format-config|client|users|user-add|user-delete|server|backup|backups|restore|export|diagnose|outbounds|outbound-add|outbound-bind|outbound-delete|ip-preference|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-disable|quic-bbr-status|acme|remove-panel);;
       *)core_passthrough "$command" "$@";return;;esac
     require_root && require_systemd && safe_paths || return
     if ! is_managed;then case "$command" in menu|setup|install) ;;*)fail "请先 sudo bash xray-manager.sh setup 安装独立面板。";return 1;;esac;fi
@@ -3151,7 +3203,7 @@ main(){
       server)with_lock set_default_server "$@";;backup)with_lock create_backup;;backups)list_backups;;restore)[[ $# -eq 1 ]] && with_lock restore_backup "$1";;
       export)[[ $# -eq 2 ]] && with_lock exports "$1" "$2";;diagnose)diagnose;;
       outbounds)outbounds_menu;;outbound-add)[[ $# -eq 1 ]] && with_lock add_outbounds_file_locked "$1";;outbound-bind)[[ $# -eq 2 ]] && with_lock bind_outbound_locked "$1" "$2";;outbound-delete)[[ $# -eq 1 ]] && with_lock delete_outbound_locked "$1";;
-      ip-preference)[[ $# -le 1 ]] && set_outbound_preference "$@";;bbr)enable_bbr "$@";;bbr-disable)disable_bbr "$@";;bbr-status)show_bbr_status "$@";;acme)open_acme_menu "$@";;
+      ip-preference)[[ $# -le 1 ]] && set_outbound_preference "$@";;quic-bbr)with_lock quic_bbr_change_locked enable "$@";;quic-bbr-disable)with_lock quic_bbr_change_locked disable "$@";;quic-bbr-status)show_quic_bbr_status;;bbr)enable_bbr "$@";;bbr-disable)disable_bbr "$@";;bbr-status)show_bbr_status "$@";;acme)open_acme_menu "$@";;
       remove-panel)[[ ! -e $CORE_BIN ]] && confirm "删除独立 Xray 菜单入口？" && rm -f -- "$WRAPPER";;
     esac
 }

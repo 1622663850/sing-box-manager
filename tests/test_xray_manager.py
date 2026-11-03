@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import base64
+from urllib.parse import parse_qs, urlsplit
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -143,7 +145,7 @@ if args in (["version"], ["--version"]):
 if args == ["uuid"] or args == ["generate", "uuid"]:
     print("b7efdc96-87aa-4910-81b4-374b2eecc737")
     raise SystemExit(0)
-if args in (["x25519"], ["generate", "x25519"]):
+if args in (["x25519"], ["generate", "x25519"]) or (args and args[0] == "x25519"):
     print("Private key: Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw")
     print("Password (PublicKey): AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     raise SystemExit(0)
@@ -157,6 +159,10 @@ if args and args[0] == "run" and "-test" in args:
         assert isinstance(value.get("inbounds", []), list)
         assert isinstance(value.get("outbounds", []), list)
         assert not value.get("_test_invalid")
+        allowed = {"freedom", "blackhole", "vless", "vmess", "trojan", "shadowsocks",
+                   "socks", "http", "hysteria", "dns"}
+        assert all(isinstance(node, dict) and node.get("protocol") in allowed
+                   for node in value.get("outbounds", []))
     except (AssertionError, OSError, ValueError, IndexError):
         print("mock Xray: invalid configuration", file=sys.stderr)
         raise SystemExit(23)
@@ -164,6 +170,40 @@ if args and args[0] == "run" and "-test" in args:
 
 print(json.dumps(args, ensure_ascii=False))
 raise SystemExit(0)
+'''
+
+
+MOCK_CURL = r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+with Path(os.environ["XR_MOCK_CURL_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\n")
+mode = os.environ.get("XR_MOCK_CURL_MODE", "success")
+counter = Path(os.environ["XR_MOCK_CURL_COUNTER"])
+if mode == "fail":
+    raise SystemExit(6)
+if mode == "first-fail":
+    count = int(counter.read_text(encoding="utf-8") or "0") if counter.exists() else 0
+    counter.write_text(str(count + 1), encoding="utf-8")
+    if count == 0:
+        raise SystemExit(6)
+if mode == "invalid":
+    print(os.environ.get("XR_MOCK_CURL_BODY", "not-an-ip"))
+else:
+    print(os.environ.get("XR_MOCK_CURL_BODY", "2606:4700:4700::1111"))
+raise SystemExit(0)
+'''
+
+
+MOCK_SS = r'''#!/usr/bin/env bash
+if [[ ${XR_MOCK_SS_BUSY:-0} == 1 ]]; then
+    printf 'LISTEN\n'
+fi
+exit 0
 '''
 
 
@@ -207,6 +247,8 @@ class XrayFixture(unittest.TestCase):
         self.mock_state = self.root / "service-state.json"
         self.system_log = self.root / "systemctl.jsonl"
         self.core_log = self.root / "xray.jsonl"
+        self.curl_log = self.root / "curl.jsonl"
+        self.curl_counter = self.root / "curl.counter"
         self.original = {
             "log": {"loglevel": "warning"},
             "inbounds": [],
@@ -227,6 +269,8 @@ class XrayFixture(unittest.TestCase):
         for path, content in (
             (self.bin / "systemctl", MOCK_SYSTEMCTL),
             (self.core, MOCK_CORE),
+            (self.bin / "curl", MOCK_CURL),
+            (self.bin / "ss", MOCK_SS),
         ):
             path.write_text(content, encoding="utf-8")
             path.chmod(0o755)
@@ -237,6 +281,10 @@ class XrayFixture(unittest.TestCase):
             "XR_MOCK_STATE_FILE": str(self.mock_state),
             "XR_MOCK_SYSTEMCTL_LOG": str(self.system_log),
             "XR_MOCK_CORE_LOG": str(self.core_log),
+            "XR_MOCK_CURL_LOG": str(self.curl_log),
+            "XR_MOCK_CURL_COUNTER": str(self.curl_counter),
+            "XR_MOCK_CURL_MODE": "success",
+            "XR_MOCK_CURL_BODY": "2606:4700:4700::1111",
             "XR_MOCK_UNIT_FILE": str(self.unit),
             "XR_MOCK_MANAGER": str(SCRIPT),
             "XR_CORE_ASSETS": str(self.lib_dir),
@@ -509,6 +557,224 @@ class XrayManagerTest(XrayFixture):
         candidate = self.write_hy2("same-tag", 18454)
         result = self.shell('check_inbound_conflicts "$1" "" "$2"', str(self.candidate(candidate, "duplicate-tag.json")), str(self.config))
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_normalize_outbound_import_accepts_jsonc_and_multiline_standard_links(self) -> None:
+        native = [
+            {"protocol": "vless", "tag": "native-vless", "settings": {"address": "example.com", "port": 443, "id": UUID}},
+            {"protocol": "vmess", "tag": "native-vmess", "settings": {"address": "example.com", "port": 443, "id": UUID, "alterId": 0}},
+            {"protocol": "trojan", "tag": "native-trojan", "settings": {"address": "example.com", "port": 443, "password": "trojan-password"}},
+            {"protocol": "hysteria", "tag": "native-hy2", "settings": {"address": "example.com", "port": 443, "version": 2}},
+        ]
+        native_file = self.root / "native-outbounds.jsonc"
+        native_file.write_text(
+            '{\n  // JSONC must be accepted without rewriting the source.\n  "outbounds": '
+            + json.dumps(native, ensure_ascii=False) + '\n}\n',
+            encoding="utf-8",
+        )
+        native_result = self.shell('normalize_outbound_import "$1"', str(native_file), check=True)
+        self.assertEqual(json.loads(native_result.stdout), native)
+
+        vmess_payload = {
+            "v": "2", "ps": "vmess-link", "add": "example.com", "port": "443",
+            "id": UUID, "aid": "0", "net": "tcp", "type": "none",
+        }
+        vmess_link = "vmess://" + base64.urlsafe_b64encode(
+            json.dumps(vmess_payload, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        links = "\n".join([
+            f"vless://{UUID}@example.com:443?encryption=none&type=tcp&security=reality&sni=origin.example&fp=chrome&pbk={PUBLIC_KEY}&sid=01234567&flow=xtls-rprx-vision#vless-link",
+            vmess_link,
+            "trojan://trojan-password@example.com:443?sni=origin.example#trojan-link",
+            "hysteria2://hy2-password@example.com:443?sni=origin.example&obfs=salamander&obfs-password=obfs-pass#hy2-link",
+        ]) + "\n"
+        link_file = self.root / "outbound-links.txt"
+        link_file.write_text(links, encoding="utf-8")
+        link_result = self.shell('normalize_outbound_import "$1"', str(link_file), check=True)
+        converted = json.loads(link_result.stdout)
+        self.assertEqual({node["tag"] for node in converted}, {"vless-link", "vmess-link", "trojan-link", "hy2-link"})
+        by_tag = {node["tag"]: node for node in converted}
+        self.assertEqual(by_tag["vless-link"]["protocol"], "vless")
+        self.assertEqual(by_tag["vmess-link"]["protocol"], "vmess")
+        self.assertEqual(by_tag["trojan-link"]["protocol"], "trojan")
+        self.assertEqual(by_tag["hy2-link"]["protocol"], "hysteria")
+        self.assertEqual(by_tag["hy2-link"]["streamSettings"]["hysteriaSettings"]["version"], 2)
+        self.assertEqual(
+            by_tag["hy2-link"]["streamSettings"]["finalmask"]["udp"][0]["settings"]["password"],
+            "obfs-pass",
+        )
+
+    def test_vless_reality_client_link_contains_sni_public_key_short_id_and_flow(self) -> None:
+        node = self.write_node("reality-link", 18454)
+        node["settings"]["users"][0]["flow"] = "xtls-rprx-vision"
+        node["streamSettings"] = {
+            "method": "raw",
+            "security": "reality",
+            "realitySettings": {
+                "serverNames": ["sni.example"],
+                "shortIds": ["01234567"],
+                "privateKey": "Cph7W9JiwwNiPF1IaxyKHmta4D5-FdwLmlPB8EF0COw",
+            },
+        }
+        inbound = self.candidate(node, "reality-inbound.json")
+        generated = self.shell('generate_client "$1" "$2" "$3"', str(inbound), "example.com", PUBLIC_KEY, check=True)
+        outbound = self.root / "reality-outbound.json"
+        outbound.write_text(generated.stdout, encoding="utf-8")
+        link = self.shell('client_link "$1" "$2"', str(outbound), "reality-label", check=True).stdout.strip()
+        parts = urlsplit(link)
+        query = parse_qs(parts.query)
+        self.assertEqual(parts.scheme, "vless")
+        self.assertEqual(parts.username, UUID)
+        self.assertEqual(parts.hostname, "example.com")
+        self.assertEqual(parts.port, 443)
+        self.assertEqual(query["type"], ["tcp"])
+        self.assertEqual(query["security"], ["reality"])
+        self.assertEqual(query["sni"], ["sni.example"])
+        self.assertEqual(query["pbk"], [PUBLIC_KEY])
+        self.assertEqual(query["sid"], ["01234567"])
+        self.assertEqual(query["flow"], ["xtls-rprx-vision"])
+
+    def test_ipv6_preference_guard_failure_does_not_backup_restart_or_write(self) -> None:
+        before_config = self.config.read_bytes()
+        before_state = self.state(active=True, enabled=True)
+        before_backups = sorted(self.backups_dir.iterdir())
+        self.env["XR_MOCK_CURL_MODE"] = "fail"
+        result = self.shell('confirm() { return 0; }; configure_outbound_preference_locked prefer_ipv6')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(sorted(self.backups_dir.iterdir()), before_backups)
+        self.assertEqual(self.state(), before_state)
+        self.assertFalse(any(action in call for call in self.calls() for action in ("start", "stop", "restart")))
+        curl_calls = [json.loads(line) for line in self.curl_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(curl_calls), 2)
+        for args in curl_calls:
+            self.assertEqual(args[:4], ["-q", "--noproxy", "*", "-6"])
+            self.assertIn("--proto", args)
+            self.assertIn("=https", args)
+            self.assertIn("--connect-timeout", args)
+            self.assertIn("4", args)
+            self.assertIn("--max-time", args)
+            self.assertIn("8", args)
+            self.assertIn("--max-filesize", args)
+            self.assertIn("128", args)
+
+    def test_acme_discovery_reads_xray_namespace_only_and_is_read_only(self) -> None:
+        acme = self.root / "root/.acme.sh/example.com_ecc"
+        acme.mkdir(parents=True)
+        certificate = acme / "fullchain.cer"
+        private_key = acme / "example.com.key"
+        certificate.write_text("certificate-placeholder\n", encoding="utf-8")
+        private_key.write_text("key-placeholder\n", encoding="utf-8")
+        default_certificate = self.root / "root/cert.crt"
+        default_key = self.root / "root/private.key"
+        default_certificate.write_text("certificate-placeholder\n", encoding="utf-8")
+        default_key.write_text("key-placeholder\n", encoding="utf-8")
+        before = {path.relative_to(self.root) for path in self.root.rglob("*")}
+        result = self.shell("discover_acme_certificates", check=True)
+        entries = json.loads(result.stdout)
+        after = {path.relative_to(self.root) for path in self.root.rglob("*")}
+        self.assertEqual(before, after)
+        paths = {(item["certificate"], item["key"]) for item in entries}
+        self.assertIn((str(certificate), str(private_key)), paths)
+        self.assertIn((str(default_certificate), str(default_key)), paths)
+        self.assertNotIn("sing-box", result.stdout + result.stderr)
+        self.assertFalse((self.root / "root/acme-script").exists())
+
+    def test_quic_bbr_enable_disable_round_trip_preserves_masks_record_and_service_state(self) -> None:
+        variants = (
+            ("no-finalmask", None),
+            ("missing-quic-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}]}),
+            ("null-quic-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}], "quicParams": None}),
+            ("existing-params", {"udp": [{"type": "salamander", "settings": {"password": "mask-pass"}}], "quicParams": {"congestion": "cubic", "bbrProfile": "edge", "other": "keep"}}),
+        )
+        for suffix, finalmask in variants:
+            with self.subTest(variant=suffix):
+                for path in self.clients_dir.glob("*.json"):
+                    path.unlink()
+                for path in self.backups_dir.glob("*"):
+                    path.unlink()
+                self.system_log.unlink(missing_ok=True)
+                node = self.write_hy2("hy2-" + suffix, 18460)
+                if finalmask is not None:
+                    node["streamSettings"]["finalmask"] = finalmask
+                baseline = json.loads(json.dumps(node))
+                self.write_config([node])
+                metadata = self.write_metadata(node, server="hy2.example", public_key=PUBLIC_KEY)
+                self.state(active=True, enabled=True, restart_failures=0)
+                enabled = self.shell('confirm() { return 0; }; quic_bbr_change_locked enable "$1"', node["tag"], check=True)
+                self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+                changed = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+                self.assertEqual(changed["streamSettings"]["finalmask"]["quicParams"]["congestion"], "bbr")
+                self.assertEqual(changed["streamSettings"]["finalmask"]["quicParams"]["bbrProfile"], "standard")
+                record = json.loads(metadata.read_text(encoding="utf-8"))["quic_bbr_restore"]
+                self.assertEqual(record["format"], "xray-manager-quic-bbr-v1")
+                calls_before = len(self.calls())
+                backup_count = len(list(self.backups_dir.glob("*")))
+                noop = self.shell('confirm() { return 1; }; quic_bbr_change_locked enable "$1"', node["tag"])
+                self.assertEqual(noop.returncode, 0, noop.stdout + noop.stderr)
+                self.assertEqual(len(self.calls()), calls_before)
+                self.assertEqual(len(list(self.backups_dir.glob("*"))), backup_count)
+                disabled = self.shell('confirm() { return 0; }; quic_bbr_change_locked disable "$1"', node["tag"], check=True)
+                self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
+                restored = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+                self.assertEqual(restored, baseline)
+                restored_meta = json.loads(metadata.read_text(encoding="utf-8"))
+                self.assertNotIn("quic_bbr_restore", restored_meta)
+                self.assertEqual(restored_meta["inbound"], baseline)
+                self.assertTrue(self.state()["active"])
+                self.assertTrue(self.state()["enabled"])
+
+        node = self.write_hy2("hy2-external", 18461)
+        node["streamSettings"]["finalmask"] = {"quicParams": {"congestion": "cubic"}}
+        self.write_config([node])
+        metadata = self.write_metadata(node, server="hy2.example", public_key=PUBLIC_KEY)
+        self.state(active=False, enabled=False)
+        self.shell('confirm() { return 0; }; quic_bbr_change_locked enable "$1"', node["tag"], check=True)
+        external = json.loads(self.config.read_text(encoding="utf-8"))
+        external["inbounds"][0]["streamSettings"]["finalmask"]["quicParams"]["congestion"] = "external"
+        dump(self.config, external)
+        before_metadata = metadata.read_bytes()
+        rejected = self.shell('confirm() { return 0; }; quic_bbr_change_locked disable "$1"', node["tag"])
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertEqual(metadata.read_bytes(), before_metadata)
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]["streamSettings"]["finalmask"]["quicParams"]["congestion"], "external")
+
+    def test_add_outbounds_rejects_duplicate_names_and_invalid_native_protocol_without_writes(self) -> None:
+        duplicate = self.root / "duplicate-outbounds.json"
+        dump(duplicate, [
+            {"protocol": "freedom", "tag": "duplicate", "settings": {}},
+            {"protocol": "freedom", "tag": "duplicate", "settings": {}},
+        ])
+        before = self.config.read_bytes()
+        result = self.shell('confirm() { return 0; }; add_outbounds_file_locked "$1"', str(duplicate))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(list(self.backups_dir.iterdir()), [])
+        invalid = self.root / "invalid-outbound.json"
+        dump(invalid, [{"protocol": "not-a-real-xray-protocol", "tag": "invalid", "settings": {}}])
+        result = self.shell('confirm() { return 0; }; add_outbounds_file_locked "$1"', str(invalid))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(list(self.backups_dir.iterdir()), [])
+        self.assertFalse(any(action in call for call in self.calls() for action in ("start", "stop", "restart")))
+
+    def test_main_cli_rejects_nonempty_seam_but_core_passthrough_uses_private_core(self) -> None:
+        rejected = self.cli("version")
+        self.assertNotEqual(rejected.returncode, 0)
+        passthrough = self.shell('core_passthrough version', check=True)
+        self.assertEqual(passthrough.stdout.strip(), "Xray 1.8.24")
+        self.assertIn(["version"], self.core_calls())
+        paths = self.shell('printf "%s\\n" "$CONFIG_FILE" "$STATE_DIR" "$SERVICE"', check=True).stdout.splitlines()
+        self.assertEqual(paths, [str(self.config), str(self.state_dir), "xray.service"])
+
+    def test_check_conflicts_rejects_unmanaged_paths_and_external_service_fragment(self) -> None:
+        self.marker.unlink()
+        unmanaged = self.shell("check_conflicts")
+        self.assertNotEqual(unmanaged.returncode, 0, unmanaged.stdout + unmanaged.stderr)
+        self.marker.write_text("xray-manager-v1\n", encoding="utf-8")
+        external_service = self.root / "external-xray.service"
+        self.env["XR_MOCK_UNIT_FILE"] = str(external_service)
+        foreign_service = self.shell("check_conflicts")
+        self.assertNotEqual(foreign_service.returncode, 0, foreign_service.stdout + foreign_service.stderr)
 
 
 if __name__ == "__main__":
