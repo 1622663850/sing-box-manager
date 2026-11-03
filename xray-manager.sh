@@ -470,15 +470,21 @@ PY_JSONC_EDITOR
 
 format_config_source() { preserve_config_source --format "$1"; }
 
-validate_config(){
-    local file=$1 log result=0
+validate_config() (
+    umask 077
+    local file=$1 log="" candidate="" result=0
     [[ -f $file && -x $CORE_BIN ]] || { fail "配置文件或 Xray 核心不存在。"; return 1; }
     json_query "$file" -e 'type=="object" and ((.inbounds // [])|type=="array") and ((.outbounds // [])|type=="array")' >/dev/null || { fail "配置须为合法 JSON/JSONC 对象，inbounds/outbounds 须为数组。"; return 1; }
     log=$(mktemp "$STATE_DIR/check.XXXXXX") || return 1
-    XRAY_LOCATION_ASSET="$LIB_DIR" "$CORE_BIN" run -test -config "$file" >"$log" 2>&1 || result=$?
-    rm -f -- "$log"
+    candidate=$(mktemp "$CONFIG_DIR/.check.XXXXXX.json") || { rm -f -- "$log";return 1; }
+    trap 'rm -f -- "$log" "$candidate"' EXIT
+    cp -- "$file" "$candidate" || return 1
+    # Xray still checks the filename suffix even with -format json.  Preserve
+    # the exact JSONC bytes, and validate in the service working directory.
+    cd "$STATE_DIR" || return 1
+    XRAY_LOCATION_ASSET="$LIB_DIR" "$CORE_BIN" run -test -config "$candidate" >"$log" 2>&1 || result=$?
     [[ $result -eq 0 ]] || { fail "Xray 配置校验未通过（诊断可能包含凭据，未直接输出）；请核对协议字段、TLS 和引用。"; return 1; }
-}
+)
 
 service_is_active() { systemctl is-active --quiet "$SERVICE"; }
 

@@ -757,6 +757,17 @@ class XrayManagerTest(XrayFixture):
         self.assertEqual(list(self.backups_dir.iterdir()), [])
         self.assertFalse(any(action in call for call in self.calls() for action in ("start", "stop", "restart")))
 
+    def test_validation_uses_json_suffix_and_removes_private_copies(self) -> None:
+        candidate = self.root / ".candidate.without-json-extension"
+        candidate.write_text(json.dumps({"inbounds": [], "outbounds": [{"protocol":"freedom","tag":"direct","settings":{}}]}), encoding="utf-8")
+        result = self.shell('validate_config "$1"', str(candidate), check=True)
+        checks = [call for call in self.core_calls() if "-test" in call]
+        self.assertTrue(checks)
+        self.assertTrue(checks[-1][-1].endswith(".json"))
+        self.assertFalse(Path(checks[-1][-1]).exists())
+        self.assertFalse(list(self.config.parent.glob(".check.*")))
+        self.assertFalse(list(self.state_dir.glob("check.*")))
+
     def test_main_cli_rejects_nonempty_seam_but_core_passthrough_uses_private_core(self) -> None:
         rejected = self.cli("version")
         self.assertNotEqual(rejected.returncode, 0)
