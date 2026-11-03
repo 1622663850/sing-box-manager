@@ -625,7 +625,7 @@ class XrayManagerTest(XrayFixture):
         self.assertEqual(parts.scheme, "vless")
         self.assertEqual(parts.username, UUID)
         self.assertEqual(parts.hostname, "example.com")
-        self.assertEqual(parts.port, 443)
+        self.assertEqual(parts.port, node["port"])
         self.assertEqual(query["type"], ["tcp"])
         self.assertEqual(query["security"], ["reality"])
         self.assertEqual(query["sni"], ["sni.example"])
