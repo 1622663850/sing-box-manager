@@ -42,3 +42,5 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_xray*.py' -v
       - name: Real Xray protocol forwarding
         run: python3 tests/smoke_xray.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
+      - name: Real post-quantum encryption and authentication
+        run: python3 tests/smoke_xray_pq.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"

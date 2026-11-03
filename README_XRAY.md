@@ -41,6 +41,18 @@ sudo xray
 
 VLESS、VMess、Trojan、Hy2 可按用户添加/删除独立认证并导出；SS2022 当前是单密码模板。用户操作保留其他用户和共享传输，至少保留一个用户。客户端导出保留 TLS 校验、SNI、REALITY、公钥、short ID、flow、WS/gRPC/XHTTP 等必要信息；未知或无法安全表达的导入配置拒绝向导导出，不静默去掉安全设置。
 
+## 后量子加密与认证（面板 v1.1.0）
+
+菜单 **8 添加入站 / 11 修改配置**：全部 VLESS 模板支持单独开启、关闭或重新生成 VLESS Encryption 密钥；REALITY 模板另有 ML-DSA-65 开关。新增默认关闭以兼容现有客户端，修改默认保留原开关和密钥。开启、关闭或换密钥影响整个入站的全部用户，须重新导入各用户连接信息；不会自动改变现有节点。
+
+- **VLESS Encryption**：官方核心 `mlkem768` 生成密钥，服务端 `decryption=mlkem768x25519plus.native.600s.<Seed>`，客户端从同一 Seed 派生 `encryption=mlkem768x25519plus.native.0rtt.<Client>`；支持 RAW、TLS、REALITY、WS、gRPC、XHTTP 叠加。
+- **REALITY ML-DSA-65**：官方核心 `mldsa65` 生成独立密钥，服务端 `mldsa65Seed`、客户端 `mldsa65Verify`；不替代原 REALITY X25519 密钥。首次开启、换密钥或修改握手域名时，自动检测目标 TLS 1.3、X25519MLKEM768 和超过 3500 字节的证书链；未通过不保存。
+- 分享链接按官方标准保留完整 `encryption`、`pqv`、`pbk` 等客户端参数；导入分享链接和出站向导均支持对应字段。客户端 JSON / 链接不包含服务端 Seed 或私钥；服务端完整 JSON 和备份仍须保密。
+
+测试基线为 **Xray v26.10.31**。客户端核心及其导入界面必须同时支持对应功能；仅有新版核心不保证 GUI 导入器保留长参数，导入后需核对 `encryption` / `mldsa65Verify`，必要时使用原生 Xray outbound JSON。自动派生仅处理面板生成的单密钥格式，复杂 padding/多密钥导入请用原生 JSON 管理，不会降级成 `none`。0rtt 字段表示尝试票据复用，回环测试不宣称已验证 0-RTT 性能。
+
+参数依据：[官方 VLESS 文档](https://xtls.github.io/config/outbounds/vless.html)、[REALITY 文档](https://xtls.github.io/config/transports/reality.html)、[官方分享链接标准](https://github.com/XTLS/Xray-core/discussions/716)。实际加密转发及错误密钥拒绝验证见 `tests/smoke_xray_pq.py`。
+
 ## 出站、IPv6 与 BBR
 
 出站管理支持协议向导、粘贴分享链接、原生 Xray outbound JSON/JSONC 与每行一个链接的文本文件。支持单对象、数组、仅包含 outbounds 的对象；不会把 sing-box JSON 当成 Xray 格式。新增只追加，不改变路由；绑定入站时增加优先 `inboundTag → outboundTag` 规则，取消只移除面板登记的原样规则；外部改过/重复的规则拒绝自动处理，路由/代理引用未解除时禁止删除出站。完整 JSON 粘贴不回显，以单独一行 `END` 结束。

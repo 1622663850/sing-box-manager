@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.0.0"
+XR_MANAGER_VERSION="1.1.0"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -1727,6 +1727,75 @@ format_config_locked() (
 )
 format_config(){ with_lock format_config_locked; }
 
+pq_crypto() {
+    python3 - "$CORE_BIN" "$@" <<'PY_XRAY_PQ'
+import base64, json, re, subprocess, sys
+from pathlib import Path
+
+def decoded(value, length):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value): raise ValueError()
+    raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    if len(raw) != length or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value: raise ValueError()
+    return value
+
+def pair(kind, seed=""):
+    size, label, public_size = {"mlkem768": (64, "Client", 1184), "mldsa65": (32, "Verify", 1952)}[kind]
+    if seed: decoded(seed, size)
+    command = [sys.argv[1], kind] + (["-i", seed] if seed else [])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=True)
+    def field(name):
+        matches = re.findall(r"^" + name + r": ([A-Za-z0-9_-]+)$", result.stdout, re.M)
+        if len(matches) != 1: raise ValueError()
+        return matches[0]
+    private, public = decoded(field("Seed"), size), decoded(field(label), public_size)
+    if seed and private != seed: raise ValueError()
+    return {"private": private, "public": public}
+
+try:
+    mode = sys.argv[2]
+    if mode == "client":
+        node = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+        encryption, verify = "none", ""
+        decryption = node.get("settings", {}).get("decryption", "none") if node.get("protocol") == "vless" else "none"
+        if decryption != "none":
+            # The wizard owns this single-key form; refuse unknown forms rather than weakening exports.
+            match = re.fullmatch(r"mlkem768x25519plus\.(native|xorpub|random)\.([0-9]+(?:-[0-9]+)?s)\.([A-Za-z0-9_-]+)", decryption)
+            if not match: raise ValueError()
+            encryption = "mlkem768x25519plus." + match[1] + ".0rtt." + pair("mlkem768", match[3])["public"]
+        reality = node.get("streamSettings", {}).get("realitySettings", {})
+        if reality.get("mldsa65Seed"):
+            if node.get("streamSettings", {}).get("security") != "reality": raise ValueError()
+            verify = pair("mldsa65", reality["mldsa65Seed"])["public"]
+        output = {"encryption": encryption, "verify": verify}
+    else:
+        output = pair(mode, sys.argv[3] if len(sys.argv) > 3 else "")
+    print(json.dumps(output, separators=(",", ":")))
+except (ValueError, KeyError, TypeError, OSError, IndexError, subprocess.SubprocessError):
+    print("后量子参数生成/派生失败：请使用支持 ML-KEM-768 / ML-DSA-65 的 Xray 核心；导入的复杂密钥格式请用原生 JSON 管理。", file=sys.stderr)
+    raise SystemExit(1)
+PY_XRAY_PQ
+}
+
+check_reality_pq_target() {
+    python3 - "$CORE_BIN" "$1" <<'PY_XRAY_PQ_TARGET'
+import re, subprocess, sys
+try:
+    result = subprocess.run([sys.argv[1], "tls", "ping", sys.argv[2]], capture_output=True, text=True, timeout=20, check=True)
+    valid = False
+    for block in result.stdout.split("-------------------"):
+        lengths = re.findall(r"Certificate chain's total length:\s*(\d+)", block)
+        if ("Pinging with SNI" in block and "Handshake succeeded" in block and "Handshake failure" not in block and
+            re.search(r"TLS Version:\s*TLS 1\.3", block) and
+            re.search(r"TLS Post-Quantum key exchange:\s*true \(X25519MLKEM768\)", block) and
+            lengths and int(lengths[0]) > 3500): valid = True
+    if not valid: raise ValueError()
+except (ValueError, OSError, subprocess.SubprocessError):
+    print("REALITY 后量子目标检测未通过：需要 TLS 1.3、X25519MLKEM768 和超过 3500 字节的证书链；未保存配置。", file=sys.stderr)
+    raise SystemExit(1)
+print("[信息] REALITY 目标的后量子密钥交换及证书链长度检测通过。")
+PY_XRAY_PQ_TARGET
+}
+
 generate_inbound() {
     while (($# < 12)); do set -- "$@" ""; done
     if ! valid_tag "$2" || ! valid_port "$3"; then fail "名称或端口无效。";return 1;fi
@@ -1745,6 +1814,19 @@ extra, private_key, short_id = sys.argv[5:8]
 tls_name, certificate, tls_key = sys.argv[8:11]
 password = sys.argv[11] if len(sys.argv) > 11 else ""
 obfs = sys.argv[12] if len(sys.argv) > 12 else ""
+decryption = sys.argv[13] if len(sys.argv) > 13 and sys.argv[13] else "none"
+mldsa_seed = sys.argv[14] if len(sys.argv) > 14 else ""
+def key_material(value, length):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value): raise SystemExit(1)
+    decoded = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    if len(decoded) != length or base64.urlsafe_b64encode(decoded).decode().rstrip("=") != value: raise SystemExit(1)
+if decryption != "none":
+    parts = decryption.split(".")
+    if not p.startswith("vless-") or len(parts) != 4 or parts[0] != "mlkem768x25519plus" or parts[1] not in {"native", "xorpub", "random"} or not re.fullmatch(r"[0-9]+(?:-[0-9]+)?s", parts[2]): raise SystemExit(1)
+    key_material(parts[3], 64)
+if mldsa_seed:
+    if "reality" not in p or mldsa_seed == private_key: raise SystemExit(1)
+    key_material(mldsa_seed, 32)
 uuid_re = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", tag) or not 1 <= int(port) <= 65535:
     raise SystemExit(1)
@@ -1781,6 +1863,7 @@ def stream(network, security="none"):
             "show": False, "target": f"{tls_name}:443", "xver": 0,
             "serverNames": [tls_name], "privateKey": private_key, "shortIds": [short_id],
         }
+        if mldsa_seed: value["realitySettings"]["mldsa65Seed"] = mldsa_seed
     return value
 if p == "vless-grpc-reality-vision":
     raise SystemExit(1)
@@ -1795,7 +1878,7 @@ if p.startswith("vless-"):
     client = {"id": user_uuid(credential)}
     if p == "vless-reality": client["flow"] = "xtls-rprx-vision"
     value = {"protocol": "vless", "tag": tag, "listen": "::", "port": int(port),
-             "settings": {"users": [client], "decryption": "none"},
+             "settings": {"users": [client], "decryption": decryption},
              "streamSettings": stream(network, security)}
 elif p.startswith("vmess-"):
     network = "raw"
@@ -1832,15 +1915,18 @@ PY_XRAY_INBOUND
 }
 
 generate_client() {
+    local parameters
     validate_inbound_users "$1" >/dev/null 2>&1 || return 1
-    python3 - "$@" 2>/dev/null <<'PY_XRAY_CLIENT'
-import json, re, sys
+    parameters=$(pq_crypto client "$1") || return 1
+    XR_PQ_CLIENT="$parameters" python3 - "$@" 2>/dev/null <<'PY_XRAY_CLIENT'
+import json, os, re, sys
 from pathlib import Path
 
 path, server = sys.argv[1:3]
 public_key = sys.argv[3] if len(sys.argv) > 3 else ""
 index = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else 1
 value = json.loads(Path(path).read_text(encoding="utf-8"))
+pq = json.loads(os.environ["XR_PQ_CLIENT"])
 protocol = value.get("protocol")
 port = value.get("port")
 settings = value.get("settings", {})
@@ -1877,7 +1963,7 @@ if protocol in {"vless", "vmess"}:
     if not users or not 1 <= index <= len(users): raise SystemExit(1)
     user = users[index - 1]
     if protocol == "vless":
-        out = {"tag": "proxy", "protocol": "vless", "settings": {"address": server, "port": port, "id": user["id"], "encryption": "none"}}
+        out = {"tag": "proxy", "protocol": "vless", "settings": {"address": server, "port": port, "id": user["id"], "encryption": pq["encryption"]}}
     else:
         out = {"tag": "proxy", "protocol": "vmess", "settings": {"address": server, "port": port, "id": user["id"], "alterId": user.get("alterId", 0), "security": "auto"}}
     if user.get("flow"): out["settings"]["flow"] = user["flow"]
@@ -1912,12 +1998,13 @@ if stream:
     if stream.get("security") == "reality":
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", public_key): raise SystemExit(1)
         reality = dict(stream["realitySettings"])
-        for field in ("target","dest","privateKey","serverNames","shortIds","xver","minClientVer","maxClientVer","maxTimeDiff"):
+        for field in ("target","dest","privateKey","serverNames","shortIds","xver","minClientVer","maxClientVer","maxTimeDiff","mldsa65Seed","limitFallbackUpload","limitFallbackDownload"):
             reality.pop(field,None)
         reality["serverName"] = (stream.get("realitySettings", {}).get("serverNames") or [""])[0]
         reality["fingerprint"] = "chrome"
         reality["password"] = public_key
         reality["shortId"] = (stream.get("realitySettings", {}).get("shortIds") or [""])[0]
+        if pq["verify"]: reality["mldsa65Verify"] = pq["verify"]
         out["streamSettings"]["realitySettings"] = reality
     if protocol == "hysteria":
         hs = dict(out["streamSettings"].get("hysteriaSettings", {}))
@@ -1947,12 +2034,13 @@ def common(q):
         q += "&fp=" + quote(reality.get("fingerprint", "chrome"), safe="")
         q += "&pbk=" + quote(reality.get("password", reality.get("publicKey", "")), safe="")
         q += "&sid=" + quote(reality.get("shortId", ""), safe="")
-        if settings.get("flow"): q += "&flow=" + quote(settings["flow"], safe="")
+        if reality.get("mldsa65Verify"): q += "&pqv=" + quote(reality["mldsa65Verify"], safe="")
     elif security == "tls":
         tls = stream.get("tlsSettings", {})
         q += "&sni=" + quote(tls.get("serverName", ""), safe="")
         if tls.get("alpn"): q += "&alpn=" + quote(",".join(tls["alpn"]), safe="")
         if tls.get("fingerprint"): q += "&fp=" + quote(tls["fingerprint"], safe="")
+    if settings.get("flow"): q += "&flow=" + quote(settings["flow"], safe="")
     return q
 def transport(q):
     if method == "websocket":
@@ -1967,7 +2055,7 @@ def transport(q):
         q += "&path=" + quote(x.get("path", ""), safe="") + "&mode=" + quote(x.get("mode", "auto"), safe="")
     return q
 if protocol == "vless":
-    q = common("encryption=none&type=" + {"raw":"tcp","websocket":"ws","grpc":"grpc","xhttp":"xhttp"}.get(method, method) + "&security=" + security)
+    q = common("encryption=" + quote(settings.get("encryption", "none"), safe="") + "&type=" + {"raw":"tcp","websocket":"ws","grpc":"grpc","xhttp":"xhttp"}.get(method, method) + "&security=" + security)
     print(f"vless://{settings['id']}@{address(settings['address'])}:{settings['port']}?{transport(q)}#{tag}")
 elif protocol == "vmess":
     payload = {"v":"2","ps":sys.argv[2],"add":settings["address"],"port":str(settings["port"]),"id":settings["id"],"aid":str(settings.get("alterId",0)),"net":{"raw":"tcp","websocket":"ws","grpc":"grpc","xhttp":"xhttp"}.get(method,method),"type":"none"}
@@ -2103,6 +2191,7 @@ node_wizard_locked() (
     umask 077
     local certificate="" tls_key=""
     local obfs="" obfs_choice
+    local decryption=none mldsa_seed="" old_mldsa="" pq_default=1 pq_target=""
     local old=${1:-} protocol="" tag port=443 credential="" extra="" private_key="" public_key="" sid="" tls_name="" cert="" key="" server="" pair work index=1 count=1 old_tls="" choice file
     require_core && safe_paths || exit 1
     work=$(mktemp -d "$STATE_DIR/node-wizard.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
@@ -2118,6 +2207,8 @@ node_wizard_locked() (
         tls_name=$(jq -r '.streamSettings.tlsSettings.serverName // .streamSettings.realitySettings.serverNames[0] // ""' "$work/original");old_tls=$tls_name
         cert=$(jq -r '.streamSettings.tlsSettings.certificates[0].certificateFile // ""' "$work/original");key=$(jq -r '.streamSettings.tlsSettings.certificates[0].keyFile // ""' "$work/original")
         private_key=$(jq -r '.streamSettings.realitySettings.privateKey // ""' "$work/original");sid=$(jq -r '.streamSettings.realitySettings.shortIds[0] // ""' "$work/original")
+        decryption=$(jq -r '.settings.decryption // "none"' "$work/original")
+        mldsa_seed=$(jq -r '.streamSettings.realitySettings.mldsa65Seed // ""' "$work/original");old_mldsa=$mldsa_seed
         if [[ -f $CLIENT_DIR/$old.json ]]; then
             server=$(jq -r '.server // ""' "$CLIENT_DIR/$old.json");public_key=$(jq -r '.public_key // ""' "$CLIENT_DIR/$old.json")
         fi
@@ -2137,6 +2228,18 @@ node_wizard_locked() (
     prompt_secret credential "UUID/密码（回车保留或自动生成，@new 重新生成）" "$credential" || exit 1
     if [[ $credential == @new ]]; then case "$protocol" in vless-*|vmess-*) credential=$("$CORE_BIN" uuid);; *) credential=$(openssl rand -base64 16);; esac || exit 1; fi
     case "$protocol" in *-ws|*-ws-tls|*-xhttp-*) prompt extra "传输路径" "${extra:-/xray}" || exit 1;; *-grpc-*) prompt extra "gRPC 服务名" "${extra:-TunService}" || exit 1;; esac
+    if [[ $protocol == vless-* ]]; then
+        info "VLESS Encryption 为整个入站共享；开启/关闭/换密钥后，所有用户须重新导入客户端配置。客户端需支持此功能。"
+        [[ $decryption == none ]] || pq_default=2
+        prompt choice "VLESS 后量子混合加密：1 关闭，2 开启/保留密钥，3 开启并重新生成密钥，0 取消" "$pq_default" || exit 1
+        case "$choice" in
+          0) exit 0;; 1) decryption=none;;
+          2|3) if [[ $decryption == none || $choice == 3 ]]; then
+              pair=$(pq_crypto mlkem768) || exit 1
+              decryption="mlkem768x25519plus.native.600s.$(jq -r .private <<<"$pair")"
+          fi;; *) exit 1;;
+        esac
+    fi
     case "$protocol" in
         *reality*)
             prompt tls_name "REALITY TLS 1.3 握手域名" "$tls_name" || exit 1
@@ -2148,6 +2251,21 @@ node_wizard_locked() (
             private_key=$(jq -r .private <<<"$pair");public_key=$(jq -r .public <<<"$pair")
             [[ -n $sid ]] || sid=$(openssl rand -hex 8) || exit 1
             prompt_secret sid "REALITY short ID（回车保留）" "$sid" || exit 1
+            info "ML-DSA-65 是附加后量子认证；客户端须支持。开启/换密钥会影响此入站全部用户。"
+            pq_default=1; [[ -z $mldsa_seed ]] || pq_default=2
+            prompt choice "REALITY ML-DSA-65：1 关闭，2 开启/保留密钥，3 开启并重新生成密钥，0 取消" "$pq_default" || exit 1
+            case "$choice" in
+              0) exit 0;; 1) mldsa_seed="";;
+              2|3) if [[ -z $mldsa_seed || $choice == 3 ]]; then pair=$(pq_crypto mldsa65) || exit 1;mldsa_seed=$(jq -r .private <<<"$pair");fi;;
+              *) exit 1;;
+            esac
+            if [[ -n $mldsa_seed && ( $mldsa_seed != "$old_mldsa" || $tls_name != "$old_tls" ) ]]; then
+                pq_target="$tls_name:443"
+                if [[ -n $old && $tls_name == "$old_tls" ]]; then pq_target=$(jq -r '.streamSettings.realitySettings.target // .streamSettings.realitySettings.dest // ""' "$work/original");fi
+                [[ -n $pq_target ]] || pq_target="$tls_name:443"
+                info "正在检测 REALITY 握手目标的后量子支持与证书链长度……"
+                check_reality_pq_target "$pq_target" || exit 1
+            fi
             ;;
         *-tls|trojan|hysteria)
             prompt tls_name "TLS SNI 域名/IP" "$tls_name" || exit 1
@@ -2164,7 +2282,7 @@ node_wizard_locked() (
     [[ -n $server ]] || server=$(read_default_server) || exit 1
     prompt server "客户端服务器 IP/域名（- 清除独立地址）" "$server" || exit 1
     [[ $server != - ]] || server=""
-    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$sid" "$tls_name" "$cert" "$key" "" "$obfs" >"$work/generated" || exit 1
+    generate_inbound "$protocol" "$tag" "$port" "$credential" "$extra" "$private_key" "$sid" "$tls_name" "$cert" "$key" "" "$obfs" "$decryption" "$mldsa_seed" >"$work/generated" || exit 1
     if [[ -n $old ]]; then
         jq --slurpfile update "$work/generated" --argjson i "$((index-1))" '
           . as $old | (.settings.users // .settings.clients // null) as $users | . * $update[0] |
@@ -2174,6 +2292,9 @@ node_wizard_locked() (
         fi
         if [[ $protocol == hysteria && -z $obfs ]];then
             jq 'del(.streamSettings.finalmask.udp)' "$work/updated" >"$work/unmasked" && mv "$work/unmasked" "$work/updated" || exit 1
+        fi
+        if [[ $protocol == *reality* && -z $mldsa_seed ]]; then
+            jq 'del(.streamSettings.realitySettings.mldsa65Seed)' "$work/updated" >"$work/no-mldsa" && mv "$work/no-mldsa" "$work/updated" || exit 1
         fi
         confirm "保存修改？（其他用户保留，配置和连接信息成套备份）" || exit 0
         snapshot_bundle >"$work/current" || exit 1
@@ -2607,11 +2728,21 @@ def parse_vless(raw: str, parts, name: str) -> dict:
     host, port = endpoint(parts)
     query = query_values(
         parts,
-        {"encryption", "type", "security", "flow", "fp", "sni", "pbk", "sid", "alpn",
+        {"encryption", "type", "security", "flow", "fp", "sni", "pbk", "sid", "pqv", "alpn",
          "path", "host", "serviceName", "mode"},
     )
-    if query.get("encryption", "none") != "none":
-        fail()
+    encryption = query.get("encryption", "none")
+    def key_bytes(value, size):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", value): fail()
+        data = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+        if len(data) != size or base64.urlsafe_b64encode(data).decode().rstrip("=") != value: fail()
+    if encryption != "none":
+        match = re.fullmatch(r"mlkem768x25519plus\.(native|xorpub|random)\.(0rtt|1rtt)\.([A-Za-z0-9_-]+)", encryption)
+        if not match: fail()
+        key_bytes(match[3], 1184)
+    if "pqv" in query:
+        if query.get("security") != "reality": fail()
+        key_bytes(query["pqv"], 1952)
     transport = query.get("type", "tcp")
     if transport not in {"tcp", "ws", "grpc", "xhttp"}:
         fail()
@@ -2619,6 +2750,7 @@ def parse_vless(raw: str, parts, name: str) -> dict:
     if security not in {"none", "tls", "reality"}:
         fail()
     result = {"type": "vless", "tag": name, "server": host, "server_port": port, "uuid": uuid(user)}
+    result["encryption"] = encryption
     if transport == "ws":
         path = query.get("path")
         if not path or not path.startswith("/"):
@@ -2646,18 +2778,25 @@ def parse_vless(raw: str, parts, name: str) -> dict:
         if transport not in {"tcp", "grpc", "xhttp"}:
             fail()
         tls_fields(result, query, host, reality=True)
+        if "pqv" in query: result["tls"]["reality"]["mldsa65Verify"] = query["pqv"]
         if "flow" in query:
             if query["flow"] != "xtls-rprx-vision":
                 fail()
-            if transport == "grpc":
+            if transport in {"grpc", "xhttp"} and encryption == "none":
                 fail()
             result["flow"] = query["flow"]
     elif security == "tls":
-        if any(key in query for key in ("flow", "pbk", "sid")):
+        if any(key in query for key in ("pbk", "sid", "pqv")):
             fail()
         tls_fields(result, query, host)
-    elif any(key in query for key in ("flow", "fp", "pbk", "sid", "sni", "alpn")):
+        if "flow" in query:
+            if query["flow"] != "xtls-rprx-vision" or (transport != "tcp" and encryption == "none"): fail()
+            result["flow"] = query["flow"]
+    elif any(key in query for key in ("fp", "pbk", "sid", "pqv", "sni", "alpn")):
         fail()
+    elif "flow" in query:
+        if query["flow"] != "xtls-rprx-vision" or encryption == "none": fail()
+        result["flow"] = query["flow"]
     return result
 
 
@@ -2952,7 +3091,7 @@ try:
         settings={'address':n['server'],'port':n['server_port']}
         if kind in {'vless','vmess'}:
             settings['id']=n['uuid']
-            settings['encryption' if kind=='vless' else 'security']='none' if kind=='vless' else n.get('security','auto')
+            settings['encryption' if kind=='vless' else 'security']=n.get('encryption','none') if kind=='vless' else n.get('security','auto')
             if n.get('flow'):settings['flow']=n['flow']
         elif kind in {'trojan','shadowsocks'}:
             settings['password']=n['password']
@@ -2972,6 +3111,7 @@ try:
             if tls.get('reality',{}).get('enabled'):
                 stream['security']='reality';stream.pop('tlsSettings')
                 stream['realitySettings']={'serverName':tls['server_name'],'fingerprint':tls.get('utls',{}).get('fingerprint','chrome'),'password':tls['reality']['public_key'],'shortId':tls['reality']['short_id']}
+                if tls['reality'].get('mldsa65Verify'):stream['realitySettings']['mldsa65Verify']=tls['reality']['mldsa65Verify']
         if kind=='hysteria2':
             stream['method']='hysteria';stream['hysteriaSettings']={'version':2,'auth':n['password']}
             if n.get('obfs'):stream['finalmask']={'udp':[{'type':'salamander','settings':{'password':n['obfs']['password']}}]}
@@ -3039,6 +3179,7 @@ import_outbound_wizard_locked() (
 add_outbound_wizard_locked() (
     umask 077
     local protocol tag server port credential="" method="" network=raw security=none sni="" pub="" sid="" flow="" path="" username="" password="" choice work
+    local encryption=none pq_verify=""
     require_core || exit 1
     printf '\n添加远端出站\n  1. VLESS\n  2. VMess\n  3. Trojan\n  4. Shadowsocks\n  5. Hysteria 2\n  6. SOCKS5\n  7. HTTP/HTTPS\n  8. 直连\n  0. 返回\n'
     prompt choice "选择协议" 1 || exit 1
@@ -3058,14 +3199,20 @@ add_outbound_wizard_locked() (
       prompt choice "安全：1 无 TLS，2 TLS，3 REALITY（仅 VLESS），0 取消" 2 || exit 1
       case "$choice" in 1)security=none;;2)security=tls;;3)[[ $protocol == vless && $network != websocket ]] || exit 1;security=reality;;0)exit 0;;*)exit 1;;esac;;esac
     if [[ $security != none ]];then prompt sni "远端 SNI" "$server" || exit 1;valid_host "$sni" || exit 1;fi
+    if [[ $protocol == vless ]]; then
+      prompt choice "远端 VLESS Encryption：1 无，2 输入远端提供的完整 encryption，0 取消" 1 || exit 1
+      case "$choice" in 1) ;;2)prompt_secret encryption "客户端 encryption（不可填服务端 decryption/Seed）" || exit 1;;0)exit 0;;*)exit 1;;esac
+    fi
     if [[ $security == reality ]];then
       prompt pub "REALITY 公钥（Password/PublicKey，不是 Hash32）" || exit 1;prompt sid "REALITY short ID" || exit 1
       [[ $pub =~ ^[a-zA-Z0-9_-]{43}$ && $sid =~ ^([a-fA-F0-9]{2}){0,8}$ ]] || exit 1
+      prompt choice "远端 REALITY ML-DSA-65：1 无，2 输入远端 Verify/pqv，0 取消" 1 || exit 1
+      case "$choice" in 1);;2)prompt_secret pq_verify "mldsa65Verify/pqv（不可填 Seed）" || exit 1;;0)exit 0;;*)exit 1;;esac
       if [[ $network == raw ]];then prompt choice "Vision：1 开启，2 关闭" 1 || exit 1;[[ $choice != 1 ]] || flow=xtls-rprx-vision;fi
     fi
-    jq -n --arg p "$protocol" --arg tag "$tag" --arg addr "$server" --argjson port "$((10#$port))" --arg c "$credential" --arg n "$network" --arg security "$security" --arg sni "$sni" --arg pub "$pub" --arg sid "$sid" --arg flow "$flow" --arg path "$path" --arg method "$method" --arg u "$username" --arg password "$password" '
+    jq -n --arg p "$protocol" --arg tag "$tag" --arg addr "$server" --argjson port "$((10#$port))" --arg c "$credential" --arg n "$network" --arg security "$security" --arg sni "$sni" --arg pub "$pub" --arg sid "$sid" --arg flow "$flow" --arg path "$path" --arg method "$method" --arg u "$username" --arg password "$password" --arg encryption "$encryption" --arg pqv "$pq_verify" '
       {protocol:$p,tag:$tag,settings:{address:$addr,port:$port},streamSettings:{method:$n,security:$security}} |
-      if $p=="vless" or $p=="vmess" then .settings.id=$c | if $p=="vless" then .settings.encryption="none" else .settings.security="auto" end
+      if $p=="vless" or $p=="vmess" then .settings.id=$c | if $p=="vless" then .settings.encryption=$encryption else .settings.security="auto" end
       elif $p=="trojan" then .settings.password=$c
       elif $p=="shadowsocks" then .settings.method=$method|.settings.password=$c
       elif $p=="hysteria" then .settings.version=2|.streamSettings.method="hysteria"|.streamSettings.hysteriaSettings={version:2,auth:$c}
@@ -3073,7 +3220,8 @@ add_outbound_wizard_locked() (
       if $n=="websocket" then .streamSettings.wsSettings={path:$path} elif $n=="grpc" then .streamSettings.grpcSettings={serviceName:$path} elif $n=="xhttp" then .streamSettings.xhttpSettings={path:$path,mode:"auto"} else . end |
       if $security=="tls" then .streamSettings.tlsSettings={serverName:$sni,allowInsecure:false} | if $n=="grpc" then .streamSettings.tlsSettings.alpn=["h2"] elif $n=="websocket" then .streamSettings.tlsSettings.alpn=["http/1.1"] else . end
       elif $security=="reality" then .streamSettings.realitySettings={serverName:$sni,password:$pub,shortId:$sid,fingerprint:"chrome"} else . end |
-      if $flow!="" then .settings.flow=$flow else . end' >"$work/node" || exit 1
+      if $flow!="" then .settings.flow=$flow else . end |
+      if $pqv!="" then .streamSettings.realitySettings.mldsa65Verify=$pqv else . end' >"$work/node" || exit 1
     add_outbounds_file_locked "$work/node"
 )
 outbounds_menu(){
