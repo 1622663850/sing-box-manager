@@ -3186,7 +3186,7 @@ menu(){
       read -r -p "按回车键返回菜单..." selected || return 0
     done
 }
-core_passthrough(){ require_core || return; XRAY_LOCATION_ASSET="$LIB_DIR" exec "$CORE_BIN" "$@"; }
+core_passthrough(){ [[ -x $CORE_BIN ]] || { fail "尚未安装 Xray 核心。";return 1; }; XRAY_LOCATION_ASSET="$LIB_DIR" exec "$CORE_BIN" "$@"; }
 main(){
     set -o pipefail;umask 077
     [[ -z $XR_ROOT_PREFIX ]] || { fail "XR_ROOT_PREFIX 仅供 source 后隔离测试，CLI 禁止设置。";return 1; }

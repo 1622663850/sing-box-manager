@@ -774,6 +774,8 @@ class XrayManagerTest(XrayFixture):
         passthrough = self.shell('core_passthrough version', check=True)
         self.assertEqual(passthrough.stdout.strip(), "Xray 1.8.24")
         self.assertIn(["version"], self.core_calls())
+        self.config.unlink()
+        self.assertEqual(self.shell('core_passthrough version', check=True).stdout.strip(), "Xray 1.8.24")
         paths = self.shell('printf "%s\\n" "$CONFIG_FILE" "$STATE_DIR" "$SERVICE"', check=True).stdout.splitlines()
         self.assertEqual(paths, [str(self.config), str(self.state_dir), "xray.service"])
 
