@@ -107,6 +107,8 @@ def unit_source(core: Path, state: Path, config: Path) -> bytes:
         "NoNewPrivileges=true\n"
         "StandardOutput=null\n"
         "StandardError=null\n"
+        "\n[Install]\n"
+        "WantedBy=multi-user.target\n"
     ).encode("utf-8")
 
 
@@ -394,6 +396,9 @@ def run(core: Path, manager: Path) -> None:
                 )
                 require(status.returncode != 0, "isolated service remained active during cleanup")
                 run_command([real_systemctl, "reset-failed", service], "isolated service reset", check=False, timeout=15)
+                enabled_state = run_command([real_systemctl, "show", service, "--property=UnitFileState", "--value"], "isolated boot state", check=False, timeout=15).stdout.strip()
+                if enabled_state in {"enabled", "enabled-runtime"}:
+                    run_command([real_systemctl, "disable", service], "isolated boot cleanup", check=False, timeout=15)
                 require(runtime_unit.is_file() and not runtime_unit.is_symlink(), "runtime unit was replaced or removed")
                 require(runtime_unit.read_bytes() == unit_bytes, "runtime unit changed during smoke")
                 runtime_unit.unlink()
