@@ -34,7 +34,6 @@ from urllib.parse import urlsplit
 
 from smoke_core import (
     LOOPBACK,
-    fetch_through_socks_retry,
     free_port,
     receive_exact,
     tls_material,
@@ -203,12 +202,12 @@ class CountingRelay:
                     continue
                 if not data:
                     break
-                destination.sendall(data)
                 with self._counter_lock:
                     if direction == "client":
                         self.client_bytes += len(data)
                     else:
                         self.server_bytes += len(data)
+                destination.sendall(data)
         except OSError:
             pass
         finally:
@@ -281,9 +280,9 @@ class CountingUdpRelay:
                 thread.start()
                 self._threads.append(thread)
             try:
-                upstream.send(data)
                 with self._counter_lock:
                     self.client_bytes += len(data)
+                upstream.send(data)
             except OSError:
                 pass
 
@@ -299,9 +298,9 @@ class CountingUdpRelay:
             if not data:
                 return
             try:
-                self._server.sendto(data, client)
                 with self._counter_lock:
                     self.server_bytes += len(data)
+                self._server.sendto(data, client)
             except OSError:
                 return
 
@@ -414,6 +413,15 @@ def run_counting_udp_relay_self_test() -> None:
         stop.set()
         target.close()
         thread.join(timeout=2)
+
+
+def safe_error_message(error: BaseException) -> str:
+    """Keep CI diagnostics useful without echoing identifiers or key material."""
+    message = str(error)
+    message = re.sub(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}", "<REDACTED>", message)
+    message = re.sub(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])", "<REDACTED>", message)
+    message = re.sub(r"https?://\S+", "<REDACTED_URL>", message)
+    return message[:180] or "no detail"
 
 
 @contextmanager
@@ -578,6 +586,7 @@ def attach_download(manager: Path, env: dict[str, str], outbound: dict, download
 
 
 def tls_download(port: int, path: str, alpn: str = "h2") -> dict:
+    fingerprint = "unsafe" if alpn == "http/1.1" else "chrome"
     return {
         "address": DOWNLOAD_HOST,
         "port": port,
@@ -585,7 +594,7 @@ def tls_download(port: int, path: str, alpn: str = "h2") -> dict:
         "security": "tls",
         "tlsSettings": {
             "serverName": "localhost",
-            "fingerprint": "chrome",
+            "fingerprint": fingerprint,
             "alpn": [alpn],
             "allowInsecure": False,
         },
@@ -799,10 +808,7 @@ def runtime_case(
                     check_xray(core, client_file, work)
                     proxy_port = json.loads(client_file.read_text(encoding="utf-8"))["inbounds"][0]["port"]
                     with running_xray(core, client_file, work, proxy_port, f"{label}-{name}-client"):
-                        if security == "tls":
-                            received = post_through_socks_retry(proxy_port, http_port, PAYLOAD)
-                        else:
-                            received = fetch_through_socks_retry(proxy_port, http_port, "/" + name)
+                        received = post_through_socks_retry(proxy_port, http_port, PAYLOAD)
                         if received != PAYLOAD:
                             raise RuntimeError(f"{label} {name} payload mismatch")
                     if upload_relay.accepted < 1 or download_relay.accepted < 1:
@@ -855,7 +861,7 @@ def main() -> int:
         run_counting_relay_self_test()
         run_counting_udp_relay_self_test()
     except Exception as error:
-        print(f"FAIL relay self-test: {type(error).__name__}", file=sys.stderr)
+        print(f"FAIL relay self-test: {safe_error_message(error)}", file=sys.stderr)
         return 1
     if not core.is_file() or not os.access(core, os.X_OK) or not manager.is_file():
         print("FAIL xhttp split smoke: invalid core or manager path", file=sys.stderr)
@@ -865,7 +871,7 @@ def main() -> int:
     except Exception as error:
         frames = traceback.extract_tb(error.__traceback__)
         locations = ",".join(Path(frame.filename).name + ":" + str(frame.lineno) for frame in frames[-3:])
-        print(f"FAIL xhttp split smoke: {type(error).__name__} at {locations}", file=sys.stderr)
+        print(f"FAIL xhttp split smoke: {type(error).__name__} at {locations}: {safe_error_message(error)}", file=sys.stderr)
         return 1
     print("PASS xhttp split smoke: TLS, REALITY, Vision, exports, and metadata", flush=True)
     return 0

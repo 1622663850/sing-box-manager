@@ -79,7 +79,10 @@ def upload_outbound(*, mode: str = "auto", security: str = "tls", path: str = "/
     }
 
 
-def download_settings(*, security: str = "tls", path: str = "/xhttp") -> dict:
+def download_settings(
+    *, security: str = "tls", path: str = "/xhttp", alpn: str = "h2",
+    fingerprint: str = "chrome", allow_insecure: bool = False,
+) -> dict:
     value: dict = {
         "address": "download.example",
         "port": 443,
@@ -90,8 +93,9 @@ def download_settings(*, security: str = "tls", path: str = "/xhttp") -> dict:
     if security == "tls":
         value["tlsSettings"] = {
             "serverName": "download.example",
-            "alpn": ["h2"],
-            "allowInsecure": False,
+            "alpn": [alpn],
+            "fingerprint": fingerprint,
+            "allowInsecure": allow_insecure,
         }
     else:
         value["realitySettings"] = {
@@ -147,6 +151,33 @@ class XhttpEmbeddedTest(unittest.TestCase):
         download = packet["streamSettings"]["xhttpSettings"]["extra"]["downloadSettings"]
         self.assertEqual(download["security"], "reality")
         self.assertEqual(download["realitySettings"]["fingerprint"], "chrome")
+
+    def test_http11_download_requires_unsafe_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xray-split-http11-fingerprint-") as directory:
+            root = Path(directory)
+            inbound_path = write_json(root / "inbound.json", upload_outbound())
+            chrome_path = write_json(root / "chrome.json", download_settings(alpn="http/1.1", fingerprint="chrome"))
+            rejected = self.call_download("download", chrome_path, inbound_path)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertNotIn(DOWNLOAD_SECRET, rejected.stdout + rejected.stderr)
+
+            unsafe_path = write_json(root / "unsafe.json", download_settings(alpn="http/1.1", fingerprint="unsafe"))
+            normalized = self.call_download("download", unsafe_path, inbound_path)
+            self.assertEqual(normalized.returncode, 0, normalized.stdout + normalized.stderr)
+            self.assertEqual(json.loads(normalized.stdout)["tlsSettings"]["fingerprint"], "unsafe")
+
+            attached = self.attach(upload_outbound(), download_settings(alpn="http/1.1", fingerprint="unsafe"))
+            attached_path = write_json(root / "attached.json", attached)
+            checked = self.call_download("check", attached_path)
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+
+            insecure_path = write_json(
+                root / "insecure.json",
+                download_settings(alpn="http/1.1", fingerprint="unsafe", allow_insecure=True),
+            )
+            insecure = self.call_download("attach", inbound_path, insecure_path)
+            self.assertNotEqual(insecure.returncode, 0)
+            self.assertNotIn(DOWNLOAD_SECRET, insecure.stdout + insecure.stderr)
 
     def test_invalid_downloads_are_rejected_without_secret_echo(self) -> None:
         cases = []
