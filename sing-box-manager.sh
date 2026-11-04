@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.24.0"
+SB_MANAGER_VERSION="1.25.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1641,24 +1641,151 @@ confirm() {
 }
 
 uninstall_core_locked() {
-    local snapshot
+    local snapshot="" mode=${1:-retain}
+    case "$mode" in retain|purge) ;; *) return 1;; esac
     is_managed || { fail "没有本脚本管理的安装。"; return 1; }
-    snapshot=$(mktemp -d "$BACKUP_DIR/uninstall-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return
-    [[ ! -f "$CONFIG_FILE" ]] || install -m 600 "$CONFIG_FILE" "$snapshot/config.json" || return
-    if [[ -e "$UNIT_FILE" ]] || service_is_active; then
+    if [[ $mode == retain ]]; then
+        install -d -m 700 "$BACKUP_DIR" || return 1
+        snapshot=$(mktemp -d "$BACKUP_DIR/uninstall-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return
+        [[ ! -f "$CONFIG_FILE" ]] || install -m 600 "$CONFIG_FILE" "$snapshot/config.json" || return
+    fi
+    if [[ -e "$UNIT_FILE" ]] || service_is_active || systemctl is-enabled --quiet "$SERVICE"; then
         systemctl disable --now "$SERVICE" || { fail "无法停止/禁用服务，已取消卸载。"; return 1; }
+        if service_is_active; then fail "服务仍在运行，已取消卸载。"; return 1; fi
     fi
     rm -f -- "$CORE_BIN" "$UNIT_FILE" || return
     systemctl daemon-reload || return
     systemctl reset-failed "$SERVICE" 2>/dev/null || true
-    info "已卸载核心和服务；面板保留，仍可使用 sing-box 重新安装。"
-    info "配置及连接信息保留在 $CONFIG_DIR 和 $STATE_DIR；本次备份：$snapshot"
+    if [[ $mode == retain ]]; then
+        info "已卸载核心和服务；面板保留，仍可使用 sing-box 重新安装。"
+        info "配置及连接信息保留在 $CONFIG_DIR 和 $STATE_DIR；本次备份：$snapshot"
+    fi
 }
 
 uninstall_core() {
     is_managed || { fail "没有本脚本管理的安装。"; return 1; }
     confirm "卸载核心并停止服务？（配置、备份和面板保留）" || return
     with_lock uninstall_core_locked
+}
+
+validate_purge_paths() {
+    python3 - "$SB_ROOT_PREFIX" "$LIB_DIR" "$CONFIG_DIR" "$STATE_DIR" "$WRAPPER" "$UNIT_FILE" \
+        "$MANAGED_MARKER" "$CORE_BIN" "$BACKUP_DIR" "$CLIENT_DIR" "$DEFAULT_SERVER_FILE" \
+        "$BBR_SYSCTL_DIR" "$BBR_SYSCTL_FILE" "$BBR_RESTORE_FILE" "$SERVICE" "${1:-}" "$CONFIG_FILE" <<'PY_PURGE_PATHS'
+from pathlib import Path
+import os, re, stat, sys
+
+try:
+    prefix = sys.argv[1]
+    if prefix and (not prefix.startswith('/') or prefix.startswith('//') or prefix == '/' or os.path.normpath(prefix) != prefix):
+        raise ValueError()
+    expected = ['/usr/local/lib/sing-box-manager', '/etc/sing-box', '/var/lib/sing-box-manager',
+                '/usr/local/bin/sing-box', '/etc/systemd/system/sing-box.service',
+                '/usr/local/lib/sing-box-manager/.managed', '/usr/local/lib/sing-box-manager/sing-box',
+                '/var/lib/sing-box-manager/backups', '/var/lib/sing-box-manager/clients',
+                '/var/lib/sing-box-manager/default-server', '/etc/sysctl.d',
+                '/etc/sysctl.d/99-sing-box-manager-bbr.conf', '/var/lib/sing-box-manager/bbr-active']
+    if (sys.argv[2:15] != [prefix + p for p in expected] or sys.argv[15] != 'sing-box.service' or
+        sys.argv[17] != prefix + '/etc/sing-box/config.json'):
+        raise ValueError()
+    paths = [Path(p) for p in sys.argv[2:15]] + [Path(sys.argv[17])]
+    source = Path(sys.argv[16]) if sys.argv[16] else None
+    if source:
+        if (not source.is_absolute() or str(source).startswith('//') or os.path.normpath(str(source)) != str(source) or
+            any(ord(c) < 32 or ord(c) == 127 for c in str(source))): raise ValueError()
+        protected = ['/usr/local/lib/xray-manager', '/usr/local/bin/xray', '/etc/xray',
+                     '/var/lib/xray-manager', '/etc/systemd/system/xray.service',
+                     '/root/xray-manager', '/root/.acme.sh', '/root/acme-script']
+        if any(source == Path(prefix + p) or Path(prefix + p) in source.parents for p in protected): raise ValueError()
+        paths.append(source)
+    for p in paths:
+        if any(parent.is_symlink() for parent in [p, *p.parents]): raise ValueError()
+        if p.exists() and os.path.ismount(p): raise ValueError()
+    for p in paths[:3] + paths[7:9] + [paths[10]]:
+        if p.exists() and not p.is_dir(): raise ValueError()
+    # A bind mount can share st_dev with its parent; --one-file-system alone cannot protect it.
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        mount = Path(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4]))
+        if any(mount == p or p in mount.parents for p in paths[:3]): raise ValueError()
+    for p in [paths[i] for i in [3, 4, 5, 6, 9, 11, 12, 13]]:
+        if p.exists() and not stat.S_ISREG(p.stat().st_mode): raise ValueError()
+    if paths[5].stat().st_size > 256 or paths[5].read_text().strip() != 'sing-box-manager-v1': raise ValueError()
+    def owned_script(p):
+        if not p.is_file() or p.stat().st_size > 1048576: return False
+        data = p.read_bytes()
+        return (data.startswith(b'#!/usr/bin/env bash\n') and
+                b'# sing-box-manager: a self-contained Chinese terminal manager.' in data.splitlines() and
+                re.search(rb'^SB_MANAGER_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$', data, re.M) is not None)
+    if paths[3].exists() and not owned_script(paths[3]): raise ValueError()
+    if source and not owned_script(source): raise ValueError()
+    if paths[4].exists():
+        if paths[4].stat().st_size > 1048576: raise ValueError()
+        unit = paths[4].read_text()
+        if (not unit.startswith('# Managed by sing-box-manager.') or
+            ('ExecStart=' + str(paths[6]) + ' run -D ' + str(paths[2]) + ' -c ' + str(paths[1] / 'config.json')) not in unit.splitlines()):
+            raise ValueError()
+except (ValueError, OSError, UnicodeError):
+    print('[错误] 彻底卸载路径或文件归属检查失败；拒绝删除符号链接、挂载点或非本面板文件。', file=sys.stderr)
+    raise SystemExit(1)
+PY_PURGE_PATHS
+}
+
+purge_install_locked() {
+    local source=${1:-} bbr_backup="" bbr_archive=""
+    [[ $# -le 1 ]] || return 1
+    is_managed && validate_purge_paths "$source" && check_conflicts || return 1
+    if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then bbr_backup=$(bbr_restore_backup) || return 1; fi
+    # Keep recovery data for a shared kernel setting, never node credentials or all panel backups.
+    if [[ -n $bbr_backup ]]; then
+        bbr_archive=$(mktemp -d "${STATE_DIR%/*}/sing-box-manager-bbr-recovery-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+        install -d -m 700 "$bbr_archive/backups/${bbr_backup##*/}" &&
+            install -m 600 "$BBR_RESTORE_FILE" "$bbr_archive/bbr-active" &&
+            install -m 600 /dev/null "$bbr_archive/backups/${bbr_backup##*/}/runtime.json" &&
+            jq '{tcp_congestion_control,default_qdisc,config_existed,config_mode}' "$bbr_backup/runtime.json" \
+                >"$bbr_archive/backups/${bbr_backup##*/}/runtime.json" || return 1
+        if [[ $(jq -r .config_existed "$bbr_archive/backups/${bbr_backup##*/}/runtime.json") == true ]]; then
+            [[ ! -L $bbr_backup/sysctl.conf ]] &&
+                install -m 600 "$bbr_backup/sysctl.conf" "$bbr_archive/backups/${bbr_backup##*/}/sysctl.conf" || return 1
+        fi
+        printf '仅保存共享 TCP BBR 的开启前恢复资料，不包含节点配置。\n如需恢复，重新安装面板后，将 bbr-active 和 backups 中的该项备份复制回 %s，再执行 sing-box bbr-disable。\n' "$STATE_DIR" >"$bbr_archive/README.txt" || return 1
+        chmod 600 "$bbr_archive/README.txt" || return 1
+    fi
+    uninstall_core_locked purge || return 1
+    validate_purge_paths "$source" || return 1
+    if ! rm -rf --one-file-system -- "$CONFIG_DIR" "$STATE_DIR" "$LIB_DIR" ||
+       ! rm -f -- "$WRAPPER"; then
+        fail "彻底卸载未完成，请核对上方删除清单和剩余文件。"; return 1
+    fi
+    [[ -z $source ]] || rm -f -- "$source" || return 1
+    info "已彻底卸载 sing-box 核心、服务、面板命令、节点配置、连接信息和面板备份。"
+    [[ -z $source ]] || info "已删除指定的下载脚本：$source"
+    [[ -z $bbr_archive ]] || info "系统 TCP BBR 保留；仅 BBR 恢复资料另存于：$bbr_archive"
+    info "外部 ACME 证书、ACME 菜单、其他程序及系统日志保留。"
+}
+
+purge_uninstall() {
+    local source="" answer
+    is_managed || { fail "没有本脚本管理的安装。"; return 1; }
+    prompt source "额外删除的原下载脚本绝对路径（留空保留源码副本，0 取消）" || return 1
+    [[ $source != 0 ]] || return 0
+    validate_purge_paths "$source" && check_conflicts || return 1
+    if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
+        info "系统 TCP BBR 保留；现有恢复资料会单独保存到 /var/lib/sing-box-manager-bbr-recovery-*。"
+    fi
+    printf '\n将永久删除以下路径（含全部节点及面板备份）：\n  %s\n  %s\n  %s\n  %s\n  %s\n' "$CORE_BIN" "$LIB_DIR" "$WRAPPER" "$CONFIG_DIR" "$STATE_DIR"
+    printf '  %s\n' "$UNIT_FILE"
+    [[ -z $source ]] || printf '  %s\n' "$source"
+    info "不会递归删除整个源码仓库；外部证书、ACME 和 Xray 保留。"
+    prompt answer "此操作不可撤销；输入 DELETE 确认，其他输入取消" 0 || return 1
+    [[ $answer == DELETE ]] || { info "已取消彻底卸载。"; return 0; }
+    with_lock purge_install_locked "$source"
+}
+
+uninstall_menu() {
+    local uninstall_choice
+    printf '\n卸载 sing-box\n  1. 仅卸载核心和服务（保留面板、配置和备份）\n  2. 彻底卸载（清除面板、核心、配置、连接信息和备份）\n  0. 返回\n'
+    prompt uninstall_choice "请选择卸载方式" 1 || return 1
+    case "$uninstall_choice" in 0) return 0;;1) uninstall_core;;2) purge_uninstall;;*) fail "无效选项。";;esac
 }
 
 remove_panel() {
@@ -4511,7 +4638,7 @@ menu() {
         read -r -p "请输入选项 [0-20]: " choice || return 0
         case "$choice" in
             1) install_core || true ;;
-            2) uninstall_core || true ;;
+            2) uninstall_menu || true; is_managed || return 0 ;;
             3) with_lock service_action start || true ;;
             4) autostart_menu || true; continue ;;
             5) with_lock service_action restart || true ;;
@@ -4566,7 +4693,8 @@ sing-box 中文终端管理面板
   sing-box outbound-delete TAG    删除未引用的出站（自动备份）
   sing-box ip-preference [ipv6|ipv4|status] 设置或查看默认出站 IP 优先级
   sing-box acme                   安装/打开 acme-script 证书管理菜单
-  sing-box uninstall              卸载核心及服务，保留配置、备份和面板
+  sing-box uninstall              选择仅卸载核心或彻底卸载
+  sing-box uninstall --purge      彻底卸载（列出清单，输入 DELETE 确认）
   sing-box start | restart        启动 / 重新启动
   sing-box enable                 设置开机自启（不改变当前运行状态）
   sing-box disable-autostart      关闭开机自启（不改变当前运行状态）
@@ -4656,7 +4784,10 @@ main() {
             [[ $# -eq 1 ]] || { fail "用法：sing-box outbound-delete TAG"; return 1; }
             with_lock delete_outbound_locked "$1" ;;
         menu) menu ;;
-        uninstall) uninstall_core ;;
+        uninstall)
+            if [[ $# -eq 0 ]]; then uninstall_menu
+            elif [[ $# -eq 1 && $1 == --purge ]]; then purge_uninstall
+            else fail "用法：sing-box uninstall [--purge]"; return 1; fi ;;
         remove-panel) remove_panel ;;
         status) show_status ;;
         disable-autostart)

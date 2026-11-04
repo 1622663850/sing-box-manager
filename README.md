@@ -285,6 +285,20 @@ sudo sing-box core run -c /root/another-config.json
 
 配置 JSON、连接元数据、配置备份权限为 `600`，配置和状态目录权限为 `700`。完整配置及连接信息包含凭据；请勿提交真实 UUID、密码、私钥、备份到仓库。日志由 systemd journal 管理。
 
+### 卸载与彻底清理（v1.25.0）
+
+主菜单 **2. 卸载 sing-box** 或 `sudo sing-box uninstall` 可选择：
+
+- **1. 仅卸载核心和服务**：停止服务、关闭自启并移除核心及 unit；面板、节点配置、连接信息和备份保留，方便重新安装。
+- **2. 彻底卸载**：删除 `/usr/local/lib/sing-box-manager`、`/usr/local/bin/sing-box`、`/etc/sing-box`、`/var/lib/sing-box-manager` 和本面板 unit，包含所有节点、默认地址及面板备份。可额外指定一个原下载脚本的绝对路径一并删除；不递归删除整个 Git 源码仓库。完成后退出面板。
+- **0. 返回**：不卸载。
+
+也可执行 `sudo sing-box uninstall --purge` 直接进入彻底卸载确认。界面先列出删除路径，只有输入大写 **DELETE** 才执行；其余输入取消。此操作不可撤销，需要保留的节点或备份请先另行导出至删除清单之外。
+
+彻底卸载按用户选择保留整机共享的 **TCP BBR**：当前内核参数和 `/etc/sysctl.d/99-sing-box-manager-bbr.conf` 保持原样；若有有效的开启前恢复记录，仅将该记录及对应 BBR 备份保存至 `/var/lib/sing-box-manager-bbr-recovery-时间-随机值/`，目录 `700`、文件 `600`，不复制节点配置或其他面板备份。若以后需要恢复，重新安装面板，将该目录内的 `bbr-active` 和 `backups` 中的对应备份复制回 `/var/lib/sing-box-manager`，再执行 `sudo sing-box bbr-disable`。损坏或缺失的已登记 BBR 恢复资料会阻止彻底卸载，以免丢失恢复依据。
+
+ACME 菜单、目录外的证书与私钥、Xray、系统日志及其他程序保留；放在 `/etc/sing-box` 内的文件属于上述删除范围。卸载拒绝路径被改到其他位置、符号链接或子挂载点、非本面板的入口与 unit。无法停止服务时不删除文件。
+
 ## ACME 证书菜单
 
 v1.8.0 起选择主菜单 **17. 安装/打开 ACME 证书菜单**，或运行 `sudo sing-box acme`，接入 [1622663850/acme-script](https://github.com/1622663850/acme-script)。首次从该仓库 `main` 分支下载 `acme_cf_token.sh`，校验 GitHub 响应、大小、Git Blob 摘要、项目标识及 Bash 语法，然后打开其菜单。v1.12.2 起还校验 `persistent-menu-v1` 返回契约，安装至 `/root/acme-script/acme_cf_token_menu_v1.sh`（权限 `700`）；旧的 `acme_cf_token.sh` 保留不动，不重新安装证书核心。再次进入直接使用已安装的新菜单文件，不重复下载或自动更新。
@@ -330,7 +344,8 @@ v1.16.0 或外部工具启用的旧节点没有活动恢复记录。可在核对
 ## 卸载与更新面板
 
 ```bash
-sudo sing-box uninstall       # 交互确认；卸载核心和服务
+sudo sing-box uninstall       # 选择仅卸载核心或彻底卸载
+sudo sing-box uninstall --purge # 展示清单并输入 DELETE，清理全部面板文件
 sudo sing-box remove-panel    # 核心已卸载后，移除面板命令
 ```
 
