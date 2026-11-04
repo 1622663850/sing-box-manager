@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.1"
+XR_MANAGER_VERSION="1.2.2"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2134,6 +2134,8 @@ def download(value, upload_path):
     if security == "tls":
         if tls.get("allowInsecure", False) is not False: reject()
         if "alpn" in tls and (not isinstance(tls["alpn"], list) or not tls["alpn"] or any(a not in {"h2", "h3", "http/1.1"} for a in tls["alpn"])): reject()
+        if tls.get("alpn", ["h2"])[0] == "http/1.1" and fp != "unsafe":
+            raise ValueError("HTTP11_FINGERPRINT")
     else:
         if fp == "unsafe": reject()
         public = tls.get("password", tls.get("publicKey"))
@@ -2198,8 +2200,11 @@ try:
         raise SystemExit(0)
     else: reject()
     print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, UnicodeError, RecursionError):
-    print("XHTTP 下载入口无效：须为完整 TLS/REALITY 客户端配置、匹配上行路径且使用可分离模式；不允许私钥、不安全 TLS 或嵌套下载入口。", file=sys.stderr)
+except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, UnicodeError, RecursionError) as error:
+    if isinstance(error, ValueError) and error.args == ("HTTP11_FINGERPRINT",):
+        print("HTTP/1.1 下载须使用 fingerprint=unsafe（原生 Go TLS，仍校验证书）；使用浏览器指纹时请选择 h2 或 h3。", file=sys.stderr)
+    else:
+        print("XHTTP 下载入口无效：须为完整 TLS/REALITY 客户端配置、匹配上行路径且使用可分离模式；不允许私钥、不安全 TLS 或嵌套下载入口。", file=sys.stderr)
     raise SystemExit(1)
 PY_XHTTP_DOWNLOAD
 }
@@ -2249,12 +2254,16 @@ xhttp_split_wizard_locked() (
     path=$(jq -r '.streamSettings.xhttpSettings.path // ""' "$work/node")
     info "下载入口须已转发至同一个 XHTTP 入站，路径自动沿用；客户端必须支持 downloadSettings。"
     prompt address "下载入口 IP/域名" && prompt port "下载入口端口" 443 || exit 1
-    valid_host "$address" && valid_port "$port" || { fail "下载地址或端口无效。"; exit 1; }
+    if ! valid_host "$address" || ! valid_port "$port"; then fail "下载地址或端口无效。"; exit 1; fi
     prompt choice "下载安全类型：1.TLS  2.REALITY" 1 || exit 1
     case "$choice" in 1) security=tls;;2) security=reality;;*) exit 1;;esac
-    prompt sni "下载入口 SNI" "$address" && prompt fp "下载入口 TLS 指纹" chrome && prompt host "HTTP Host（回车跟随下载入口）" "" || exit 1
-    if [[ $security == tls ]]; then prompt alpn "下载 ALPN（h2、h3 或 http/1.1）" h2 || exit 1
-    else prompt_secret public "下载入口 REALITY 客户端公钥" && prompt_secret sid "下载入口 shortId（可空）" && prompt_secret verify "下载入口 ML-DSA-65 校验值（可空）" || exit 1; fi
+    prompt sni "下载入口 SNI" "$address" || exit 1
+    if [[ $security == tls ]]; then
+        prompt alpn "下载 ALPN（h2、h3 或 http/1.1）" h2 || exit 1
+        if [[ $alpn == http/1.1 ]]; then fp=unsafe; info "HTTP/1.1 下载使用原生 Go TLS 指纹 unsafe，证书校验仍启用；优先浏览器指纹可选择 h2。"; fi
+    fi
+    prompt fp "下载入口 TLS 指纹" "$fp" && prompt host "HTTP Host（回车跟随下载入口）" "" || exit 1
+    if [[ $security == reality ]]; then prompt_secret public "下载入口 REALITY 客户端公钥" && prompt_secret sid "下载入口 shortId（可空）" && prompt_secret verify "下载入口 ML-DSA-65 校验值（可空）" || exit 1; fi
     jq -n --arg address "$address" --argjson port "$port" --arg security "$security" --arg sni "$sni" --arg fp "$fp" --arg alpn "$alpn" --arg public "$public" --arg sid "$sid" --arg verify "$verify" --arg host "$host" --arg path "$path" '{address:$address,port:$port,network:"xhttp",security:$security,xhttpSettings:({path:$path,mode:"auto"}+(if $host!="" then {host:$host} else {} end))} + (if $security=="tls" then {tlsSettings:{serverName:$sni,fingerprint:$fp,alpn:[$alpn]}} else {realitySettings:({serverName:$sni,fingerprint:$fp,password:$public,shortId:$sid}+(if $verify!="" then {mldsa65Verify:$verify} else {} end))} end)' >"$work/download" || exit 1
     confirm "保存此入站的客户端上下行分离设置（不重启服务端）？" || exit 0
     set_xhttp_split_locked "$tag" "$work/download"
@@ -2681,7 +2690,7 @@ edit_wizard_locked(){ local selected=${1:-}; if [[ -z $selected ]]; then select_
 
 show_client() (
     umask 077
-    local tag=$1 server=${2:-} mode=${3:-full} user_index=${4:-} work public_key="" count index label name split=0
+    local tag=$1 server=${2:-} mode=${3:-full} user_index=${4:-} work public_key="" private_key pair count index label name split=0
     local -a indices=()
     require_core && valid_tag "$tag" || exit 1
     case "$mode" in full|json-only|link-only) ;; *) exit 1;; esac
@@ -2699,6 +2708,12 @@ show_client() (
         fi
     elif [[ -f $CLIENT_DIR/$tag.json ]] && jq -e 'has("xhttp_split")' "$CLIENT_DIR/$tag.json" >/dev/null 2>&1; then
         fail "XHTTP 上下行分离信息已过期，请重新设置或关闭后再导出。"; exit 1
+    fi
+    if [[ $(jq -r '.streamSettings.security // "none"' "$work/node") == reality ]]; then
+        private_key=$(jq -r '.streamSettings.realitySettings.privateKey // ""' "$work/node") || exit 1
+        [[ $private_key =~ ^[a-zA-Z0-9_-]{43}$ ]] || { fail "REALITY 私钥无效，无法派生客户端公钥；配置未修改。"; exit 1; }
+        pair=$(make_reality_pair "$private_key") || { fail "无法派生 REALITY 公钥，请检查已安装核心；配置及密钥未修改。"; exit 1; }
+        public_key=$(jq -r .public <<<"$pair") || exit 1
     fi
     [[ -n $server ]] || server=$(read_default_server) || exit 1
     if [[ -z $server ]]; then

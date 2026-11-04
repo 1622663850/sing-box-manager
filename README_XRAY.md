@@ -51,11 +51,15 @@ sudo xray
 
 VLESS、VMess、Trojan、Hy2 可按用户添加/删除独立认证并导出；SS2022 当前是单密码模板。用户操作保留其他用户和共享传输，至少保留一个用户。客户端导出保留 TLS 校验、SNI、REALITY、公钥、short ID、flow、WS/gRPC/XHTTP 等必要信息；未知或无法安全表达的导入配置拒绝向导导出，不静默去掉安全设置。
 
+面板 **v1.2.2** 导出 REALITY 节点时，从当前节点的原私钥只读派生客户端公钥，不再依赖旧连接元数据里的缓存公钥。旧元数据缺失或用户列表变化后仍可导出；此过程不生成新私钥、不更改认证或节点配置。XHTTP 上下行分离元数据的过期检查仍保留。
+
 ## XHTTP 上下行分离（面板 v1.2.0）
 
 主菜单 **21. XHTTP 上下行分离（客户端）**，或 `sudo xray xhttp-split [入站名称]`，可为已有的 VLESS XHTTP 入站填写独立下载入口。支持 TLS（SNI、指纹、h2/h3/http/1.1）与 REALITY（SNI、指纹、客户端公钥、shortId、可选 ML-DSA-65 校验值），也支持从完整 `downloadSettings` JSON 文件导入；菜单中可关闭此功能。默认关闭，原有节点导出保持原行为。
 
 下载入口必须已经通过 CDN、反向代理或其他入口转发至**同一个 XHTTP 入站、相同 path**。本功能不会创建第二台服务器、配置 CDN 或修改防火墙。设置只保存在该入站的客户端元数据中，不写入服务端 inbound，也不重启核心；备份/恢复、重命名及用户管理沿用现有元数据机制。上传 `auto` 在导出时明确改为 `stream-up`，`packet-up` 保持不变；服务端固定 `stream-one` 时拒绝启用分离。修改入站 path 或外部修改节点后，旧分离配置会被拒绝导出，须重新设置或关闭。
+
+HTTP/1.1 下载入口需使用 `fingerprint: "unsafe"`（原生 Go TLS 握手，证书验证仍开启）；向导选择 HTTP/1.1 后使用此默认值，文件导入时拒绝 HTTP/1.1 搭配浏览器指纹的组合，避免 ALPN 协商到 H2 却发送 H1。默认 h2 继续使用 `chrome`。
 
 保存后通过 **9.查看配置 → 3.客户端 JSON 和链接** 或 `xray client` 重新导出。单用户、多用户、批量 JSON/链接/Base64 导出均携带客户端 `xhttpSettings.extra.downloadSettings`；分享链接通过 URL 编码的 `extra` 字段携带，出站链接/JSON 导入也保留并校验该字段。不会导出下载侧服务端私钥、Seed 或允许不安全 TLS 的设置；暂不接受下载侧嵌套分离、`sockopt` 及本机证书文件配置。
 

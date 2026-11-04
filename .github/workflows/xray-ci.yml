@@ -53,3 +53,5 @@ jobs:
           for protocol in vless vmess trojan hysteria; do
             sudo python3 tests/smoke_xray_user_routes.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh" --protocol "$protocol"
           done
+      - name: REALITY multi-user exports without cached public key
+        run: sudo python3 tests/smoke_xray_reality_users.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
