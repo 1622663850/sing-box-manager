@@ -1738,7 +1738,7 @@ purge_install_locked() {
     # Keep recovery data for a shared kernel setting, never node credentials or all panel backups.
     if [[ -n $bbr_backup ]]; then
         bbr_archive=$(mktemp -d "${STATE_DIR%/*}/sing-box-manager-bbr-recovery-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
-        install -d -m 700 "$bbr_archive/backups/${bbr_backup##*/}" &&
+        install -d -m 700 "$bbr_archive/backups" "$bbr_archive/backups/${bbr_backup##*/}" &&
             install -m 600 "$BBR_RESTORE_FILE" "$bbr_archive/bbr-active" &&
             install -m 600 /dev/null "$bbr_archive/backups/${bbr_backup##*/}/runtime.json" &&
             jq '{tcp_congestion_control,default_qdisc,config_existed,config_mode}' "$bbr_backup/runtime.json" \
