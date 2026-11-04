@@ -44,3 +44,7 @@ jobs:
         run: python3 tests/smoke_xray.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
       - name: Real post-quantum encryption and authentication
         run: python3 tests/smoke_xray_pq.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
+      - name: Isolated systemd transactions and rollback
+        run: sudo python3 tests/smoke_xray_management.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
+      - name: Add forward and delete every inbound template
+        run: sudo python3 tests/smoke_xray_templates.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"

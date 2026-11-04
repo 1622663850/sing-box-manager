@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.1.4"
+XR_MANAGER_VERSION="1.1.5"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -538,6 +538,7 @@ commit_config() (
             result=1
         fi
         rm -f -- "$snapshot"
+        [[ $restored -eq 0 || -z $backup ]] || rm -f -- "$backup"
         exit "$result"
     }
     trap rollback_config EXIT
@@ -555,7 +556,7 @@ commit_config() (
     service_is_active && active=1
     if [[ -f "$CONFIG_FILE" ]]; then
         old_exists=1
-        backup=$(mktemp "$BACKUP_DIR/config-$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || exit 1
+        backup=$(mktemp "$STATE_DIR/config-rollback.XXXXXX") || exit 1
         install -m 600 "$CONFIG_FILE" "$backup" || exit 1
     fi
     transaction=1
@@ -568,7 +569,6 @@ commit_config() (
         fi
     fi
     transaction=0
-    [[ $old_exists -eq 0 ]] || info "旧配置已备份：$backup"
     if [[ $active -eq 1 ]]; then
         info "配置已保存，服务已重新启动。"
     elif [[ $activation == start ]]; then
@@ -633,7 +633,7 @@ validate_bundle() {
 
 apply_bundle() (
     umask 077
-    local file=$1 policy=${2:-preserve} activation=${3:-preserve} work backup="" tag server active=0 transaction=0 had_clients=0 start_requested=0
+    local file=$1 policy=${2:-preserve} activation=${3:-preserve} work tag server active=0 transaction=0 had_clients=0 start_requested=0
     case "$policy" in preserve|replace) ;; *) fail "未知的配置恢复方式。"; exit 1;; esac
     case "$activation" in preserve|start) ;; *) fail "未知的服务启动策略。"; exit 1;; esac
     require_core && safe_paths && validate_bundle "$file" || exit 1
@@ -657,7 +657,7 @@ apply_bundle() (
             if [[ -f $work/default-before ]]; then atomic_copy "$work/default-before" "$DEFAULT_SERVER_FILE" || restored=0
             else rm -f -- "$DEFAULT_SERVER_FILE" || restored=0; fi
             if [[ $restored -eq 1 ]]; then warn "操作未完成，已恢复原配置和连接信息。"
-            else warn "恢复未完全成功，请使用备份：$backup；临时文件：$work"; fi
+            else warn "恢复未完全成功，临时恢复文件保留在：$work"; fi
             result=1
         fi
         [[ $restored -eq 0 ]] || rm -rf -- "$work"
@@ -683,7 +683,6 @@ apply_bundle() (
     done < <(jq -r '.clients|keys[]' "$work/bundle.json")
     server=$(jq -r '.default_server // ""' "$work/bundle.json") || exit 1
     printf '%s\n' "$server" >"$work/default-server"
-    backup=$(create_backup) || exit 1
     cp -- "$CONFIG_FILE" "$work/config-before.json" || exit 1
     [[ ! -e $DEFAULT_SERVER_FILE ]] || cp -- "$DEFAULT_SERVER_FILE" "$work/default-before" || exit 1
     [[ ! -d $CLIENT_DIR ]] || had_clients=1
@@ -699,7 +698,7 @@ apply_bundle() (
         commit_config "$work/config.json" "$policy" "$activation" || exit 1
     fi
     transaction=0
-    info "配置及连接信息已保存。操作前备份：$backup"
+    info "配置及连接信息已保存。"
 )
 
 
@@ -879,9 +878,11 @@ prompt_secret() {
 
 
 confirm() {
-    local answer
+    local answer default=${2:-n} choices=y/N
     [[ -t 0 ]] || { fail "此操作需要交互确认，请在终端运行。"; return 1; }
-    read -r -p "$1 [y/N]: " answer || return 1
+    [[ $default != y ]] || choices=Y/n
+    read -r -p "$1 [$choices]: " answer || return 1
+    answer=${answer:-$default}
     [[ $answer == y || $answer == Y ]]
 }
 
@@ -931,7 +932,7 @@ update_panel_locked() (
     work=$(mktemp -d "$STATE_DIR/panel-update.XXXXXX") || exit 1
     # shellcheck disable=SC2317,SC2329 # Invoked by EXIT/INT/TERM traps below.
     rollback_panel_update() {
-        local result=$?
+        local result=$? restored=1
         trap - EXIT INT TERM
         if [[ $transaction -eq 1 ]]; then
             if ! cmp -s "$backup" "$WRAPPER"; then
@@ -940,11 +941,12 @@ update_panel_locked() (
             if cmp -s "$backup" "$WRAPPER"; then
                 warn "面板更新未完成，已保留或恢复旧版本。"
             else
-                warn "面板自动恢复失败，请使用备份恢复：$backup"
+                restored=0
+                warn "面板自动恢复失败，临时恢复文件保留在：$backup"
             fi
             result=1
         fi
-        rm -rf -- "$work"
+        [[ $restored -eq 0 ]] || rm -rf -- "$work"
         exit "$result"
     }
     trap rollback_panel_update EXIT
@@ -978,17 +980,17 @@ PY_PANEL_DOWNLOAD
         exit 0
     fi
     install -d -m 700 "$BACKUP_DIR" || exit 1
-    backup=$(mktemp "$BACKUP_DIR/panel-$(date +%Y%m%d-%H%M%S)-XXXXXX.sh") || exit 1
+    backup="$work/panel-before.sh"
     install -m 600 "$WRAPPER" "$backup" || exit 1
     if ! XR_ROOT_PREFIX="" timeout --kill-after=2s 15s bash "$work/panel.sh" help 9>&- </dev/null >"$work/help.log" 2>&1 ||
        ! grep -Fq 'Xray 中文终端管理面板' "$work/help.log"; then
-        fail "新面板入口检查失败，旧版本保留。备份：$backup"; exit 1
+        fail "新面板入口检查失败，旧版本保留。"; exit 1
     fi
     transaction=1
     atomic_copy "$work/panel.sh" "$WRAPPER" 755 || exit 1
     cmp -s "$work/panel.sh" "$WRAPPER" && bash -n "$WRAPPER" 9>&- || exit 1
     transaction=0
-    info "面板已更新至 v$version，旧面板备份：$backup"
+    info "面板已更新至 v$version。"
     info "现有配置、连接信息、核心和服务状态均保留。"
 )
 
@@ -1166,7 +1168,13 @@ configure_bbr_locked() (
             else warn "BBR 自动恢复未完全成功，请核对备份：$backup"; fi
             result=1
         fi
-        rm -rf -- "$work"
+        if [[ $restored -eq 1 ]]; then
+            if [[ -n $backup && $action == enable && $had_restore -eq 0 &&
+                  ( ! -f $BBR_RESTORE_FILE || $(cat "$BBR_RESTORE_FILE") != "${backup##*/}" ) ]]; then
+                rm -rf -- "$backup"
+            fi
+            rm -rf -- "$work"
+        fi
         exit "$result"
     }
     trap rollback_bbr EXIT
@@ -1243,7 +1251,11 @@ configure_bbr_locked() (
     if [[ $old_qdisc != "$target_qdisc" ]] && have modprobe; then modprobe "sch_$target_qdisc" >/dev/null 2>&1 || true; fi
     bbr_inputs_unchanged || { fail "设置已被其他操作修改，已取消写入。"; exit 1; }
     install -d -m 700 "$BACKUP_DIR" || exit 1
-    backup=$(mktemp -d "$BACKUP_DIR/bbr-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
+    if [[ $action == enable && $had_restore -eq 0 ]]; then
+        backup=$(mktemp -d "$BACKUP_DIR/bbr-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
+    else
+        backup="$work/rollback"; mkdir -m 700 "$backup" || exit 1
+    fi
     jq -n --arg cc "$old_cc" --arg qdisc "$old_qdisc" --arg mode "$old_mode" \
         --argjson existed "$([[ $had_file -eq 1 ]] && printf true || printf false)" \
         '{tcp_congestion_control:$cc,default_qdisc:$qdisc,config_existed:$existed,config_mode:$mode}' >"$backup/runtime.json" || exit 1
@@ -1273,9 +1285,9 @@ configure_bbr_locked() (
     fi
     transaction=0
     if [[ $action == disable ]]; then
-        info "已恢复开启前的设置：TCP=$target_cc，默认队列=$target_qdisc；操作前备份：$backup"
+        info "已恢复开启前的设置：TCP=$target_cc，默认队列=$target_qdisc"
     else
-        info "TCP BBR 已启用并写入持久化配置；操作前备份：$backup"
+        info "TCP BBR 已启用并写入持久化配置"
     fi
     info "如需已有入站监听采用新算法，可自行选择 5.重新启动；重启会短暂中断现有节点连接。"
 )
@@ -1494,7 +1506,7 @@ install_core_locked() (
     [[ $operation == update || ! -e $CORE_BIN ]] || { fail "核心已存在，请使用 update。"; exit 1; }
     [[ $operation != update || -x $CORE_BIN ]] || { fail "请先安装核心。"; exit 1; }
     work=$(mktemp -d "$STATE_DIR/core-stage.XXXXXX") || exit 1
-    backup=$(mktemp -d "$BACKUP_DIR/core-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
+    backup="$work/rollback"; mkdir -m 700 "$backup" || { rm -rf -- "$work"; exit 1; }
     # shellcheck disable=SC2317,SC2329 # EXIT/INT/TERM transaction cleanup.
     rollback_core(){
         local result=$? restored=1
@@ -1513,7 +1525,7 @@ install_core_locked() (
             warn "核心安装/更新失败，已尝试恢复；备份：$backup（恢复结果 $restored）。"
             result=1
         fi
-        rm -rf -- "$work"; exit "$result"
+        [[ $restored -eq 0 ]] || rm -rf -- "$work"; exit "$result"
     }
     trap rollback_core EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
     download_core "$requested" "$work" || exit 1
@@ -1536,7 +1548,7 @@ install_core_locked() (
     if [[ $active -eq 1 ]]; then restart_checked || exit 1
     elif [[ $operation == install ]]; then systemctl start "$SERVICE" && wait_healthy || exit 1; fi
     transaction=0
-    info "Xray 核心已安装/更新；旧文件备份：$backup；开机自启设置保留。"
+    info "Xray 核心已安装/更新；开机自启设置保留。"
 )
 install_core(){
     require_root && require_systemd || return
@@ -1549,16 +1561,39 @@ uninstall_core() {
     confirm "停止并卸载 Xray 核心/服务？配置和面板保留，其他服务不变。" || return 1
     with_lock uninstall_core_locked
 }
-uninstall_core_locked(){
-    local backup
+uninstall_core_locked() (
+    local work transaction=0 active=0 enabled=0
     safe_paths && is_managed || return
-    backup=$(mktemp -d "$BACKUP_DIR/uninstall-XXXXXX") || return
-    cp -- "$CORE_BIN" "$backup/xray" && cp -- "$UNIT_FILE" "$backup/unit" || return
+    work=$(mktemp -d "$STATE_DIR/uninstall.XXXXXX") || return
+    # shellcheck disable=SC2317,SC2329 # EXIT transaction cleanup.
+    rollback_uninstall() {
+        local result=$? restored=1
+        trap - EXIT INT TERM
+        if [[ $transaction -eq 1 ]]; then
+            atomic_copy "$work/xray" "$CORE_BIN" 755 || restored=0
+            atomic_copy "$work/unit" "$UNIT_FILE" 644 || restored=0
+            systemctl daemon-reload || restored=0
+            [[ $enabled -eq 0 ]] || systemctl enable "$SERVICE" || restored=0
+            [[ $active -eq 0 ]] || restart_checked || restored=0
+            result=1
+        fi
+        if [[ $restored -eq 1 ]]; then rm -rf -- "$work"
+        else warn "卸载恢复未完成，临时恢复文件保留在：$work"; fi
+        exit "$result"
+    }
+    trap rollback_uninstall EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    cp -- "$CORE_BIN" "$work/xray" && cp -- "$UNIT_FILE" "$work/unit" || return
+    service_is_active && active=1
+    systemctl is-enabled --quiet "$SERVICE" && enabled=1
+    transaction=1
     systemctl disable --now "$SERVICE" || return
     rm -f -- "$CORE_BIN" "$UNIT_FILE" || return
     systemctl daemon-reload || return
+    transaction=0
     info "Xray 核心已卸载，配置、证书、备份和菜单保留。"
-}
+)
 service_action(){
     local action=$1
     require_core || return
@@ -1650,7 +1685,7 @@ delete_inbound() (
     valid_tag "$tag" || exit 1
     config_jq -e --arg t "$tag" '[.inbounds[]?|select(.tag==$t)]|length==1' >/dev/null || { fail "节点不存在或名称重复。"; exit 1; }
     if config_jq -e --arg t "$tag" 'del(.inbounds[]|select(.tag==$t))|any(..|strings;.==$t)' >/dev/null; then fail "节点仍被路由引用，请先解除。"; exit 1; fi
-    confirm "删除节点 $tag？（成套备份）" || exit 1
+    confirm "删除节点 $tag？" || exit 1
     work=$(mktemp -d "$STATE_DIR/delete.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
     snapshot_bundle >"$work/before" || exit 1
     jq --arg t "$tag" '.config.inbounds|=map(select(.tag!=$t))|del(.clients[$t])' "$work/before" >"$work/after" || exit 1
@@ -1682,7 +1717,7 @@ bind_outbound_locked() (
           .clients[$i].outbound_route={format:"xray-manager-outbound-route-v1",rule:$rule,created_metadata:(if $r!=null then ($r.created_metadata // false) else $created end)}
         end end' "$work/before" >"$work/after" 2>/dev/null || { fail "节点缺失、重复或受管规则已外部修改。"; exit 1; }
     if [[ $(jq -Sc '{config,clients}' "$work/before") == "$(jq -Sc '{config,clients}' "$work/after")" ]]; then info "绑定未变化。"; exit 0; fi
-    confirm "保存入站出站绑定？（优先于已有路由，自动备份并按需重启）" || exit 1
+    confirm "保存入站出站绑定？（优先于已有路由，按需重启）" || exit 1
     snapshot_bundle >"$work/current" || exit 1
     [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/before")" ]] || { fail "配置或元数据已变化。"; exit 1; }
     apply_bundle "$work/after"
@@ -1710,20 +1745,19 @@ select_node(){
 }
 
 list_backups(){ local file; for file in "$BACKUP_DIR"/bundle-*.json; do [[ ! -f $file || -L $file ]] || printf '%s\n' "$file"; done; }
-restore_backup(){ validate_bundle "$1" && confirm "恢复完整 Xray 配置、连接信息和默认地址？（先备份）" && apply_bundle "$1" replace; }
+restore_backup(){ validate_bundle "$1" && confirm "恢复完整 Xray 配置、连接信息和默认地址？" && apply_bundle "$1" replace; }
 import_config(){ validate_config "$1" && commit_config "$1" replace; }
 format_config_locked() (
     umask 077
-    local work backup
+    local work
     require_core && safe_paths || exit 1
     work=$(mktemp -d "$STATE_DIR/format.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
     cp -- "$CONFIG_FILE" "$work/before" || exit 1
     format_config_source "$CONFIG_FILE" >"$work/after" || exit 1
     if cmp -s "$work/before" "$work/after"; then info "格式已规范。"; exit 0; fi
     validate_config "$work/after" || exit 1
-    backup=$(create_backup) || exit 1
     cmp -s "$work/before" "$CONFIG_FILE" && atomic_copy "$work/after" "$CONFIG_FILE" 600 || exit 1
-    info "已格式化（不重启），备份：$backup"
+    info "已格式化（不重启）。"
 )
 format_config(){ with_lock format_config_locked; }
 
@@ -1985,6 +2019,7 @@ else:
 stream = dict(value.get("streamSettings", {}))
 if stream:
     method = stream.get("method", stream.get("network", "raw"))
+    if method == "tcp": method = "raw"
     if method not in {"raw", "websocket", "grpc", "xhttp", "hysteria"}: raise SystemExit(1)
     if set(stream) - {"method", "network", "security", "tlsSettings", "realitySettings", "wsSettings", "grpcSettings", "xhttpSettings", "hysteriaSettings", "finalmask"}: raise SystemExit(1)
     stream["method"] = method
@@ -2028,6 +2063,7 @@ o = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 tag = quote(sys.argv[2] if len(sys.argv)>2 else o.get("tag","proxy"), safe="")
 protocol = o["protocol"]; settings = o.get("settings", {}); stream = o.get("streamSettings", {})
 method = stream.get("method", stream.get("network", "raw")); security = stream.get("security", "none")
+if method == "tcp": method = "raw"
 def address(value): return "[" + value + "]" if ":" in value and not value.startswith("[") else value
 if method not in {"raw", "websocket", "grpc", "xhttp", "hysteria"} or security not in {"none", "tls", "reality"}:
     raise SystemExit(1)
@@ -2226,7 +2262,7 @@ node_wizard_locked() (
         if [[ $protocol == import-* ]]; then
             prompt file "服务器 JSON 文件绝对路径" || exit 1
             if [[ $protocol == import-node ]]; then confirm "追加单个入站并按需启动/重启？" && add_inbound_file "$file"
-            else confirm "替换完整 Xray 配置？（自动备份，连接元数据可能需重新设置）" && import_config "$file"; fi
+            else confirm "替换完整 Xray 配置？（连接元数据可能需重新设置）" && import_config "$file"; fi
             exit $?
         fi
         tag="$protocol-$(date +%H%M%S)"
@@ -2312,12 +2348,12 @@ node_wizard_locked() (
         if [[ $protocol == *reality* && -z $mldsa_seed ]]; then
             jq 'del(.streamSettings.realitySettings.mldsa65Seed)' "$work/updated" >"$work/no-mldsa" && mv "$work/no-mldsa" "$work/updated" || exit 1
         fi
-        confirm "保存修改？（其他用户保留，配置和连接信息成套备份）" || exit 0
+        confirm "保存修改？（其他用户保留）" || exit 0
         snapshot_bundle >"$work/current" || exit 1
         [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/snapshot")" ]] || { fail "编辑期间配置或连接信息已变化。"; exit 1; }
         replace_inbound_file "$old" "$work/updated" "$server" "$public_key" "$work/original" || exit 1
     else
-        confirm "添加节点并按需启动/重启 Xray？（自动备份）" || exit 0
+        confirm "添加节点并按需启动/重启 Xray？" y || exit 0
         add_managed_inbound "$work/generated" "$server" "$public_key" || exit 1
     fi
     info "配置已保存，请按实际传输放行云安全组和系统防火墙；面板不改防火墙。"
@@ -2423,7 +2459,7 @@ change_inbound_user() (
         jq --argjson i "$((index-1))" '.settings.users=(.settings.users // .settings.clients)|del(.settings.clients)|del(.settings.users[$i])' "$work/node" >"$work/new" || exit 1
     fi
     validate_inbound_users "$work/new" || { fail "认证重复或用户数据无效。"; exit 1; }
-    confirm "保存用户变更（其他用户保留，自动备份）？" || exit 0
+    confirm "保存用户变更（其他用户保留）？" || exit 0
     snapshot_bundle >"$work/current" || exit 1
     [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/before")" ]] || { fail "配置已变化。"; exit 1; }
     jq --arg t "$selected" --slurpfile n "$work/new" '.config.inbounds|=map(if .tag==$t then $n[0] else . end)|.clients[$t]=((.clients[$t] // {})+{inbound:$n[0]})' "$work/before" >"$work/after" || exit 1
@@ -2481,7 +2517,7 @@ PY_IPV6_EGRESS
 
 configure_outbound_preference_locked() (
     umask 077
-    local strategy=$1 work backup
+    local strategy=$1 work
     case "$strategy" in prefer_ipv6|prefer_ipv4) ;; *) return 1;; esac
     require_core && safe_paths || exit 1
     work=$(mktemp -d "$STATE_DIR/ip-preference.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
@@ -2495,12 +2531,11 @@ configure_outbound_preference_locked() (
     [[ $(json_query "$work/before" -Sc .) != "$(jq -Sc . "$work/after")" ]] || { info "优先级已是当前设置。"; exit 0; }
     validate_config "$work/after" || exit 1
     info "只调整 freedom 出站的地址解析顺序，保留代理出站和独立 DNS 服务器；不保证 IPv6 连接失败后的网络重连回退。"
-    confirm "保存出站 IP 优先级？（自动备份并按需重启）" || exit 1
+    confirm "保存出站 IP 优先级？（按需重启）" || exit 1
     [[ $strategy != prefer_ipv6 ]] || check_ipv6_egress || exit 1
     cmp -s "$work/before" "$CONFIG_FILE" || { fail "配置已变化，请重试。"; exit 1; }
-    backup=$(create_backup) || exit 1
     commit_config "$work/after" || exit 1
-    info "已保存，备份：$backup"
+    info "已保存。"
 )
 show_outbound_preference(){
     config_jq -r '["直连出站","解析策略"],(.outbounds[]?|select(.protocol=="freedom")|[.tag,(.streamSettings.sockopt.domainStrategy // .settings.domainStrategy // "默认")])|@tsv'
@@ -2573,7 +2608,7 @@ management_menu(){
             3) list_backups; prompt file "成套备份文件绝对路径" && with_lock restore_backup "$file";;
             4) prompt format "导出格式 links/base64/json" links && prompt file "尚不存在的绝对输出路径" && with_lock exports "$format" "$file";;
             5) diagnose;; 6) prompt file "单个 inbound JSON 文件路径" && confirm "追加配置并按需启动？" && with_lock add_inbound_file "$file";;
-            7) prompt file "完整 Xray JSON 文件路径" && confirm "替换完整配置（成套备份）？" && with_lock import_config "$file";;
+            7) prompt file "完整 Xray JSON 文件路径" && confirm "替换完整配置？" && with_lock import_config "$file";;
             *) warn "无效选项。";;
         esac || true
         prompt choice "按回车返回维护菜单" "" || return
@@ -3155,7 +3190,7 @@ normalize_outbound_import() (
 )
 add_outbounds_file_locked() (
     umask 077
-    local file=$1 work tag backup
+    local file=$1 work tag
     require_core && safe_paths || exit 1
     work=$(mktemp -d "$STATE_DIR/out-add.XXXXXX") || exit 1;trap 'rm -rf -- "$work"' EXIT
     cp -- "$CONFIG_FILE" "$work/before" || exit 1
@@ -3166,22 +3201,22 @@ add_outbounds_file_locked() (
     json_query "$work/before" --slurpfile n "$work/nodes" '.outbounds=((.outbounds // [])+$n[0])' >"$work/after" || exit 1
     validate_config "$work/after" || exit 1
     jq -r '["出站名称","协议"],(.[]|[.tag,.protocol])|@tsv' "$work/nodes"
-    confirm "添加以上出站（不自动绑定入站，成套备份）？" || exit 0
+    confirm "添加以上出站（不自动绑定入站）？" || exit 0
     cmp -s "$work/before" "$CONFIG_FILE" || { fail "配置已变化。";exit 1; }
-    backup=$(create_backup) || exit 1;commit_config "$work/after" || exit 1;info "出站已保存，备份：$backup"
+    commit_config "$work/after" || exit 1;info "出站已保存。"
 )
 delete_outbound_locked() (
     umask 077
-    local selected=$1 work backup
+    local selected=$1 work
     require_core && safe_paths && valid_tag "$selected" || exit 1
     work=$(mktemp -d "$STATE_DIR/out-delete.XXXXXX") || exit 1;trap 'rm -rf -- "$work"' EXIT
     cp -- "$CONFIG_FILE" "$work/before" || exit 1
     json_query "$work/before" -e --arg t "$selected" '(.outbounds|length)>1 and ([.outbounds[]|select(.tag==$t)]|length)==1' >/dev/null || { fail "出站不存在或为最后一个出站。";exit 1; }
     if json_query "$work/before" -e --arg t "$selected" 'del(.outbounds[]|select(.tag==$t))|any(..|strings;.==$t)' >/dev/null;then fail "出站被路由、proxySettings 等引用，请先解除。";exit 1;fi
     json_query "$work/before" --arg t "$selected" '.outbounds|=map(select(.tag!=$t))' >"$work/after" || exit 1
-    validate_config "$work/after" && confirm "删除出站 $selected（成套备份）？" || exit 1
+    validate_config "$work/after" && confirm "删除出站 $selected？" || exit 1
     cmp -s "$work/before" "$CONFIG_FILE" || exit 1
-    backup=$(create_backup) || exit 1;commit_config "$work/after" || exit 1;info "已删除，备份：$backup"
+    commit_config "$work/after" || exit 1;info "已删除。"
 )
 list_outbounds(){ config_jq -r '["名称","协议","远端地址","远端端口"],(.outbounds[]?|[.tag,.protocol,(.settings.address // .settings.vnext[0].address // .settings.servers[0].address // "-"),(.settings.port // .settings.vnext[0].port // .settings.servers[0].port // "-")])|map(if type=="string" then gsub("[[:cntrl:]]";"?") else . end)|@tsv'; }
 import_outbound_wizard_locked() (

@@ -178,6 +178,24 @@ class XrayProtocolsTest(fixture.XrayFixture):
                 self.assertNotIn(credential, result.stderr)
                 self.assertNotIn("secret-password", result.stderr)
 
+    def test_native_tcp_alias_exports_with_canonical_raw_transport(self) -> None:
+        for field in ("method", "network"):
+            with self.subTest(field=field):
+                inbound = self.generate("vless-tcp")
+                inbound["streamSettings"].pop("method")
+                inbound["streamSettings"][field] = "tcp"
+                source = self.write("tcp-alias.json", inbound)
+                outbound = json.loads(self.shell(
+                    'generate_client "$@"', str(source), "example.com", PUBLIC, "1", check=True,
+                ).stdout)
+                self.assertEqual(outbound["streamSettings"]["method"], "raw")
+                self.assertNotIn("network", outbound["streamSettings"])
+                # Existing native outbound JSON can use the same Xray alias.
+                outbound["streamSettings"]["method"] = "tcp"
+                path = self.write("tcp-outbound-alias.json", outbound)
+                link = self.shell('client_link "$@"', str(path), "tcp-alias", check=True).stdout.strip()
+                self.assertEqual(parse_qs(urlsplit(link).query)["type"], ["tcp"])
+
 
 if __name__ == "__main__":
     unittest.main()
