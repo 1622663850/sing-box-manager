@@ -619,6 +619,21 @@ class XrayPostQuantumTest(fixture.XrayFixture):
         self.assertIn(["mlkem768"], calls)
         self.assertIn(["mldsa65"], calls)
 
+    def test_saved_add_and_edit_stay_successful_when_client_display_fails(self) -> None:
+        driver = 'show_client() { return 1; }\n' + WIZARD_DRIVER
+        added = self.shell(driver, "off")
+        self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+        self.assertIn("不要重复添加", added.stderr)
+        nodes = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"]
+        self.assertEqual(len(nodes), 1)
+        tag = nodes[0]["tag"]
+        metadata = self.clients_dir / (tag + ".json")
+        self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["inbound"], nodes[0])
+        edited = self.shell(driver, "off", tag)
+        self.assertEqual(edited.returncode, 0, edited.stdout + edited.stderr)
+        self.assertIn("不要重复添加", edited.stderr)
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8"))["inbounds"], nodes)
+
     def test_wizard_independent_only_mlkem_and_only_mldsa_switches(self) -> None:
         mlkem = self.wizard("only-mlkem")
         self.assertEqual(mlkem.returncode, 0, mlkem.stdout + mlkem.stderr)

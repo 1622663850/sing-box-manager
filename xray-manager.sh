@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.1.3"
+XR_MANAGER_VERSION="1.1.4"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2321,7 +2321,10 @@ node_wizard_locked() (
         add_managed_inbound "$work/generated" "$server" "$public_key" || exit 1
     fi
     info "配置已保存，请按实际传输放行云安全组和系统防火墙；面板不改防火墙。"
-    [[ -z $server ]] || show_client "$tag" "$server" full all
+    if [[ -n $server ]] && ! show_client "$tag" "$server" full all; then
+        warn "配置已保存，但客户端信息展示未完成；不要重复添加，请在 9.查看配置中重新导出。"
+    fi
+    exit 0
 )
 add_wizard_locked(){ node_wizard_locked; }
 edit_wizard_locked(){ local selected=${1:-}; if [[ -z $selected ]]; then select_inbound selected "修改" || return; [[ -n $selected ]] || return 0; fi; node_wizard_locked "$selected"; }
