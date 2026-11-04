@@ -4,10 +4,16 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 from pathlib import Path
+import pty
+import select
+import signal
 import shutil
 import subprocess
+import struct
+import termios
 import time
 import unittest
 
@@ -293,6 +299,70 @@ uninstall_menu
                 result = self.shell(body, str(log), choice)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(log.read_text(encoding="utf-8") if log.exists() else "", expected)
+
+    def test_real_menu_purge_exits_after_delete_without_return_prompt(self) -> None:
+        source = self._install_fixture()
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 240, 0, 0))
+        process = subprocess.Popen(
+            ["bash", "-c", 'source "$1"; menu', "uninstall-menu", str(fixture.SCRIPT)],
+            env=self.env,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            start_new_session=True,
+        )
+        os.close(slave)
+        transcript = bytearray()
+
+        def wait_for(needle: str) -> None:
+            target = needle.encode("utf-8")
+            deadline = time.monotonic() + 8
+            while target not in transcript:
+                self.assertLess(time.monotonic(), deadline, f"prompt not shown: {needle}")
+                if process.poll() is not None:
+                    self.fail(f"menu exited before prompt: {needle}")
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        chunk = b""
+                    self.assertTrue(chunk, f"PTY closed before prompt: {needle}")
+                    transcript.extend(chunk)
+
+        try:
+            wait_for("请输入选项 [0-20]")
+            os.write(master, "2\n".encode("utf-8"))
+            wait_for("请选择卸载方式")
+            os.write(master, "2\n".encode("utf-8"))
+            wait_for("额外删除的原下载脚本绝对路径")
+            os.write(master, "\n".encode("utf-8"))
+            wait_for("输入 DELETE 确认")
+            os.write(master, "DELETE\n".encode("utf-8"))
+            self.assertEqual(process.wait(timeout=8), 0)
+            # Drain the final fixed messages without sending a return key.
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and select.select([master], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                transcript.extend(chunk)
+            self.assertEqual(transcript.decode("utf-8", errors="replace").count("请输入选项"), 1)
+            for path in self._fixed_paths():
+                self.assertFalse(path.exists() or path.is_symlink(), f"owned path remains: {path}")
+            self.assertTrue(source.exists(), "blank optional source path should be retained")
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=3)
+            os.close(master)
 
     def test_cli_uninstall_purge_requires_exact_option(self) -> None:
         marker = self.root / "cli-route"
