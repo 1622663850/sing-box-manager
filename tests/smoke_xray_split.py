@@ -742,7 +742,9 @@ def runtime_case(
     inbound["listen"] = LOOPBACK
     inbound["streamSettings"]["xhttpSettings"]["mode"] = upload_mode
     if security == "tls":
-        inbound["streamSettings"]["tlsSettings"]["alpn"] = ["h2", "h3", "http/1.1"]
+        inbound["streamSettings"]["tlsSettings"]["alpn"] = (
+            ["h3"] if download_alpn == "h3" else ["h2", "h3", "http/1.1"]
+        )
     if security == "reality":
         reality = inbound["streamSettings"]["realitySettings"]
         reality["target"] = f"{LOOPBACK}:{camouflage_port}"
@@ -758,13 +760,17 @@ def runtime_case(
             old_metadata.unlink()
         write_json(server_file, server_config(inbound, (http_port,)))
         check_xray(core, server_file, work)
-        upload_relay = CountingRelay(UPLOAD_HOST, server_port, server_port)
+        if download_alpn == "h3":
+            upload_relay = CountingUdpRelay(UPLOAD_HOST, server_port, server_port)
+        else:
+            upload_relay = CountingRelay(UPLOAD_HOST, server_port, server_port)
         if download_alpn == "h3":
             download_relay = CountingUdpRelay(DOWNLOAD_HOST, download_port, server_port)
         else:
             download_relay = CountingRelay(DOWNLOAD_HOST, download_port, server_port)
         target_context = tls_target(certificate, private_key, camouflage_port) if security == "reality" else _null_context()
-        with target_context, running_xray(core, server_file, work, server_port, f"{label}-server"):
+        server_probe = None if download_alpn == "h3" else server_port
+        with target_context, running_xray(core, server_file, work, server_probe, f"{label}-server"):
             with upload_relay, download_relay:
                 metadata_download = reality_download(download_port, path, public, REALITY_SHORT_ID) if security == "reality" else tls_download(download_port, path, download_alpn)
                 clients_root = root / "var/lib/xray-manager/clients"
@@ -824,7 +830,8 @@ def runtime_case(
                 no_split = manager_call(manager, env, "show_client", inbound["tag"], UPLOAD_HOST, "json-only", "1")
                 if no_split.returncode or "downloadSettings" in no_split.stdout:
                     raise RuntimeError("closing split did not restore normal export")
-    print(f"PASS xhttp split {label}: JSON/URI export and two loopback relays", flush=True)
+    transport_label = "dual-UDP" if download_alpn == "h3" else "loopback relays"
+    print(f"PASS xhttp split {label}: JSON/URI export and {transport_label}", flush=True)
 
 
 @contextmanager
@@ -845,7 +852,7 @@ def run(core: Path, manager: Path) -> None:
         runtime_case(core, manager, env, root, work, "tls", "tls", False, cert, key)
         runtime_case(core, manager, env, root, work, "tls-packet-up", "tls", False, cert, key, upload_mode="packet-up")
         runtime_case(core, manager, env, root, work, "tls-http11", "tls", False, cert, key, download_alpn="http/1.1")
-        runtime_case(core, manager, env, root, work, "tls-h3", "tls", False, cert, key, download_alpn="h3")
+        runtime_case(core, manager, env, root, work, "tls-h3", "tls", False, cert, key, upload_mode="packet-up", download_alpn="h3")
         runtime_case(core, manager, env, root, work, "reality", "reality", False, cert, key)
         runtime_case(core, manager, env, root, work, "reality-vision", "reality", True, cert, key)
 
