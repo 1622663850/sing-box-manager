@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.25.0"
+SB_MANAGER_VERSION="1.26.0"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -2102,8 +2102,18 @@ replace_inbound_file() (
     else printf '{}\n' >"$work/metadata-before.json"; fi
     jq --arg server "$server" --arg key "$public_key" --slurpfile node "$file" --arg record "$quic_record" \
         '.server=$server | .public_key=$key | .inbound=$node[0]
+         | if has("user_outbound_routes") then .user_outbound_routes.inbound=$node[0] else . end
          | if $record=="" then . elif $record=="null" then del(.quic_bbr_restore)
            else .quic_bbr_restore=($record|fromjson) end' "$work/metadata-before.json" >"$work/metadata.json" || exit 1
+    if jq -e 'has("user_outbound_routes")' "$work/metadata-before.json" >/dev/null; then
+        snapshot_bundle >"$work/user-routes-before.json" || exit 1
+        user_outbound_bundle validate "$work/user-routes-before.json" "$old_tag" >/dev/null || exit 1
+        jq --slurpfile config "$work/candidate.json" --slurpfile metadata "$work/metadata.json" --arg t "$tag" \
+            '.config=$config[0] | .clients[$t]=$metadata[0]' "$work/user-routes-before.json" >"$work/user-routes-after.json" || exit 1
+        user_outbound_bundle validate "$work/user-routes-after.json" "$tag" >/dev/null || {
+            fail "不能删除或更名已绑定出站的用户；请先解除其绑定。"; exit 1;
+        }
+    fi
     [[ $(json_query "$snapshot" -Sc .) == "$(jq -Sc . "$work/candidate.json")" ]] || changed=1
     if [[ $changed -eq 0 && $old_metadata_exists -eq 1 &&
           $(jq -Sc . "$work/metadata-before.json") == "$(jq -Sc . "$work/metadata.json")" ]]; then
@@ -2670,6 +2680,10 @@ change_inbound_user() (
         [[ $count -gt 1 ]] || { fail "不能删除最后一个用户；如需移除此入站，请使用删除配置。"; exit 1; }
         select_inbound_user selected_user_index "$work/original.json" || exit 1
         [[ -n $selected_user_index ]] || exit 0
+        if [[ -f $expected_metadata ]] && jq -e --argjson i "$((selected_user_index - 1))" --slurpfile metadata "$expected_metadata" \
+            '.users[$i].name as $n | any($metadata[0].user_outbound_routes.bindings[]?; .name==$n)' "$work/original.json" >/dev/null; then
+            fail "此用户已绑定出站，请先解除单用户绑定再删除。"; exit 1
+        fi
         jq --argjson i "$((selected_user_index - 1))" 'del(.users[$i])' "$work/original.json" >"$work/updated.json" || exit 1
         confirm "确认删除 $tag 的第 $selected_user_index 个用户？其凭据将失效，其他用户保留；运行中的服务会短暂重启。" || { info "已取消。"; exit 0; }
     fi
@@ -4201,6 +4215,209 @@ add_outbounds_file_locked() (
     info "出站已添加，成套备份：$backup"
 )
 
+user_outbound_bundle() {
+    python3 - "$@" <<'PY_USER_OUTBOUND'
+import json, re, secrets, sys
+from pathlib import Path
+
+class BindingError(Exception): pass
+def require(condition, message):
+    if not condition: raise BindingError(message)
+def name_ok(value):
+    return isinstance(value, str) and bool(value) and not any(ord(c) < 32 or ord(c) == 127 for c in value)
+def auth_names(obj):
+    result = set()
+    if isinstance(obj, dict):
+        value = obj.get('auth_user')
+        if isinstance(value, str): result.add(value)
+        elif isinstance(value, list): result.update(n for n in value if isinstance(n, str))
+        for value in obj.values(): result.update(auth_names(value))
+    elif isinstance(obj, list):
+        for value in obj: result.update(auth_names(value))
+    return result
+
+try:
+    mode, file, tag = sys.argv[1:4]
+    bundle = json.loads(Path(file).read_text(encoding='utf-8'))
+    config, clients = bundle['config'], bundle['clients']
+    found = [n for n in config.get('inbounds', []) if n.get('tag') == tag]
+    require(len(found) == 1, '入站不存在或名称重复。')
+    node = found[0]
+    meta = clients.get(tag, {})
+    require(isinstance(meta, dict), '节点连接信息无效。')
+    route = config.get('route') or {}
+    require(isinstance(route, dict), '现有路由无效。')
+    rules = route.get('rules')
+    if rules is None: rules = []
+    require(isinstance(rules, list), '现有规则列表无效。')
+    collection = meta.get('user_outbound_routes')
+    records = []
+    if 'user_outbound_routes' in meta:
+        require(isinstance(collection, dict) and set(collection) == {'format', 'created_metadata', 'bindings', 'inbound'} and
+                collection.get('format') == 'sing-box-manager-user-outbound-route-v1' and
+                isinstance(collection.get('created_metadata'), bool) and
+                isinstance(collection.get('bindings'), list) and bool(collection['bindings']), '用户绑定记录格式无效。')
+        require('inbound' not in meta or meta['inbound'] == node, '节点与用户绑定记录不一致，请先核对外部修改。')
+        require(collection.get('inbound') == node, '入站用户与绑定快照不一致，请先核对外部修改。')
+        records = collection['bindings']
+    users = node.get('users')
+    if mode == 'bind' or records:
+        require(node.get('type') in {'vless', 'vmess', 'hysteria2', 'tuic', 'anytls'} and
+                isinstance(users, list) and bool(users) and all(isinstance(u, dict) for u in users), '此模板不支持按认证用户绑定出站。')
+        names = [u.get('name') for u in users if u.get('name')]
+        require(all(name_ok(n) for n in names) and len(names) == len(set(names)), '用户名重复或无效，不能区分用户。')
+        key = 'uuid' if node['type'] in {'vless', 'vmess', 'tuic'} else 'password'
+        credentials = [u.get(key) for u in users]
+        require(all(isinstance(c, str) and c for c in credentials), '用户认证无效。')
+        if key == 'uuid': credentials = [c.lower() for c in credentials]
+        require(len(set(credentials)) == len(credentials), '认证凭据重复，不能区分用户。')
+    seen = set()
+    for record in records:
+        require(isinstance(record, dict) and set(record) == {'name', 'name_before_present', 'name_before', 'rule'}, '用户绑定记录无效。')
+        name, rule = record['name'], record['rule']
+        require(name_ok(name) and name not in seen and sum(u.get('name') == name for u in users) == 1, '绑定用户缺失或名称重复。')
+        seen.add(name)
+        require(isinstance(record['name_before_present'], bool) and record['name_before'] in (None, '', name) and
+                (record['name_before_present'] or record['name_before'] is None), '用户原名称恢复记录无效。')
+        require((record['name_before_present'] and record['name_before'] == name) or
+                (not record['name_before'] and re.fullmatch(r'user-route-[0-9a-f]{16}', name)), '原用户名与自动名称恢复记录不一致。')
+        require(isinstance(rule, dict) and name_ok(rule.get('outbound')) and
+                rule == {'inbound': [tag], 'auth_user': [name], 'action': 'route', 'outbound': rule.get('outbound')} and
+                sum(r == rule for r in rules) == 1, '用户绑定规则已被外部修改、删除或重复，未保存。')
+    bulk = meta.get('outbound_route')
+    if bulk is not None and (records or mode == 'bind'):
+        require(isinstance(bulk, dict) and bulk.get('format') == 'sing-box-manager-outbound-route-v1' and
+                isinstance(bulk.get('rule'), dict) and name_ok(bulk['rule'].get('outbound')) and
+                bulk['rule'] == {'inbound': [tag], 'action': 'route', 'outbound': bulk['rule']['outbound']} and
+                sum(r == bulk['rule'] for r in rules) == 1, '入站默认绑定记录已被外部修改，未保存。')
+        require(all(rules.index(e['rule']) < rules.index(bulk['rule']) for e in records), '用户规则被入站默认规则遮蔽，请先核对外部调整的优先级。')
+    if mode == 'validate':
+        print(json.dumps({'rules': [r for r in rules if any(r == e['rule'] for e in records)],
+                          'names': [e['name'] for e in records]}, ensure_ascii=False))
+        raise SystemExit(0)
+    require(mode == 'bind' and len(sys.argv) == 6, '用户绑定参数无效。')
+    index, target = sys.argv[4:6]
+    require(re.fullmatch(r'[1-9][0-9]{0,5}', index) is not None and int(index) <= len(users), '用户序号无效。')
+    user = users[int(index) - 1]
+    record = next((r for r in records if r['name'] == user.get('name')), None)
+    if target == '-' and record is None:
+        print(json.dumps(bundle, ensure_ascii=False)); raise SystemExit(0)
+    if target != '-':
+        require(sum(o.get('tag') == target for o in config.get('outbounds', [])) == 1, '出站不存在或名称重复。')
+        require('inbound' not in meta or meta['inbound'] == node, '节点与连接信息不一致，请先核对。')
+        if record is not None and record['rule']['outbound'] == target:
+            print(json.dumps(bundle, ensure_ascii=False)); raise SystemExit(0)
+    if record is not None:
+        rules = [r for r in rules if r != record['rule']]
+    if target == '-':
+        if not record['name_before']:
+            require(record['name'] not in (auth_names(rules) | auth_names(config.get('dns'))), '自动用户名已被其他规则引用，请先处理该引用再解除绑定。')
+        if record['name_before_present']: user['name'] = record['name_before']
+        else: user.pop('name', None)
+        records = [r for r in records if r is not record]
+    else:
+        if record is None:
+            before_present, before_name = 'name' in user, user.get('name')
+            if not before_name:
+                occupied = set(names) | auth_names(rules) | auth_names(config.get('dns'))
+                while True:
+                    generated = 'user-route-' + secrets.token_hex(8)
+                    if generated not in occupied: break
+                user['name'] = generated
+            record = {'name': user['name'], 'name_before_present': before_present, 'name_before': before_name, 'rule': {}}
+            if collection is None:
+                created = tag not in clients or (set(meta) == {'outbound_route'} and isinstance(bulk, dict) and bulk.get('created_metadata') is True)
+                collection = {'format': 'sing-box-manager-user-outbound-route-v1', 'created_metadata': created, 'bindings': records, 'inbound': node}
+            records.append(record)
+        rule = {'inbound': [tag], 'auth_user': [user['name']], 'action': 'route', 'outbound': target}
+        require(rule not in rules, '相同用户路由已存在且未登记为本面板所有，不会接管。')
+        record['rule'] = rule
+        rules = [rule] + rules
+    config.setdefault('route', {})
+    if config['route'] is None: config['route'] = {}
+    config['route']['rules'] = rules
+    if 'inbound' in meta: meta['inbound'] = node
+    if records:
+        collection['bindings'] = records
+        collection['inbound'] = node
+        meta['user_outbound_routes'] = collection
+        clients[tag] = meta
+    else:
+        meta.pop('user_outbound_routes', None)
+        if collection['created_metadata'] and not meta: clients.pop(tag, None)
+        else:
+            if collection['created_metadata'] and set(meta) == {'outbound_route'}: meta['outbound_route']['created_metadata'] = True
+            clients[tag] = meta
+    print(json.dumps(bundle, ensure_ascii=False))
+except BindingError as error:
+    print('[错误] ' + str(error), file=sys.stderr); raise SystemExit(1)
+except (OSError, ValueError, TypeError, KeyError, IndexError):
+    print('[错误] 用户绑定或现有配置格式无效，未保存。', file=sys.stderr); raise SystemExit(1)
+PY_USER_OUTBOUND
+}
+
+# shellcheck disable=SC2016 # jq filters contain literal variables.
+bind_user_outbound_locked() (
+    umask 077
+    local bind_inbound=${1:-} user_index=${2:-} bind_target=${3:-} expected=${4:-} work
+    [[ $# -ge 3 && $# -le 4 ]] || { fail "用法：sing-box outbound-user-bind 入站名称 用户序号 出站名称|-"; exit 1; }
+    require_core && safe_paths || exit 1
+    if ! valid_tag "$bind_inbound" || { [[ $bind_target != - ]] && ! valid_tag "$bind_target"; }; then fail "入站或出站名称无效。";exit 1;fi
+    check_shadowtls_component "$bind_inbound" || exit 1
+    work=$(mktemp -d "$STATE_DIR/user-outbound.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before.json" || exit 1
+    if [[ -n $expected ]]; then
+        [[ $(jq -Sc . "$expected") == "$(jq -Sc . "$work/before.json")" ]] || { fail "选择期间配置或用户已变化，请重新选择。"; exit 1; }
+    fi
+    jq -e --arg i "$bind_inbound" '[.config.inbounds[]?|select(.tag==$i)]|if length==1 then .[0] else error("inbound") end' "$work/before.json" >"$work/node.json" || exit 1
+    validate_inbound_users "$work/node.json" || exit 1
+    user_outbound_bundle bind "$work/before.json" "$bind_inbound" "$user_index" "$bind_target" >"$work/after.json" || exit 1
+    if [[ $(jq -Sc '{config,clients}' "$work/before.json") == "$(jq -Sc '{config,clients}' "$work/after.json")" ]]; then info "此用户的绑定未变化，无需保存或重启。"; exit 0; fi
+    jq .config "$work/after.json" >"$work/config.json" || exit 1
+    validate_config "$work/config.json" >"$work/check.log" 2>&1 || { fail "单用户绑定未通过核心校验，未保存。";exit 1; }
+    if [[ $bind_target == - ]]; then info "解除 $bind_inbound 第 $user_index 个用户的绑定，恢复其余路由及入站默认出站。"
+    else info "仅 $bind_inbound 第 $user_index 个用户优先使用出站 $bind_target；其他用户保持原路由。"; fi
+    confirm "保存单用户出站绑定？（自动备份，运行中的服务短暂重启）" || exit 1
+    snapshot_bundle >"$work/current.json" || exit 1
+    [[ $(jq -Sc . "$work/current.json") == "$(jq -Sc . "$work/before.json")" ]] || { fail "配置、用户或连接信息已变化，请重新选择。"; exit 1; }
+    apply_bundle "$work/after.json" >"$work/save.log" 2>&1 || { fail "单用户绑定保存失败，已执行配置和连接信息回滚。"; exit 1; }
+    info "单用户出站绑定已保存。"
+)
+
+# shellcheck disable=SC2016 # jq filters contain literal variables.
+user_outbound_wizard_locked() (
+    umask 077
+    local action=${1:-bind} route_inbound="" route_user="" route_target=- work
+    [[ $action == bind || $action == unbind ]] || exit 1
+    require_core && safe_paths || exit 1
+    select_inbound route_inbound "设置单用户出站" || exit 1
+    [[ -n $route_inbound ]] || exit 0
+    work=$(mktemp -d "$STATE_DIR/user-outbound-wizard.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before.json" || exit 1
+    jq -e --arg i "$route_inbound" '[.config.inbounds[]?|select(.tag==$i)]|if length==1 then .[0] else error("inbound") end' "$work/before.json" >"$work/node.json" || exit 1
+    select_inbound_user route_user "$work/node.json" || exit 1
+    [[ -n $route_user ]] || exit 0
+    if [[ $action == bind ]]; then select_outbound route_target || exit 1; [[ -n $route_target ]] || exit 0; fi
+    bind_user_outbound_locked "$route_inbound" "$route_user" "$route_target" "$work/before.json"
+)
+
+# shellcheck disable=SC2016 # jq filters contain literal variables.
+list_user_outbound_bindings() (
+    umask 077
+    local work tag
+    require_core && safe_paths || exit 1
+    work=$(mktemp -d "$STATE_DIR/user-outbound-list.XXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/bundle.json" || exit 1
+    printf '入站\t用户\t出站\n'
+    while IFS= read -r tag; do
+        user_outbound_bundle validate "$work/bundle.json" "$tag" >"$work/bindings.json" || exit 1
+        jq -r --arg i "$tag" '.rules[]|[$i,.auth_user[0],.outbound]|map(gsub("[[:cntrl:]]";"?"))|@tsv' "$work/bindings.json" || exit 1
+    done < <(jq -r '.config.inbounds[]?.tag' "$work/bundle.json")
+)
+
 # shellcheck disable=SC2016 # jq bundle filters use literal variables.
 bind_outbound_locked() (
     umask 077
@@ -4214,7 +4431,8 @@ bind_outbound_locked() (
     work=$(mktemp -d "$STATE_DIR/outbound-bind.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     snapshot_bundle >"$work/before.json" || exit 1
-    jq --arg i "$bind_inbound" --arg o "$bind_target" '
+    user_outbound_bundle validate "$work/before.json" "$bind_inbound" >"$work/user-rules.json" || exit 1
+    jq --slurpfile user_rules "$work/user-rules.json" --arg i "$bind_inbound" --arg o "$bind_target" '
       if ([.config.inbounds[]? | select(.tag==$i)]|length)!=1 then error("inbound not unique") else . end |
       if $o!="-" and ([.config.outbounds[]? | select(.tag==$o)]|length)!=1 then error("outbound not unique") else . end |
       (.clients[$i].outbound_route // null) as $record |
@@ -4234,7 +4452,7 @@ bind_outbound_locked() (
           if $record.created_metadata==true and .clients[$i]=={} then del(.clients[$i]) else . end
         else
           {inbound:[$i],action:"route",outbound:$o} as $rule |
-          .config.route.rules=([$rule]+.config.route.rules) |
+          .config.route.rules=($user_rules[0].rules+[$rule]+[.config.route.rules[] | select(. as $r | $user_rules[0].rules | index($r) | not)]) |
           (.clients|has($i)|not) as $created |
           .clients[$i].outbound_route={format:"sing-box-manager-outbound-route-v1",rule:$rule,
             created_metadata:(if $record!=null then ($record.created_metadata // false) else $created end)}
@@ -4248,7 +4466,7 @@ bind_outbound_locked() (
     jq .config "$work/after.json" >"$work/config.json" || exit 1
     validate_config "$work/config.json" >"$work/check.log" 2>&1 || { fail "绑定未通过核心校验，请检查出站和现有路由。"; exit 1; }
     if [[ $bind_target == - ]]; then info "取消 $bind_inbound 的面板出站绑定，恢复由其余路由规则及默认出站决定。"
-    else info "$bind_inbound 的流量将优先使用出站 $bind_target（此规则优先于已有路由规则）。"; fi
+    else info "$bind_inbound 未单独绑定的用户将优先使用出站 $bind_target；已有单用户绑定优先。"; fi
     confirm "保存入站出站绑定？（自动备份，运行中的服务短暂重启）" || exit 1
     snapshot_bundle >"$work/current.json" || exit 1
     [[ $(jq -Sc . "$work/current.json") == "$(jq -Sc . "$work/before.json")" ]] || { fail "配置或连接信息已变化，请重试。"; exit 1; }
@@ -4434,7 +4652,7 @@ outbounds_menu() {
     [[ $# -eq 0 ]] || { fail "用法：sing-box outbounds"; return 1; }
     [[ -t 0 ]] || { list_outbounds; return; }
     while true; do
-        printf '\n出站节点管理\n  1. 出站列表和入站绑定\n  2. 按协议添加出站\n  3. 粘贴分享链接导入\n  4. 从 JSON/链接文件导入\n  5. 粘贴 outbound JSON 导入\n  6. 选择入站并绑定出站\n  7. 取消入站出站绑定\n  8. 删除出站\n  0. 返回\n'
+        printf '\n出站节点管理\n  1. 出站列表和入站绑定\n  2. 按协议添加出站\n  3. 粘贴分享链接导入\n  4. 从 JSON/链接文件导入\n  5. 粘贴 outbound JSON 导入\n  6. 选择入站并绑定默认出站\n  7. 取消入站默认出站绑定\n  8. 删除出站\n  9. 选择节点、用户并绑定出站\n 10. 解除单用户出站绑定\n 11. 查看单用户绑定\n  0. 返回\n'
         read -r -p "请选择出站操作 [0]: " choice || return 0
         case "$choice" in
             0|"") return 0 ;;
@@ -4451,7 +4669,10 @@ outbounds_menu() {
                     fi
                 fi ;;
             8) if select_outbound route_target && [[ -n $route_target ]]; then with_lock delete_outbound_locked "$route_target" || true; fi ;;
-            *) warn "请输入 0–8。" ;;
+            9) with_lock user_outbound_wizard_locked bind || true ;;
+            10) with_lock user_outbound_wizard_locked unbind || true ;;
+            11) list_user_outbound_bindings || true ;;
+            *) warn "请输入 0–11。" ;;
         esac
         read -r -p "按回车键返回出站管理菜单..." choice || return 0
     done
@@ -4690,6 +4911,7 @@ sing-box 中文终端管理面板
   sing-box outbounds              出站列表/管理菜单（非交互时只读列表）
   sing-box outbound-add FILE      从出站 JSON 或分享链接文本文件追加出站
   sing-box outbound-bind IN OUT|- 绑定入站至出站，- 取消面板绑定
+  sing-box outbound-user-bind IN INDEX OUT|- 绑定指定入站的第 INDEX 个用户，- 解除绑定
   sing-box outbound-delete TAG    删除未引用的出站（自动备份）
   sing-box ip-preference [ipv6|ipv4|status] 设置或查看默认出站 IP 优先级
   sing-box acme                   安装/打开 acme-script 证书管理菜单
@@ -4745,7 +4967,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return ;;
         core|bin) core_passthrough "$@"; return ;;
-        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|ip-preference|outbounds|outbound-add|outbound-bind|outbound-delete|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
+        menu|setup|install|update|update-panel|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-status|quic-bbr-disable|quic-bbr-record|acme|ip-preference|outbounds|outbound-add|outbound-bind|outbound-user-bind|outbound-delete|uninstall|start|restart|enable|disable-autostart|disable|stop|status|log|logs|add|edit|delete|backup|backups|restore|export|diagnose|add-file|import|info|client|users|user-add|user-delete|server|validate|format-config|remove-panel) ;;
         *) core_passthrough "$command" "$@"; return ;;
     esac
     require_root && require_systemd && safe_paths || return
@@ -4780,6 +5002,9 @@ main() {
         outbound-bind)
             [[ $# -eq 2 ]] || { fail "用法：sing-box outbound-bind IN OUT|-"; return 1; }
             with_lock bind_outbound_locked "$1" "$2" ;;
+        outbound-user-bind)
+            [[ $# -eq 3 ]] || { fail "用法：sing-box outbound-user-bind 入站名称 用户序号 出站名称|-"; return 1; }
+            with_lock bind_user_outbound_locked "$1" "$2" "$3" ;;
         outbound-delete)
             [[ $# -eq 1 ]] || { fail "用法：sing-box outbound-delete TAG"; return 1; }
             with_lock delete_outbound_locked "$1" ;;
