@@ -4388,19 +4388,19 @@ bind_user_outbound_locked() (
 # shellcheck disable=SC2016 # jq filters contain literal variables.
 user_outbound_wizard_locked() (
     umask 077
-    local action=${1:-bind} route_inbound="" route_user="" route_target=- work
+    local action=${1:-bind} user_route_inbound="" user_route_index="" user_route_target=- work
     [[ $action == bind || $action == unbind ]] || exit 1
     require_core && safe_paths || exit 1
-    select_inbound route_inbound "设置单用户出站" || exit 1
-    [[ -n $route_inbound ]] || exit 0
+    select_inbound user_route_inbound "设置单用户出站" || exit 1
+    [[ -n $user_route_inbound ]] || exit 0
     work=$(mktemp -d "$STATE_DIR/user-outbound-wizard.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     snapshot_bundle >"$work/before.json" || exit 1
-    jq -e --arg i "$route_inbound" '[.config.inbounds[]?|select(.tag==$i)]|if length==1 then .[0] else error("inbound") end' "$work/before.json" >"$work/node.json" || exit 1
-    select_inbound_user route_user "$work/node.json" || exit 1
-    [[ -n $route_user ]] || exit 0
-    if [[ $action == bind ]]; then select_outbound route_target || exit 1; [[ -n $route_target ]] || exit 0; fi
-    bind_user_outbound_locked "$route_inbound" "$route_user" "$route_target" "$work/before.json"
+    jq -e --arg i "$user_route_inbound" '[.config.inbounds[]?|select(.tag==$i)]|if length==1 then .[0] else error("inbound") end' "$work/before.json" >"$work/node.json" || exit 1
+    select_inbound_user user_route_index "$work/node.json" || exit 1
+    [[ -n $user_route_index ]] || exit 0
+    if [[ $action == bind ]]; then select_outbound user_route_target || exit 1; [[ -n $user_route_target ]] || exit 0; fi
+    bind_user_outbound_locked "$user_route_inbound" "$user_route_index" "$user_route_target" "$work/before.json"
 )
 
 # shellcheck disable=SC2016 # jq filters contain literal variables.
