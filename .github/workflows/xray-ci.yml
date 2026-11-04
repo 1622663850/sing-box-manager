@@ -48,3 +48,8 @@ jobs:
         run: sudo python3 tests/smoke_xray_management.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
       - name: Add forward and delete every inbound template
         run: sudo python3 tests/smoke_xray_templates.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
+      - name: Per-user outbound routing and unbind isolation
+        run: |
+          for protocol in vless vmess trojan hysteria; do
+            sudo python3 tests/smoke_xray_user_routes.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh" --protocol "$protocol"
+          done

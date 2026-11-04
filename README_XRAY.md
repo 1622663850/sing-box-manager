@@ -51,6 +51,40 @@ sudo xray
 
 VLESS、VMess、Trojan、Hy2 可按用户添加/删除独立认证并导出；SS2022 当前是单密码模板。用户操作保留其他用户和共享传输，至少保留一个用户。客户端导出保留 TLS 校验、SNI、REALITY、公钥、short ID、flow、WS/gRPC/XHTTP 等必要信息；未知或无法安全表达的导入配置拒绝向导导出，不静默去掉安全设置。
 
+## XHTTP 上下行分离（面板 v1.2.0）
+
+主菜单 **21. XHTTP 上下行分离（客户端）**，或 `sudo xray xhttp-split [入站名称]`，可为已有的 VLESS XHTTP 入站填写独立下载入口。支持 TLS（SNI、指纹、h2/h3/http/1.1）与 REALITY（SNI、指纹、客户端公钥、shortId、可选 ML-DSA-65 校验值），也支持从完整 `downloadSettings` JSON 文件导入；菜单中可关闭此功能。默认关闭，原有节点导出保持原行为。
+
+下载入口必须已经通过 CDN、反向代理或其他入口转发至**同一个 XHTTP 入站、相同 path**。本功能不会创建第二台服务器、配置 CDN 或修改防火墙。设置只保存在该入站的客户端元数据中，不写入服务端 inbound，也不重启核心；备份/恢复、重命名及用户管理沿用现有元数据机制。上传 `auto` 在导出时明确改为 `stream-up`，`packet-up` 保持不变；服务端固定 `stream-one` 时拒绝启用分离。修改入站 path 或外部修改节点后，旧分离配置会被拒绝导出，须重新设置或关闭。
+
+保存后通过 **9.查看配置 → 3.客户端 JSON 和链接** 或 `xray client` 重新导出。单用户、多用户、批量 JSON/链接/Base64 导出均携带客户端 `xhttpSettings.extra.downloadSettings`；分享链接通过 URL 编码的 `extra` 字段携带，出站链接/JSON 导入也保留并校验该字段。不会导出下载侧服务端私钥、Seed 或允许不安全 TLS 的设置；暂不接受下载侧嵌套分离、`sockopt` 及本机证书文件配置。
+
+例如一个 TLS 下载入口文件（域名、端口及 path 必须替换成实际入口）：
+
+```json
+{
+  "address": "down.example.com",
+  "port": 443,
+  "network": "xhttp",
+  "security": "tls",
+  "tlsSettings": {
+    "serverName": "down.example.com",
+    "fingerprint": "chrome",
+    "alpn": ["h2"]
+  },
+  "xhttpSettings": {"path": "/xray", "mode": "auto"}
+}
+```
+
+```bash
+sudo xray xhttp-split my-xhttp /root/download-settings.json
+sudo xray client my-xhttp
+# 关闭，仅恢复客户端导出为原来的上下行共用入口：
+sudo xray xhttp-split my-xhttp -
+```
+
+保存时使用已安装核心做客户端配置检查，但这不能验证两个入口是否正确转发，也不能证明小火箭完整支持该配置或实际更抗封锁。导入客户端后仍需检查参数保留情况并做真实上传、下载和断线恢复测试。设计依据：[XHTTP 官方上下行分离说明](https://github.com/XTLS/Xray-core/discussions/4113)。
+
 ## 后量子加密与认证（面板 v1.1.0）
 
 菜单 **8 添加入站 / 11 修改配置**：VLESS 模板支持开启、关闭或重新生成 VLESS Encryption 密钥（XHTTP + REALITY + Vision 必须开启）；REALITY 模板另有 ML-DSA-65 开关。除上述新模板外，新增默认关闭以兼容现有客户端，修改默认保留原开关和密钥。开启、关闭或换密钥影响整个入站的全部用户，须重新导入各用户连接信息；不会自动改变现有节点。
@@ -72,6 +106,17 @@ Mihomo v1.19.33 支持 VLESS Encryption，但尚未实现 REALITY **ML-DSA-65 �
 实现依据：[Mihomo 默认开关及握手处理](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/component/tls/reality.go)、[Mihomo 链接参数解析](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/common/convert/v.go)、[固定 REALITY 服务端握手要求](https://github.com/XTLS/REALITY/blob/83f621788ca8/tls.go#L215)。
 
 ## 出站、IPv6 与 BBR
+
+面板 **v1.2.1** 支持同一入站的单用户出站绑定：进入 **20 出站节点管理 → 9 绑定单个用户至出站**，依次选择节点、用户序号、出站；**10 解除单个用户绑定**只移除所选用户的受管规则。单用户规则优先于整节点规则，其他用户继续按原规则选路；再次设置整节点出站不会覆盖单用户绑定。
+
+支持 VLESS、VMess、Trojan、Hysteria 2 的独立认证用户；当前单密码 Shadowsocks 模板不支持。未命名用户首次绑定时自动补充唯一名称（`email` 字段），UUID/密码不变；解除后保留该名称。已有重名或 `regexp:` 名称会被拒绝，避免误匹配其他用户。绑定用户的凭据或名称需先解除绑定才能更改或删除；被外部修改、缺失或重复的受管规则不会被自动覆盖。操作不产生自动历史备份。
+
+```bash
+sudo xray user-outbound-bind my-node 2 exit-a
+sudo xray user-outbound-bind my-node 2 -
+```
+
+CLI 中节点与出站仍使用名称，用户使用从 1 开始的序号；交互菜单使用列表序号。绑定使用原生 `inboundTag + user → outboundTag` 规则及事务校验/失败回滚，运行中的服务会按需重启；只改变所选用户在服务端的出站选择，不更换认证，也不要求重新导入客户端。
 
 出站管理支持协议向导、粘贴分享链接、原生 Xray outbound JSON/JSONC 与每行一个链接的文本文件。支持单对象、数组、仅包含 outbounds 的对象；不会把 sing-box JSON 当成 Xray 格式。新增只追加，不改变路由；绑定入站时增加优先 `inboundTag → outboundTag` 规则，取消只移除面板登记的原样规则；外部改过/重复的规则拒绝自动处理，路由/代理引用未解除时禁止删除出站。完整 JSON 粘贴不回显，以单独一行 `END` 结束。
 
