@@ -2115,7 +2115,7 @@ xhttp_split_wizard_locked() (
     path=$(jq -r '.streamSettings.xhttpSettings.path // ""' "$work/node")
     info "下载入口须已转发至同一个 XHTTP 入站，路径自动沿用；客户端必须支持 downloadSettings。"
     prompt address "下载入口 IP/域名" && prompt port "下载入口端口" 443 || exit 1
-    valid_host "$address" && valid_port "$port" || { fail "下载地址或端口无效。"; exit 1; }
+    if ! valid_host "$address" || ! valid_port "$port"; then fail "下载地址或端口无效。"; exit 1; fi
     prompt choice "下载安全类型：1.TLS  2.REALITY" 1 || exit 1
     case "$choice" in 1) security=tls;;2) security=reality;;*) exit 1;;esac
     prompt sni "下载入口 SNI" "$address" && prompt fp "下载入口 TLS 指纹" chrome && prompt host "HTTP Host（回车跟随下载入口）" "" || exit 1
