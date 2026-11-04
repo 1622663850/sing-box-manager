@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 import shutil
 import subprocess
 import unittest
@@ -133,6 +134,30 @@ class XrayProtocolsTest(fixture.XrayFixture):
         self.assertEqual(outbound["settings"]["version"], 2)
         self.assertEqual(outbound["streamSettings"]["hysteriaSettings"]["version"], 2)
         self.assertEqual(outbound["streamSettings"]["hysteriaSettings"]["auth"], "hy-password")
+
+    def test_tls_and_reality_exports_explicit_chrome_fingerprint(self) -> None:
+        cases = {
+            "vless-tcp-tls": "", "vless-ws-tls": "/ws", "vless-grpc-tls": "GrpcService",
+            "vless-xhttp-tls": "/xhttp", "vless-reality": "",
+            "vmess-tcp-tls": "", "vmess-ws-tls": "/ws", "vmess-grpc-tls": "GrpcService",
+            "trojan": "",
+        }
+        for template, extra in cases.items():
+            with self.subTest(template=template):
+                inbound = self.generate(template, extra=extra)
+                source = self.write(template + "-chrome-in.json", inbound)
+                outbound = json.loads(self.shell(
+                    'generate_client "$@"', str(source), "example.com", PUBLIC, "1", check=True,
+                ).stdout)
+                security = outbound["streamSettings"]["security"]
+                self.assertEqual(outbound["streamSettings"][security + "Settings"]["fingerprint"], "chrome")
+                path = self.write(template + "-chrome-out.json", outbound)
+                link = self.shell('client_link "$@"', str(path), template, check=True).stdout.strip()
+                if outbound["protocol"] == "vmess":
+                    payload = json.loads(base64.b64decode(link.split("://", 1)[1]))
+                    self.assertEqual(payload["fp"], "chrome")
+                else:
+                    self.assertEqual(parse_qs(urlsplit(link).query)["fp"], ["chrome"])
 
     def test_invalid_protocol_security_and_credentials_fail_without_echo(self) -> None:
         cases = (

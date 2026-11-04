@@ -35,15 +35,21 @@ sudo xray
 - VMess RAW/TCP，无 TLS/TLS；WebSocket 无 TLS/TLS；gRPC TLS。
 - Trojan + TLS、Shadowsocks 2022 AES-128-GCM、Hysteria 2。
 
+面板 **v1.1.2** 在添加配置子菜单新增 **20. VLESS XHTTP + REALITY + Vision（需 VLESS Encryption）**，原有编号不变。此组合必须开启 VLESS Encryption，向导默认开启并拒绝关闭；ML-DSA-65 仍可独立选择。Xray v26.10.31 通过 Encryption 连接承载 Vision，XHTTP 不具备 RAW 的直接转发优化；客户端必须支持此完整组合。原有第 9 项 XHTTP + REALITY 不带 Vision，行为保持不变。修改新模板时保留 flow 和密钥，关闭加密会在保存前被拒绝。
+
+支持条件见 [官方客户端实现](https://github.com/XTLS/Xray-core/blob/v26.10.31/proxy/vless/outbound/outbound.go#L248) 和 [服务端实现](https://github.com/XTLS/Xray-core/blob/v26.10.31/proxy/vless/inbound/inbound.go#L532)。
+
 这些模板使用固定版 Xray 支持的字段，协议表不会混入未注册的 TUIC、AnyTLS、Snell、ShadowTLS。RAW 是当前 TCP 传输名称；REALITY 客户端用新版 `password` 存放公钥，`Hash32` 不作为公钥。Hy2 的原生协议名是 `hysteria`、协议/传输两处 version=2，认证在客户端 `hysteriaSettings.auth`。协议依据见 [Xray 官方文档](https://xtls.github.io/config/) 和 [v26.10.31 源码](https://github.com/XTLS/Xray-core/tree/v26.10.31)。
 
 新增/修改模板支持认证、端口、对应传输路径/服务名、TLS SNI 与证书、REALITY 密钥和 short ID。TLS 证书支持 `.pem/.cer/.crt`、私钥通常为 `.key`，文件内容均须 PEM；可直接选择 ACME 已申请的有效证书，检查 SAN、时间和密钥配对。运行 ACME 菜单使用外部独立项目，不读取账户/DNS Token 配置，不自动申请或续签证书。多个核心可引用同一已有证书文件，续签及重载仍由原证书维护方式负责。
+
+面板 **v1.1.3** 起，导出的 VLESS、VMess、Trojan TLS 客户端显式使用 `fingerprint: "chrome"`；REALITY 导出继续使用 `chrome`。VLESS/Trojan 链接写入 `fp=chrome`，VMess 分享内容写入 `"fp":"chrome"`。已有节点重新导出、重新导入即可，无需更换密钥或重启服务器。此设置不应用到 Hysteria 2 的 QUIC 握手；客户端导入界面是否保留参数仍需实际核对。
 
 VLESS、VMess、Trojan、Hy2 可按用户添加/删除独立认证并导出；SS2022 当前是单密码模板。用户操作保留其他用户和共享传输，至少保留一个用户。客户端导出保留 TLS 校验、SNI、REALITY、公钥、short ID、flow、WS/gRPC/XHTTP 等必要信息；未知或无法安全表达的导入配置拒绝向导导出，不静默去掉安全设置。
 
 ## 后量子加密与认证（面板 v1.1.0）
 
-菜单 **8 添加入站 / 11 修改配置**：全部 VLESS 模板支持单独开启、关闭或重新生成 VLESS Encryption 密钥；REALITY 模板另有 ML-DSA-65 开关。新增默认关闭以兼容现有客户端，修改默认保留原开关和密钥。开启、关闭或换密钥影响整个入站的全部用户，须重新导入各用户连接信息；不会自动改变现有节点。
+菜单 **8 添加入站 / 11 修改配置**：VLESS 模板支持开启、关闭或重新生成 VLESS Encryption 密钥（XHTTP + REALITY + Vision 必须开启）；REALITY 模板另有 ML-DSA-65 开关。除上述新模板外，新增默认关闭以兼容现有客户端，修改默认保留原开关和密钥。开启、关闭或换密钥影响整个入站的全部用户，须重新导入各用户连接信息；不会自动改变现有节点。
 
 - **VLESS Encryption**：官方核心 `mlkem768` 生成密钥，服务端 `decryption=mlkem768x25519plus.native.600s.<Seed>`，客户端从同一 Seed 派生 `encryption=mlkem768x25519plus.native.0rtt.<Client>`；支持 RAW、TLS、REALITY、WS、gRPC、XHTTP 叠加。
 - **REALITY ML-DSA-65**：官方核心 `mldsa65` 生成独立密钥，服务端 `mldsa65Seed`、客户端 `mldsa65Verify`；不替代原 REALITY X25519 密钥。首次开启、换密钥或修改握手域名时，自动检测目标 TLS 1.3、X25519MLKEM768 和超过 3500 字节的证书链；未通过不保存。

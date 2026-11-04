@@ -142,6 +142,7 @@ prompt() {
         protocol_choice)
             case "$wizard_mode" in
                 only-mlkem) value=2;;
+                xhttp-*) value=20;;
                 *) value=1;;
             esac
             ;;
@@ -168,6 +169,7 @@ prompt() {
                 *"VLESS 后量子混合加密"*)
                     case "$wizard_mode" in
                         on|only-mlkem|retain) value=2;;
+                        xhttp-on|xhttp-retain) value=$default;;
                         cancel) value=0;;
                         *) value=1;;
                     esac
@@ -630,6 +632,59 @@ class XrayPostQuantumTest(fixture.XrayFixture):
         # The second independent switch is exercised in a fresh isolated
         # configuration by a separate test method; this assertion keeps the
         # first case explicitly limited to ML-KEM.
+
+    def test_xhttp_vision_requires_encryption_and_exports_flow_and_path(self) -> None:
+        template = "vless-xhttp-reality-vision"
+        failed = self.shell(
+            'generate_inbound "$@"', template, "pq-node", "18443", UUID,
+            "/vision", PRIVATE, "01234567", "example.com", "", "", "", "", "none",
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failed.stdout, "")
+        inbound = self.generate(template, extra="/vision", decryption=DECRYPTION)
+        self.assertEqual(inbound["settings"]["users"][0]["flow"], "xtls-rprx-vision")
+        source = self.write("xhttp-vision.json", inbound)
+        self.assertEqual(self.shell('detect_inbound_template "$1"', str(source), check=True).stdout.strip(), template)
+        outbound = json.loads(self.shell(
+            'generate_client "$@"', str(source), "example.com", PUBLIC, "1", check=True,
+        ).stdout)
+        self.assertEqual(outbound["settings"]["flow"], "xtls-rprx-vision")
+        self.assertEqual(outbound["streamSettings"]["xhttpSettings"]["path"], "/vision")
+        path = self.write("xhttp-vision-outbound.json", outbound)
+        link = self.shell('client_link "$@"', str(path), "xhttp-vision", check=True).stdout.strip()
+        query = parse_qs(urlsplit(link).query)
+        self.assertEqual(query["flow"], ["xtls-rprx-vision"])
+        self.assertEqual(query["type"], ["xhttp"])
+        self.assertEqual(query["security"], ["reality"])
+        self.assertEqual(query["path"], ["/vision"])
+        self.assertEqual(query["encryption"], [outbound["settings"]["encryption"]])
+        self.assertNotIn(MLKEM_SEED, link)
+
+    def test_xhttp_vision_wizard_defaults_on_and_rejects_disabling_without_writes(self) -> None:
+        before = self.config.read_bytes()
+        result = self.wizard("xhttp-off")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(list(self.backups_dir.iterdir()), [])
+        added = self.wizard("xhttp-on")
+        self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+        node = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+        self.assertEqual(node["settings"]["users"][0]["flow"], "xtls-rprx-vision")
+        self.assertTrue(node["settings"]["decryption"].startswith("mlkem768x25519plus."))
+        metadata = self.clients_dir / (node["tag"] + ".json")
+        retained = self.wizard("xhttp-retain", node["tag"])
+        self.assertEqual(retained.returncode, 0, retained.stdout + retained.stderr)
+        current = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+        self.assertEqual(current["settings"], node["settings"])
+        self.assertEqual(current["streamSettings"], node["streamSettings"])
+        before = self.config.read_bytes()
+        metadata_before = metadata.read_bytes()
+        backups_before = sorted(self.backups_dir.iterdir())
+        closed = self.wizard("close", node["tag"])
+        self.assertNotEqual(closed.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(metadata.read_bytes(), metadata_before)
+        self.assertEqual(sorted(self.backups_dir.iterdir()), backups_before)
 
     def test_wizard_independent_only_mldsa_switch(self) -> None:
         result = self.wizard("only-mldsa")

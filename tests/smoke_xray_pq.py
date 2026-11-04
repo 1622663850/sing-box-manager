@@ -375,6 +375,8 @@ def _run_reality_pq_case(
     wrong_mldsa_public: str,
     certificate: Path,
     private_key: Path,
+    *,
+    template: str = "vless-reality",
 ) -> None:
     private_x25519, public_x25519 = _x25519(core)
     server_port, proxy_port, camouflage_port = free_port(), free_port(), free_port()
@@ -383,11 +385,11 @@ def _run_reality_pq_case(
     inbound = _generate_inbound(
         manager,
         environment,
-        "vless-reality",
+        template,
         "pq-reality",
         server_port,
         UUID,
-        "localhost",
+        "/pq-xhttp" if template == "vless-xhttp-reality-vision" else "localhost",
         "localhost",
         None,
         None,
@@ -444,7 +446,7 @@ def _run_reality_pq_case(
                 with running_xray(core, client_file, work, proxy_port, "pq-reality-client"):
                     if fetch_through_socks_retry(proxy_port, http_port, "/pq-reality") != HTTP_PAYLOAD:
                         raise RuntimeError("PQ REALITY loopback payload mismatch")
-    print("PASS xray PQ vless-reality: Vision, ML-KEM and ML-DSA verification", flush=True)
+    print(f"PASS xray PQ {template}: Vision, ML-KEM and ML-DSA verification", flush=True)
 
 
 def _assert_core_version(core: Path) -> None:
@@ -499,6 +501,12 @@ def run(core: Path, manager: Path) -> None:
             wrong_mldsa_pair["public"],
             certificate,
             private_key,
+        )
+        _run_reality_pq_case(
+            core, manager, environment, work, decryption,
+            mldsa_seed_pair["private"], mldsa_seed_pair["public"],
+            wrong_mldsa_pair["public"], certificate, private_key,
+            template="vless-xhttp-reality-vision",
         )
         # Keep the no-seed calls live as well: the generated key material is
         # checked above and these calls exercise the deterministic default path.

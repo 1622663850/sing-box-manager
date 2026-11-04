@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.1.1"
+XR_MANAGER_VERSION="1.1.3"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -1833,10 +1833,13 @@ if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", tag) or not 1 <= int(port
 supported = {
     "vless-tcp", "vless-tcp-tls", "vless-reality", "vless-ws", "vless-ws-tls",
     "vless-grpc-tls", "vless-grpc-reality", "vless-xhttp-tls", "vless-xhttp-reality",
+    "vless-xhttp-reality-vision",
     "vmess-tcp", "vmess-tcp-tls", "vmess-ws", "vmess-ws-tls", "vmess-grpc-tls",
     "trojan", "shadowsocks", "hysteria",
 }
 if p not in supported:
+    raise SystemExit(1)
+if p == "vless-xhttp-reality-vision" and decryption == "none":
     raise SystemExit(1)
 def user_uuid(value):
     if not uuid_re.fullmatch(value): raise SystemExit(1)
@@ -1876,7 +1879,7 @@ if p.startswith("vless-"):
     if p.endswith("-tls"): security = "tls"
     elif "reality" in p: security = "reality"
     client = {"id": user_uuid(credential)}
-    if p == "vless-reality": client["flow"] = "xtls-rprx-vision"
+    if p in {"vless-reality", "vless-xhttp-reality-vision"}: client["flow"] = "xtls-rprx-vision"
     value = {"protocol": "vless", "tag": tag, "listen": "::", "port": int(port),
              "settings": {"users": [client], "decryption": decryption},
              "streamSettings": stream(network, security)}
@@ -1991,6 +1994,7 @@ if stream:
         tls.pop("certificates", None)
         if tls.get("allowInsecure", False): raise SystemExit(1)
         tls["allowInsecure"] = False
+        if protocol in {"vless", "vmess", "trojan"}: tls["fingerprint"] = "chrome"
         out["streamSettings"] = {k: v for k, v in stream.items() if k not in {"tlsSettings", "realitySettings"}}
         out["streamSettings"]["tlsSettings"] = tls
     else:
@@ -2040,7 +2044,7 @@ def common(q):
         tls = stream.get("tlsSettings", {})
         q += "&sni=" + quote(tls.get("serverName", ""), safe="")
         if tls.get("alpn"): q += "&alpn=" + quote(",".join(tls["alpn"]), safe="")
-        if tls.get("fingerprint"): q += "&fp=" + quote(tls["fingerprint"], safe="")
+        q += "&fp=" + quote(tls.get("fingerprint") or "chrome", safe="")
     if settings.get("flow"): q += "&flow=" + quote(settings["flow"], safe="")
     return q
 def transport(q):
@@ -2064,6 +2068,7 @@ elif protocol == "vmess":
     if security == "tls":
         payload["sni"] = stream.get("tlsSettings", {}).get("serverName", "")
         payload["alpn"] = ",".join(stream.get("tlsSettings", {}).get("alpn", []))
+        payload["fp"] = stream.get("tlsSettings", {}).get("fingerprint") or "chrome"
     if method == "websocket":
         payload["path"] = stream.get("wsSettings", {}).get("path", "")
         payload["host"] = stream.get("wsSettings", {}).get("headers", {}).get("Host", "")
@@ -2098,6 +2103,8 @@ network=s.get("network", s.get("method","raw")); security=s.get("security","none
 label = {"raw": "tcp", "websocket": "ws", "grpc": "grpc", "xhttp": "xhttp", "hysteria": "hysteria"}.get(network, network)
 if p=="vless":
     if security=="reality" and label=="tcp": print("vless-reality"); raise SystemExit
+    if security=="reality" and label=="xhttp" and any(u.get("flow")=="xtls-rprx-vision" for u in v.get("settings",{}).get("users",v.get("settings",{}).get("clients",[]))):
+        print("vless-xhttp-reality-vision"); raise SystemExit
     print("vless-"+label+"-"+security if security!="none" else "vless-"+label); raise SystemExit
 if p=="vmess": print("vmess-"+label+"-"+security if security!="none" else "vmess-"+label); raise SystemExit
 if p=="trojan": print("trojan"); raise SystemExit
@@ -2166,14 +2173,15 @@ make_reality_pair(){
 }
 choose_template(){
     local destination=$1 protocol_choice
-    printf '\n添加 Xray 入站\n  1. VLESS RAW + REALITY + Vision\n  2. VLESS RAW\n  3. VLESS RAW + TLS\n  4. VLESS WebSocket\n  5. VLESS WebSocket + TLS\n  6. VLESS gRPC + TLS\n  7. VLESS gRPC + REALITY（无 Vision）\n  8. VLESS XHTTP + TLS\n  9. VLESS XHTTP + REALITY\n 10. VMess RAW\n 11. VMess RAW + TLS\n 12. VMess WebSocket\n 13. VMess WebSocket + TLS\n 14. VMess gRPC + TLS\n 15. Trojan + TLS\n 16. Shadowsocks 2022\n 17. Hysteria 2\n 18. 导入单个 inbound JSON\n 19. 导入完整 Xray JSON（替换）\n  0. 返回\n'
+    printf '\n添加 Xray 入站\n  1. VLESS RAW + REALITY + Vision\n  2. VLESS RAW\n  3. VLESS RAW + TLS\n  4. VLESS WebSocket\n  5. VLESS WebSocket + TLS\n  6. VLESS gRPC + TLS\n  7. VLESS gRPC + REALITY（无 Vision）\n  8. VLESS XHTTP + TLS\n  9. VLESS XHTTP + REALITY\n 10. VMess RAW\n 11. VMess RAW + TLS\n 12. VMess WebSocket\n 13. VMess WebSocket + TLS\n 14. VMess gRPC + TLS\n 15. Trojan + TLS\n 16. Shadowsocks 2022\n 17. Hysteria 2\n 18. 导入单个 inbound JSON\n 19. 导入完整 Xray JSON（替换）\n 20. VLESS XHTTP + REALITY + Vision（需 VLESS Encryption）\n  0. 返回\n'
     prompt protocol_choice "请选择协议" 1 || return
     case "$protocol_choice" in
       0) printf -v "$destination" '%s' '';; 1) printf -v "$destination" vless-reality;; 2) printf -v "$destination" vless-tcp;; 3) printf -v "$destination" vless-tcp-tls;;
       4) printf -v "$destination" vless-ws;; 5) printf -v "$destination" vless-ws-tls;; 6) printf -v "$destination" vless-grpc-tls;; 7) printf -v "$destination" vless-grpc-reality;;
       8) printf -v "$destination" vless-xhttp-tls;; 9) printf -v "$destination" vless-xhttp-reality;; 10) printf -v "$destination" vmess-tcp;; 11) printf -v "$destination" vmess-tcp-tls;;
       12) printf -v "$destination" vmess-ws;; 13) printf -v "$destination" vmess-ws-tls;; 14) printf -v "$destination" vmess-grpc-tls;; 15) printf -v "$destination" trojan;;
-      16) printf -v "$destination" shadowsocks;; 17) printf -v "$destination" hysteria;; 18) printf -v "$destination" import-node;; 19) printf -v "$destination" import-full;; *) fail "无效协议。"; return 1;; esac
+      16) printf -v "$destination" shadowsocks;; 17) printf -v "$destination" hysteria;; 18) printf -v "$destination" import-node;; 19) printf -v "$destination" import-full;;
+      20) printf -v "$destination" vless-xhttp-reality-vision;; *) fail "无效协议。"; return 1;; esac
 }
 select_inbound_user(){
     local destination=$1 file=$2 choice count
@@ -2232,6 +2240,10 @@ node_wizard_locked() (
     if [[ $protocol == vless-* ]]; then
         info "VLESS Encryption 为整个入站共享；开启/关闭/换密钥后，所有用户须重新导入客户端配置。客户端需支持此功能。"
         [[ $decryption == none ]] || pq_default=2
+        if [[ $protocol == vless-xhttp-reality-vision ]]; then
+            info "XHTTP + REALITY + Vision 必须开启 VLESS Encryption；客户端须支持此组合，XHTTP 不提供 RAW 的直接转发优化。"
+            pq_default=2
+        fi
         prompt choice "VLESS 后量子混合加密：1 关闭，2 开启/保留密钥，3 开启并重新生成密钥，0 取消" "$pq_default" || exit 1
         case "$choice" in
           0) exit 0;; 1) decryption=none;;
@@ -2240,6 +2252,9 @@ node_wizard_locked() (
               decryption="mlkem768x25519plus.native.600s.$(jq -r .private <<<"$pair")"
           fi;; *) exit 1;;
         esac
+        if [[ $protocol == vless-xhttp-reality-vision && $decryption == none ]]; then
+            fail "XHTTP + REALITY + Vision 不能关闭 VLESS Encryption；未保存配置。"; exit 1
+        fi
     fi
     case "$protocol" in
         *reality*)
