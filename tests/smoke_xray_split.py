@@ -193,7 +193,6 @@ class CountingRelay:
             left.join(timeout=30)
             right.join(timeout=30)
 
-    @staticmethod
     def _pipe(self, source: socket.socket, destination: socket.socket, direction: str) -> None:
         try:
             source.settimeout(1)
@@ -224,6 +223,197 @@ class CountingRelay:
             self._server.close()
         for thread in self._threads:
             thread.join(timeout=2)
+
+
+class CountingUdpRelay:
+    """Loopback UDP forwarder with per-client upstream sockets and counters."""
+
+    def __init__(self, listen_host: str, listen_port: int, target_port: int):
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self.target_port = target_port
+        self.accepted = 0
+        self.client_bytes = 0
+        self.server_bytes = 0
+        self._counter_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._server: socket.socket | None = None
+        self._peers: dict[tuple[str, int], socket.socket] = {}
+        self._threads: list[threading.Thread] = []
+
+    def __enter__(self) -> "CountingUdpRelay":
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.listen_host, self.listen_port))
+        server.settimeout(0.2)
+        self._server = server
+        thread = threading.Thread(target=self._receive_clients, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+        return self
+
+    def _receive_clients(self) -> None:
+        assert self._server is not None
+        while not self._stop.is_set():
+            try:
+                data, client = self._server.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            upstream = self._peers.get(client)
+            if upstream is None:
+                try:
+                    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    upstream.settimeout(0.2)
+                    upstream.connect((LOOPBACK, self.target_port))
+                except OSError:
+                    if upstream is not None:
+                        upstream.close()
+                    continue
+                self._peers[client] = upstream
+                self.accepted += 1
+                thread = threading.Thread(
+                    target=self._receive_server,
+                    args=(upstream, client),
+                    daemon=True,
+                )
+                thread.start()
+                self._threads.append(thread)
+            try:
+                upstream.send(data)
+                with self._counter_lock:
+                    self.client_bytes += len(data)
+            except OSError:
+                pass
+
+    def _receive_server(self, upstream: socket.socket, client: tuple[str, int]) -> None:
+        assert self._server is not None
+        while not self._stop.is_set():
+            try:
+                data = upstream.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            try:
+                self._server.sendto(data, client)
+                with self._counter_lock:
+                    self.server_bytes += len(data)
+            except OSError:
+                return
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._server is not None:
+            self._server.close()
+        for upstream in self._peers.values():
+            upstream.close()
+        for thread in self._threads:
+            thread.join(timeout=2)
+
+
+def run_counting_relay_self_test() -> None:
+    """Exercise CountingRelay on any platform before requiring Bash/Xray."""
+    target_port = free_port()
+    relay_port = free_port()
+    while relay_port == target_port:
+        relay_port = free_port()
+    stop = threading.Event()
+    target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    target.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    target.bind((LOOPBACK, target_port))
+    target.listen(1)
+    target.settimeout(0.2)
+
+    def echo() -> None:
+        try:
+            while not stop.is_set():
+                try:
+                    connection, _peer = target.accept()
+                    break
+                except socket.timeout:
+                    continue
+            else:
+                return
+            with connection:
+                connection.settimeout(1)
+                while not stop.is_set():
+                    try:
+                        data = connection.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        return
+                    connection.sendall(data)
+        except (OSError, socket.timeout):
+            return
+
+    thread = threading.Thread(target=echo, daemon=True)
+    thread.start()
+    body = b"counting-relay-self-test:" + (b"0123456789abcdef" * 4096)
+    try:
+        with CountingRelay(LOOPBACK, relay_port, target_port) as relay:
+            with socket.create_connection((LOOPBACK, relay_port), timeout=5) as client:
+                client.sendall(body)
+                client.shutdown(socket.SHUT_WR)
+                received = bytearray()
+                while len(received) < len(body):
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            if bytes(received) != body:
+                raise RuntimeError("CountingRelay loopback self-test payload mismatch")
+            if relay.client_bytes < len(body) or relay.server_bytes < len(body):
+                raise RuntimeError("CountingRelay loopback self-test byte counters did not advance")
+    finally:
+        stop.set()
+        target.close()
+        thread.join(timeout=2)
+
+
+def run_counting_udp_relay_self_test() -> None:
+    """Exercise the UDP relay independently of Bash/Xray on Windows too."""
+    target_port = free_port()
+    relay_port = free_port()
+    while relay_port == target_port:
+        relay_port = free_port()
+    stop = threading.Event()
+    target = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    target.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    target.bind((LOOPBACK, target_port))
+    target.settimeout(0.2)
+
+    def echo() -> None:
+        while not stop.is_set():
+            try:
+                data, peer = target.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            target.sendto(data, peer)
+
+    thread = threading.Thread(target=echo, daemon=True)
+    thread.start()
+    body = b"counting-udp-relay-self-test:" + (b"0123456789abcdef" * 1024)
+    try:
+        with CountingUdpRelay(LOOPBACK, relay_port, target_port) as relay:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.settimeout(5)
+                client.sendto(body, (LOOPBACK, relay_port))
+                received, _peer = client.recvfrom(len(body) + 1024)
+            if received != body:
+                raise RuntimeError("CountingUdpRelay loopback self-test payload mismatch")
+            if relay.client_bytes < len(body) or relay.server_bytes < len(body):
+                raise RuntimeError("CountingUdpRelay loopback self-test byte counters did not advance")
+    finally:
+        stop.set()
+        target.close()
+        thread.join(timeout=2)
 
 
 @contextmanager
@@ -387,7 +577,7 @@ def attach_download(manager: Path, env: dict[str, str], outbound: dict, download
     return manager_json(manager, env, "xhttp_download_tools", "attach", str(out_file), str(download_file))
 
 
-def tls_download(port: int, path: str) -> dict:
+def tls_download(port: int, path: str, alpn: str = "h2") -> dict:
     return {
         "address": DOWNLOAD_HOST,
         "port": port,
@@ -396,7 +586,7 @@ def tls_download(port: int, path: str) -> dict:
         "tlsSettings": {
             "serverName": "localhost",
             "fingerprint": "chrome",
-            "alpn": ["h2"],
+            "alpn": [alpn],
             "allowInsecure": False,
         },
         "xhttpSettings": {"path": path, "mode": "auto"},
@@ -514,6 +704,8 @@ def runtime_case(
     include_vision: bool,
     certificate: Path,
     private_key: Path,
+    upload_mode: str = "auto",
+    download_alpn: str = "h2",
 ) -> None:
     server_port = free_port()
     download_port = free_port()
@@ -539,6 +731,9 @@ def runtime_case(
         decryption,
     )
     inbound["listen"] = LOOPBACK
+    inbound["streamSettings"]["xhttpSettings"]["mode"] = upload_mode
+    if security == "tls":
+        inbound["streamSettings"]["tlsSettings"]["alpn"] = ["h2", "h3", "http/1.1"]
     if security == "reality":
         reality = inbound["streamSettings"]["realitySettings"]
         reality["target"] = f"{LOOPBACK}:{camouflage_port}"
@@ -555,11 +750,14 @@ def runtime_case(
         write_json(server_file, server_config(inbound, (http_port,)))
         check_xray(core, server_file, work)
         upload_relay = CountingRelay(UPLOAD_HOST, server_port, server_port)
-        download_relay = CountingRelay(DOWNLOAD_HOST, download_port, server_port)
+        if download_alpn == "h3":
+            download_relay = CountingUdpRelay(DOWNLOAD_HOST, download_port, server_port)
+        else:
+            download_relay = CountingRelay(DOWNLOAD_HOST, download_port, server_port)
         target_context = tls_target(certificate, private_key, camouflage_port) if security == "reality" else _null_context()
         with target_context, running_xray(core, server_file, work, server_port, f"{label}-server"):
             with upload_relay, download_relay:
-                metadata_download = reality_download(download_port, path, public, REALITY_SHORT_ID) if security == "reality" else tls_download(download_port, path)
+                metadata_download = reality_download(download_port, path, public, REALITY_SHORT_ID) if security == "reality" else tls_download(download_port, path, download_alpn)
                 clients_root = root / "var/lib/xray-manager/clients"
                 metadata = clients_root / f"{inbound['tag']}.json"
                 write_json(metadata, {"server": UPLOAD_HOST, "public_key": public, "inbound": inbound})
@@ -639,6 +837,9 @@ def run(core: Path, manager: Path) -> None:
         write_json(config_path, {"inbounds": [], "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {}}]})
         cert, key = tls_material(work)
         runtime_case(core, manager, env, root, work, "tls", "tls", False, cert, key)
+        runtime_case(core, manager, env, root, work, "tls-packet-up", "tls", False, cert, key, upload_mode="packet-up")
+        runtime_case(core, manager, env, root, work, "tls-http11", "tls", False, cert, key, download_alpn="http/1.1")
+        runtime_case(core, manager, env, root, work, "tls-h3", "tls", False, cert, key, download_alpn="h3")
         runtime_case(core, manager, env, root, work, "reality", "reality", False, cert, key)
         runtime_case(core, manager, env, root, work, "reality-vision", "reality", True, cert, key)
 
@@ -650,6 +851,12 @@ def main() -> int:
     args = parser.parse_args()
     core = args.core.expanduser().resolve()
     manager = args.manager.expanduser().resolve()
+    try:
+        run_counting_relay_self_test()
+        run_counting_udp_relay_self_test()
+    except Exception as error:
+        print(f"FAIL relay self-test: {type(error).__name__}", file=sys.stderr)
+        return 1
     if not core.is_file() or not os.access(core, os.X_OK) or not manager.is_file():
         print("FAIL xhttp split smoke: invalid core or manager path", file=sys.stderr)
         return 1
