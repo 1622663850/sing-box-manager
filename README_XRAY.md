@@ -51,6 +51,40 @@ sudo xray
 
 VLESS、VMess、Trojan、Hy2 可按用户添加/删除独立认证并导出；SS2022 当前是单密码模板。用户操作保留其他用户和共享传输，至少保留一个用户。客户端导出保留 TLS 校验、SNI、REALITY、公钥、short ID、flow、WS/gRPC/XHTTP 等必要信息；未知或无法安全表达的导入配置拒绝向导导出，不静默去掉安全设置。
 
+## XHTTP 上下行分离（面板 v1.2.0）
+
+主菜单 **21. XHTTP 上下行分离（客户端）**，或 `sudo xray xhttp-split [入站名称]`，可为已有的 VLESS XHTTP 入站填写独立下载入口。支持 TLS（SNI、指纹、h2/h3/http/1.1）与 REALITY（SNI、指纹、客户端公钥、shortId、可选 ML-DSA-65 校验值），也支持从完整 `downloadSettings` JSON 文件导入；菜单中可关闭此功能。默认关闭，原有节点导出保持原行为。
+
+下载入口必须已经通过 CDN、反向代理或其他入口转发至**同一个 XHTTP 入站、相同 path**。本功能不会创建第二台服务器、配置 CDN 或修改防火墙。设置只保存在该入站的客户端元数据中，不写入服务端 inbound，也不重启核心；备份/恢复、重命名及用户管理沿用现有元数据机制。上传 `auto` 在导出时明确改为 `stream-up`，`packet-up` 保持不变；服务端固定 `stream-one` 时拒绝启用分离。修改入站 path 或外部修改节点后，旧分离配置会被拒绝导出，须重新设置或关闭。
+
+保存后通过 **9.查看配置 → 3.客户端 JSON 和链接** 或 `xray client` 重新导出。单用户、多用户、批量 JSON/链接/Base64 导出均携带客户端 `xhttpSettings.extra.downloadSettings`；分享链接通过 URL 编码的 `extra` 字段携带，出站链接/JSON 导入也保留并校验该字段。不会导出下载侧服务端私钥、Seed 或允许不安全 TLS 的设置；暂不接受下载侧嵌套分离、`sockopt` 及本机证书文件配置。
+
+例如一个 TLS 下载入口文件（域名、端口及 path 必须替换成实际入口）：
+
+```json
+{
+  "address": "down.example.com",
+  "port": 443,
+  "network": "xhttp",
+  "security": "tls",
+  "tlsSettings": {
+    "serverName": "down.example.com",
+    "fingerprint": "chrome",
+    "alpn": ["h2"]
+  },
+  "xhttpSettings": {"path": "/xray", "mode": "auto"}
+}
+```
+
+```bash
+sudo xray xhttp-split my-xhttp /root/download-settings.json
+sudo xray client my-xhttp
+# 关闭，仅恢复客户端导出为原来的上下行共用入口：
+sudo xray xhttp-split my-xhttp -
+```
+
+保存时使用已安装核心做客户端配置检查，但这不能验证两个入口是否正确转发，也不能证明小火箭完整支持该配置或实际更抗封锁。导入客户端后仍需检查参数保留情况并做真实上传、下载和断线恢复测试。设计依据：[XHTTP 官方上下行分离说明](https://github.com/XTLS/Xray-core/discussions/4113)。
+
 ## 后量子加密与认证（面板 v1.1.0）
 
 菜单 **8 添加入站 / 11 修改配置**：VLESS 模板支持开启、关闭或重新生成 VLESS Encryption 密钥（XHTTP + REALITY + Vision 必须开启）；REALITY 模板另有 ML-DSA-65 开关。除上述新模板外，新增默认关闭以兼容现有客户端，修改默认保留原开关和密钥。开启、关闭或换密钥影响整个入站的全部用户，须重新导入各用户连接信息；不会自动改变现有节点。

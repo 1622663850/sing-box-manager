@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.1.5"
+XR_MANAGER_VERSION="1.2.0"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -1951,6 +1951,181 @@ print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 PY_XRAY_INBOUND
 }
 
+xhttp_download_tools() {
+    python3 - "$@" <<'PY_XHTTP_DOWNLOAD'
+import base64, copy, ipaddress, json, re, sys
+from pathlib import Path
+
+def reject(): raise ValueError()
+def load(path):
+    p = Path(path)
+    if p.is_symlink() or not p.is_file() or p.stat().st_size > 1048576: reject()
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+def host(value):
+    if not isinstance(value, str) or not value or len(value) > 253: reject()
+    try: ipaddress.ip_address(value)
+    except ValueError:
+        if re.fullmatch(r"[0-9.]+", value): reject()
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", value) or ".." in value: reject()
+def path(value):
+    if not isinstance(value, str) or not value.startswith("/") or any(ord(c) < 32 for c in value): reject()
+def key(value, size):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value): reject()
+    raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    if len(raw) != size or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value: reject()
+def download(value, upload_path):
+    if not isinstance(value, dict) or set(value) - {"address", "port", "network", "method", "security", "tlsSettings", "realitySettings", "xhttpSettings"}: reject()
+    value = copy.deepcopy(value)
+    host(value.get("address"))
+    if type(value.get("port")) is not int or not 1 <= value["port"] <= 65535: reject()
+    if value.get("network", value.get("method")) != "xhttp" or value.get("method", "xhttp") != "xhttp": reject()
+    value.pop("method", None)
+    value["network"] = "xhttp"
+    x = value.get("xhttpSettings")
+    if not isinstance(x, dict) or set(x) - {"path", "host", "mode"}: reject()
+    path(x.get("path"))
+    if x["path"] != upload_path or x.get("mode", "auto") not in {"auto", "stream-up", "packet-up"}: reject()
+    if x.get("host"): host(x["host"])
+    security = value.get("security")
+    if security not in {"tls", "reality"}: reject()
+    name = security + "Settings"
+    if ("realitySettings" if security == "tls" else "tlsSettings") in value: reject()
+    tls = value.get(name)
+    allowed = ({"serverName", "fingerprint", "alpn", "allowInsecure"} if security == "tls" else
+               {"serverName", "fingerprint", "password", "publicKey", "shortId", "mldsa65Verify", "spiderX"})
+    if not isinstance(tls, dict) or set(tls) - allowed: reject()
+    host(tls.get("serverName"))
+    fp = tls.get("fingerprint", "chrome")
+    if not isinstance(fp, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", fp): reject()
+    if security == "tls":
+        if tls.get("allowInsecure", False) is not False: reject()
+        if "alpn" in tls and (not isinstance(tls["alpn"], list) or not tls["alpn"] or any(a not in {"h2", "h3", "http/1.1"} for a in tls["alpn"])): reject()
+    else:
+        if fp == "unsafe": reject()
+        public = tls.get("password", tls.get("publicKey"))
+        key(public, 32)
+        if "password" in tls and "publicKey" in tls and tls["password"] != tls["publicKey"]: reject()
+        tls.pop("publicKey", None)
+        tls["password"] = public
+        if not isinstance(tls.get("shortId"), str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2}){0,8}", tls["shortId"]): reject()
+        if tls.get("mldsa65Verify"): key(tls["mldsa65Verify"], 1952)
+        if "spiderX" in tls: path(tls["spiderX"])
+    return value
+def xhttp(node):
+    stream = node.get("streamSettings", {})
+    if stream.get("method", stream.get("network")) != "xhttp": reject()
+    x = stream.get("xhttpSettings", {})
+    if not isinstance(x, dict): reject()
+    path(x.get("path"))
+    extra = x.get("extra", {})
+    if not isinstance(extra, dict): reject()
+    if "mode" in extra: reject()
+    mode = x.get("mode", "auto")
+    if mode not in {"auto", "stream-up", "packet-up"}: reject()
+    return x, extra, mode
+def no_server_secrets(value):
+    if isinstance(value, dict):
+        if set(value) & {"privateKey", "mldsa65Seed", "decryption", "keyFile"}: reject()
+        for v in value.values(): no_server_secrets(v)
+    elif isinstance(value, list):
+        for v in value: no_server_secrets(v)
+def check(node):
+    if not isinstance(node, dict): reject()
+    stream = node.get("streamSettings", {})
+    if stream.get("method", stream.get("network")) != "xhttp": return
+    x = stream.get("xhttpSettings", {})
+    extra = x.get("extra", {})
+    if not isinstance(extra, dict): reject()
+    no_server_secrets(extra)
+    if "downloadSettings" not in x and "downloadSettings" not in extra: return
+    x, extra, mode = xhttp(node)
+    if "downloadSettings" in x and "downloadSettings" in extra: reject()
+    download(extra.get("downloadSettings", x.get("downloadSettings")), x["path"])
+try:
+    operation = sys.argv[1]
+    value = load(sys.argv[2])
+    if operation == "download":
+        inbound = load(sys.argv[3])
+        if inbound.get("protocol") != "vless": reject()
+        x, extra, mode = xhttp(inbound)
+        value = download(value, x["path"])
+    elif operation == "attach":
+        if value.get("protocol") != "vless": reject()
+        x, extra, mode = xhttp(value)
+        if "downloadSettings" in x or "downloadSettings" in extra: reject()
+        d = download(load(sys.argv[3]), x["path"])
+        x["mode"] = "packet-up" if mode == "packet-up" else "stream-up"
+        x["extra"] = dict(extra, downloadSettings=d)
+        check(value)
+    elif operation == "check":
+        nodes = value if isinstance(value, list) else value.get("outbounds", [value])
+        if not isinstance(nodes, list): reject()
+        for node in nodes: check(node)
+        raise SystemExit(0)
+    else: reject()
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, UnicodeError, RecursionError):
+    print("XHTTP 下载入口无效：须为完整 TLS/REALITY 客户端配置、匹配上行路径且使用可分离模式；不允许私钥、不安全 TLS 或嵌套下载入口。", file=sys.stderr)
+    raise SystemExit(1)
+PY_XHTTP_DOWNLOAD
+}
+
+set_xhttp_split_locked() (
+    umask 077
+    local tag=${1:-} file=${2:-} work
+    require_core && safe_paths && valid_tag "$tag" || exit 1
+    work=$(mktemp -d "$STATE_DIR/xhttp-split.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
+    snapshot_bundle >"$work/before" || exit 1
+    jq -e --arg t "$tag" '[.config.inbounds[]?|select(.tag==$t)]|if length==1 then .[0] else error("missing") end' "$work/before" >"$work/node" || { fail "未找到唯一入站。"; exit 1; }
+    if [[ $file == - ]]; then
+        jq --arg t "$tag" 'del(.clients[$t].xhttp_split)' "$work/before" >"$work/after" || exit 1
+    else
+        xhttp_download_tools download "$file" "$work/node" >"$work/download" || exit 1
+        jq -e --arg t "$tag" --slurpfile n "$work/node" '.clients[$t].inbound==null or .clients[$t].inbound==$n[0]' "$work/before" >/dev/null || { fail "连接元数据已过期，请先重新确认该入站的连接信息。"; exit 1; }
+        jq -n --slurpfile n "$work/node" '{protocol:"vless",settings:{address:"127.0.0.1",port:9,id:"00000000-0000-4000-8000-000000000001",encryption:"none"},streamSettings:{method:"xhttp",security:"tls",tlsSettings:{serverName:"example.com",fingerprint:"chrome"},xhttpSettings:$n[0].streamSettings.xhttpSettings}}' >"$work/probe" || exit 1
+        xhttp_download_tools attach "$work/probe" "$work/download" >"$work/client" || exit 1
+        jq -n --slurpfile n "$work/client" '{inbounds:[],outbounds:[$n[0]]}' >"$work/check" || exit 1
+        validate_config "$work/check" || exit 1
+        jq --arg t "$tag" --slurpfile n "$work/node" --slurpfile d "$work/download" '.clients[$t]=((.clients[$t] // {})+{inbound:$n[0],xhttp_split:{format:"xray-manager-xhttp-split-v1",download:$d[0]}})' "$work/before" >"$work/after" || exit 1
+    fi
+    if [[ $(jq -Sc . "$work/before") == "$(jq -Sc . "$work/after")" ]]; then info "XHTTP 上下行分离设置未变化。"; exit 0; fi
+    snapshot_bundle >"$work/current" || exit 1
+    [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/before")" ]] || { fail "配置或连接信息已变化，未保存。"; exit 1; }
+    apply_bundle "$work/after" || exit 1
+    info "客户端上下行分离设置已保存；服务端未重启。请重新导出并导入客户端。"
+)
+
+xhttp_split_wizard_locked() (
+    umask 077
+    local tag=${1:-} choice file work address port=443 security sni fp=chrome alpn=h2 public="" sid="" verify="" host="" path
+    require_core && safe_paths || exit 1
+    [[ -n $tag ]] || { select_inbound tag "XHTTP 上下行分离" || exit 1; [[ -n $tag ]] || exit 0; }
+    valid_tag "$tag" || exit 1
+    printf '\nXHTTP 上下行分离\n  1. 填写下载入口\n  2. 从 downloadSettings JSON 文件导入\n  3. 关闭上下行分离\n  0. 返回\n'
+    prompt choice "请选择" 0 || exit 1
+    case "$choice" in
+      0) exit 0;;
+      3) confirm "关闭此入站的客户端上下行分离？" && set_xhttp_split_locked "$tag" -; exit $?;;
+      2) prompt file "downloadSettings JSON 文件路径" && set_xhttp_split_locked "$tag" "$file"; exit $?;;
+      1) ;; *) fail "无效选项。"; exit 1;;
+    esac
+    work=$(mktemp -d "$STATE_DIR/xhttp-wizard.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
+    config_jq -e --arg t "$tag" '[.inbounds[]?|select(.tag==$t)]|if length==1 then .[0] else error("missing") end' >"$work/node" || exit 1
+    jq -e '.protocol=="vless" and (.streamSettings.method // .streamSettings.network)=="xhttp"' "$work/node" >/dev/null || { fail "请选择 VLESS XHTTP 入站。"; exit 1; }
+    path=$(jq -r '.streamSettings.xhttpSettings.path // ""' "$work/node")
+    info "下载入口须已转发至同一个 XHTTP 入站，路径自动沿用；客户端必须支持 downloadSettings。"
+    prompt address "下载入口 IP/域名" && prompt port "下载入口端口" 443 || exit 1
+    valid_host "$address" && valid_port "$port" || { fail "下载地址或端口无效。"; exit 1; }
+    prompt choice "下载安全类型：1.TLS  2.REALITY" 1 || exit 1
+    case "$choice" in 1) security=tls;;2) security=reality;;*) exit 1;;esac
+    prompt sni "下载入口 SNI" "$address" && prompt fp "下载入口 TLS 指纹" chrome && prompt host "HTTP Host（回车跟随下载入口）" "" || exit 1
+    if [[ $security == tls ]]; then prompt alpn "下载 ALPN（h2、h3 或 http/1.1）" h2 || exit 1
+    else prompt_secret public "下载入口 REALITY 客户端公钥" && prompt_secret sid "下载入口 shortId（可空）" && prompt_secret verify "下载入口 ML-DSA-65 校验值（可空）" || exit 1; fi
+    jq -n --arg address "$address" --argjson port "$port" --arg security "$security" --arg sni "$sni" --arg fp "$fp" --arg alpn "$alpn" --arg public "$public" --arg sid "$sid" --arg verify "$verify" --arg host "$host" --arg path "$path" '{address:$address,port:$port,network:"xhttp",security:$security,xhttpSettings:({path:$path,mode:"auto"}+(if $host!="" then {host:$host} else {} end))} + (if $security=="tls" then {tlsSettings:{serverName:$sni,fingerprint:$fp,alpn:[$alpn]}} else {realitySettings:({serverName:$sni,fingerprint:$fp,password:$public,shortId:$sid}+(if $verify!="" then {mldsa65Verify:$verify} else {} end))} end)' >"$work/download" || exit 1
+    confirm "保存此入站的客户端上下行分离设置（不重启服务端）？" || exit 0
+    set_xhttp_split_locked "$tag" "$work/download"
+)
+
 generate_client() {
     local parameters
     validate_inbound_users "$1" >/dev/null 2>&1 || return 1
@@ -2055,6 +2230,7 @@ PY_XRAY_CLIENT
 }
 
 client_link() {
+    xhttp_download_tools check "$1" >/dev/null || return 1
     python3 - "$@" 2>/dev/null <<'PY_XRAY_LINK'
 import base64, json, sys
 from urllib.parse import quote
@@ -2094,6 +2270,10 @@ def transport(q):
     elif method == "xhttp":
         x = stream.get("xhttpSettings", {})
         q += "&path=" + quote(x.get("path", ""), safe="") + "&mode=" + quote(x.get("mode", "auto"), safe="")
+        if x.get("host"): q += "&host=" + quote(x["host"], safe="")
+        extra = dict(x.get("extra", {}))
+        if "downloadSettings" in x: extra["downloadSettings"] = x["downloadSettings"]
+        if extra: q += "&extra=" + quote(json.dumps(extra, separators=(",", ":")), safe="")
     return q
 if protocol == "vless":
     q = common("encryption=" + quote(settings.get("encryption", "none"), safe="") + "&type=" + {"raw":"tcp","websocket":"ws","grpc":"grpc","xhttp":"xhttp"}.get(method, method) + "&security=" + security)
@@ -2367,15 +2547,24 @@ edit_wizard_locked(){ local selected=${1:-}; if [[ -z $selected ]]; then select_
 
 show_client() (
     umask 077
-    local tag=$1 server=${2:-} mode=${3:-full} user_index=${4:-} work public_key="" count index label name
+    local tag=$1 server=${2:-} mode=${3:-full} user_index=${4:-} work public_key="" count index label name split=0
     local -a indices=()
     require_core && valid_tag "$tag" || exit 1
     case "$mode" in full|json-only|link-only) ;; *) exit 1;; esac
     work=$(mktemp -d "$STATE_DIR/client.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
     config_jq -e --arg t "$tag" '[.inbounds[]?|select(.tag==$t)]|if length==1 then .[0] else error("missing") end' >"$work/node" || exit 1
+    [[ ! -L $CLIENT_DIR/$tag.json ]] || { fail "拒绝符号链接客户端元数据。"; exit 1; }
     if [[ -f $CLIENT_DIR/$tag.json && ! -L $CLIENT_DIR/$tag.json && $(jq -Sc .inbound "$CLIENT_DIR/$tag.json") == "$(jq -Sc . "$work/node")" ]]; then
         [[ -n $server ]] || server=$(jq -r '.server // ""' "$CLIENT_DIR/$tag.json")
         public_key=$(jq -r '.public_key // ""' "$CLIENT_DIR/$tag.json")
+        if jq -e 'has("xhttp_split")' "$CLIENT_DIR/$tag.json" >/dev/null; then
+            jq -e '.xhttp_split.format=="xray-manager-xhttp-split-v1"' "$CLIENT_DIR/$tag.json" >/dev/null || { fail "XHTTP 分离元数据格式无效。"; exit 1; }
+            jq '.xhttp_split.download' "$CLIENT_DIR/$tag.json" >"$work/download" || exit 1
+            xhttp_download_tools download "$work/download" "$work/node" >"$work/validated-download" || exit 1
+            split=1
+        fi
+    elif [[ -f $CLIENT_DIR/$tag.json ]] && jq -e 'has("xhttp_split")' "$CLIENT_DIR/$tag.json" >/dev/null 2>&1; then
+        fail "XHTTP 上下行分离信息已过期，请重新设置或关闭后再导出。"; exit 1
     fi
     [[ -n $server ]] || server=$(read_default_server) || exit 1
     if [[ -z $server ]]; then
@@ -2394,6 +2583,9 @@ show_client() (
     fi
     for index in "${indices[@]}"; do
         generate_client "$work/node" "$server" "$public_key" "$index" >"$work/outbound" || { fail "客户端配置无法安全导出，请核对模板与 REALITY 公钥。"; exit 1; }
+        if [[ $split -eq 1 ]]; then
+            xhttp_download_tools attach "$work/outbound" "$work/validated-download" >"$work/split-outbound" && mv "$work/split-outbound" "$work/outbound" || exit 1
+        fi
         label=$tag
         if [[ $count -gt 1 ]]; then
             name=$(jq -r --argjson i "$((index-1))" '(.settings.users // .settings.clients)[$i].email // ""' "$work/node") || exit 1
@@ -2783,7 +2975,7 @@ def parse_vless(raw: str, parts, name: str) -> dict:
     query = query_values(
         parts,
         {"encryption", "type", "security", "flow", "fp", "sni", "pbk", "sid", "pqv", "alpn", "support-x25519mlkem768",
-         "path", "host", "serviceName", "mode"},
+         "path", "host", "serviceName", "mode", "extra"},
     )
     encryption = query.get("encryption", "none")
     if "support-x25519mlkem768" in query:
@@ -2820,11 +3012,17 @@ def parse_vless(raw: str, parts, name: str) -> dict:
         if not query.get("path", "/").startswith("/") or query.get("mode", "auto") not in {"auto","packet-up","stream-up","stream-one"}: fail()
         result["transport"] = {"type":"xhttp","path":query.get("path","/"),"mode":query.get("mode","auto")}
         if query.get("host"): result["transport"]["host"]=query["host"]
+        if "extra" in query:
+            if len(query["extra"].encode("utf-8")) > 65536: fail()
+            extra = json.loads(query["extra"])
+            if not isinstance(extra, dict): fail()
+            result["transport"]["extra"] = extra
     elif transport == "grpc":
         service = query.get("serviceName")
         if not service or query.get("mode", "gun") != "gun":
             fail()
         result["transport"] = {"type": "grpc", "service_name": service}
+    if "extra" in query and transport != "xhttp": fail()
     for key in ("path", "host", "serviceName", "mode"):
         if key in query and ((transport == "ws" and key not in {"path", "host"}) or
                              (transport == "grpc" and key not in {"serviceName", "mode"}) or
@@ -3120,7 +3318,7 @@ def main() -> int:
             fail()
         print(json.dumps([parse_line(line) for line in lines], ensure_ascii=False, separators=(",", ":")))
         return 0
-    except (OSError, ParseError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ParseError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
         print("分享链接解析失败。", file=sys.stderr)
         return 1
 
@@ -3136,7 +3334,7 @@ parse_outbound_links() (
     local work
     work=$(mktemp -d "$STATE_DIR/link-parse.XXXXXX") || exit 1; trap 'rm -rf -- "$work"' EXIT
     decode_standard_links "$1" >"$work/nodes" || exit 1
-    python3 - "$work/nodes" <<'PY_XR_LINK_CONVERT'
+    if ! python3 - "$work/nodes" >"$work/outbounds" <<'PY_XR_LINK_CONVERT'
 import json,sys
 from pathlib import Path
 try:
@@ -3177,6 +3375,9 @@ except (ValueError,KeyError,TypeError):
     print('分享链接超出当前 Xray 安全导入范围，请改用原生 outbound JSON。',file=sys.stderr)
     raise SystemExit(1)
 PY_XR_LINK_CONVERT
+    then exit 1; fi
+    xhttp_download_tools check "$work/outbounds" >/dev/null || exit 1
+    cat "$work/outbounds"
 )
 normalize_outbound_import() (
     umask 077
@@ -3185,8 +3386,10 @@ normalize_outbound_import() (
     work=$(mktemp -d "$STATE_DIR/out-import.XXXXXX") || exit 1;trap 'rm -rf -- "$work"' EXIT
     cp -- "$file" "$work/source" || exit 1
     if json_query "$work/source" . >"$work/json" 2>/dev/null; then
-        jq -e 'if type=="array" then . elif type=="object" and has("protocol") then [.] elif type=="object" and keys==["outbounds"] then .outbounds else error("not outbound JSON") end | select(type=="array" and length>0)' "$work/json" 2>/dev/null || { fail "请提供原生 Xray outbound 对象、数组或仅包含 outbounds 的 JSON。"; exit 1; }
-    else parse_outbound_links "$work/source"; fi
+        jq -e 'if type=="array" then . elif type=="object" and has("protocol") then [.] elif type=="object" and keys==["outbounds"] then .outbounds else error("not outbound JSON") end | select(type=="array" and length>0)' "$work/json" >"$work/nodes" 2>/dev/null || { fail "请提供原生 Xray outbound 对象、数组或仅包含 outbounds 的 JSON。"; exit 1; }
+    else parse_outbound_links "$work/source" >"$work/nodes" || exit 1; fi
+    xhttp_download_tools check "$work/nodes" >/dev/null || exit 1
+    cat "$work/nodes"
 )
 add_outbounds_file_locked() (
     umask 077
@@ -3353,6 +3556,7 @@ Xray 中文终端管理面板
   xray add-file FILE | import FILE          原生 Xray JSON/JSONC 导入
   xray info | validate | format-config      查看/检查/保留注释格式化
   xray client TAG [SERVER] [INDEX|all]       客户端 JSON 与完整链接
+  xray xhttp-split [TAG] [FILE|-]           配置客户端上下行分离；FILE 为 downloadSettings，- 关闭
   xray users [TAG]                          多用户管理（非交互只读）
   xray user-add [TAG] | user-delete [TAG]    交互确认变更用户
   xray server [IP/DOMAIN|-]                 默认公网连接地址
@@ -3380,12 +3584,12 @@ menu(){
     while true;do
       printf '\n========== Xray 管理面板 v%s ==========\n' "$XR_MANAGER_VERSION"
       show_status
-      printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray 核心\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / Hy2 QUIC）\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n  0. 退出\n'
-      read -r -p "请输入选项 [0-20]: " choice || return 0
+      printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray 核心\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / Hy2 QUIC）\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n 21. XHTTP 上下行分离（客户端）\n  0. 退出\n'
+      read -r -p "请输入选项 [0-21]: " choice || return 0
       case "$choice" in
         0)return 0;;1)install_core;;2)uninstall_core;;3)with_lock service_action start;;4)autostart_menu;continue;;5)with_lock service_action restart;;6)with_lock service_action disable;;7)show_logs;;
         8)with_lock add_wizard_locked;;9)show_config;continue;;10)update_core;;11)with_lock edit_wizard_locked;;12)with_lock delete_inbound;;13)management_menu;continue;;
-        14)if update_panel;then exec bash "$WRAPPER" menu;fi;;15)bbr_menu;continue;;16)disable_bbr;;17)open_acme_menu;;18)users_menu;continue;;19)outbound_preference_menu;continue;;20)outbounds_menu;continue;;*)warn "请输入 0–20。";;
+        14)if update_panel;then exec bash "$WRAPPER" menu;fi;;15)bbr_menu;continue;;16)disable_bbr;;17)open_acme_menu;;18)users_menu;continue;;19)outbound_preference_menu;continue;;20)outbounds_menu;continue;;21)with_lock xhttp_split_wizard_locked;;*)warn "请输入 0–21。";;
       esac || true
       read -r -p "按回车键返回菜单..." selected || return 0
     done
@@ -3397,7 +3601,7 @@ main(){
     (( BASH_VERSINFO[0]>=4 )) || { fail "需要 Bash 4+。";return 1; }
     local command=${1:-menu};[[ $# -eq 0 ]] || shift
     case "$command" in help|-h|--help)usage;return;;core|bin)core_passthrough "$@";return;;
-      menu|setup|install|update|update-panel|uninstall|start|restart|stop|enable|disable-autostart|disable|status|log|logs|add|edit|delete|add-file|import|info|validate|format-config|client|users|user-add|user-delete|server|backup|backups|restore|export|diagnose|outbounds|outbound-add|outbound-bind|outbound-delete|ip-preference|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-disable|quic-bbr-status|acme|remove-panel);;
+      menu|setup|install|update|update-panel|uninstall|start|restart|stop|enable|disable-autostart|disable|status|log|logs|add|edit|delete|add-file|import|info|validate|format-config|client|xhttp-split|users|user-add|user-delete|server|backup|backups|restore|export|diagnose|outbounds|outbound-add|outbound-bind|outbound-delete|ip-preference|bbr|bbr-disable|bbr-status|quic-bbr|quic-bbr-disable|quic-bbr-status|acme|remove-panel);;
       *)core_passthrough "$command" "$@";return;;esac
     require_root && require_systemd && safe_paths || return
     if ! is_managed;then case "$command" in menu|setup|install) ;;*)fail "请先 sudo bash xray-manager.sh setup 安装独立面板。";return 1;;esac;fi
@@ -3410,6 +3614,7 @@ main(){
       add-file)[[ $# -eq 1 ]] && with_lock add_inbound_file "$1";;import)[[ $# -eq 1 ]] && confirm "替换完整 Xray 配置？" && with_lock import_config "$1";;
       info)show_config;;validate)require_core && validate_config "$CONFIG_FILE";;format-config)format_config;;
       client)[[ $# -ge 1 && $# -le 3 ]] && show_client "$1" "${2:-}" full "${3:-}";;users)users_menu "$@";;user-add)with_lock change_inbound_user add "$@";;user-delete)with_lock change_inbound_user delete "$@";;
+      xhttp-split)if [[ $# -eq 2 ]]; then with_lock set_xhttp_split_locked "$1" "$2"; elif [[ $# -le 1 ]]; then with_lock xhttp_split_wizard_locked "$@"; else return 1; fi;;
       server)with_lock set_default_server "$@";;backup)with_lock create_backup;;backups)list_backups;;restore)[[ $# -eq 1 ]] && with_lock restore_backup "$1";;
       export)[[ $# -eq 2 ]] && with_lock exports "$1" "$2";;diagnose)diagnose;;
       outbounds)outbounds_menu;;outbound-add)[[ $# -eq 1 ]] && with_lock add_outbounds_file_locked "$1";;outbound-bind)[[ $# -eq 2 ]] && with_lock bind_outbound_locked "$1" "$2";;outbound-delete)[[ $# -eq 1 ]] && with_lock delete_outbound_locked "$1";;
