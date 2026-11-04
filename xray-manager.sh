@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.1.0"
+XR_MANAGER_VERSION="1.1.1"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2034,6 +2034,7 @@ def common(q):
         q += "&fp=" + quote(reality.get("fingerprint", "chrome"), safe="")
         q += "&pbk=" + quote(reality.get("password", reality.get("publicKey", "")), safe="")
         q += "&sid=" + quote(reality.get("shortId", ""), safe="")
+        q += "&support-x25519mlkem768=true"
         if reality.get("mldsa65Verify"): q += "&pqv=" + quote(reality["mldsa65Verify"], safe="")
     elif security == "tls":
         tls = stream.get("tlsSettings", {})
@@ -2728,10 +2729,12 @@ def parse_vless(raw: str, parts, name: str) -> dict:
     host, port = endpoint(parts)
     query = query_values(
         parts,
-        {"encryption", "type", "security", "flow", "fp", "sni", "pbk", "sid", "pqv", "alpn",
+        {"encryption", "type", "security", "flow", "fp", "sni", "pbk", "sid", "pqv", "alpn", "support-x25519mlkem768",
          "path", "host", "serviceName", "mode"},
     )
     encryption = query.get("encryption", "none")
+    if "support-x25519mlkem768" in query:
+        if query.get("security") != "reality" or query["support-x25519mlkem768"] != "true": fail()
     def key_bytes(value, size):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", value): fail()
         data = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)

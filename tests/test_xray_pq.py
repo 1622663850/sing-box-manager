@@ -417,6 +417,115 @@ class XrayPostQuantumTest(fixture.XrayFixture):
         self.assertNotIn(MLKEM_SEED, json.dumps(parsed))
         self.assertNotIn(MLDSA_SEED, json.dumps(parsed))
 
+    def test_reality_links_advertise_mihomo_hybrid_support_and_keep_pq_on_roundtrip(self) -> None:
+        for suffix, mldsa_seed in (("no-mldsa", ""), ("mldsa", MLDSA_SEED)):
+            with self.subTest(mode=suffix):
+                inbound = self.generate(
+                    "vless-reality", decryption=DECRYPTION, mldsa_seed=mldsa_seed
+                )
+                source = self.write("mihomo-" + suffix + "-inbound.json", inbound)
+                outbound = json.loads(
+                    self.shell(
+                        'generate_client "$@"', str(source), "example.com", PUBLIC, "1", check=True
+                    ).stdout
+                )
+                outbound_path = self.write("mihomo-" + suffix + "-outbound.json", outbound)
+                link = self.shell(
+                    'client_link "$@"', str(outbound_path), "mihomo-" + suffix, check=True
+                ).stdout.strip()
+                query = parse_qs(urlsplit(link).query, keep_blank_values=True)
+                self.assertEqual(query["support-x25519mlkem768"], ["true"])
+                self.assertEqual(query["encryption"], [outbound["settings"]["encryption"]])
+                reality = outbound["streamSettings"]["realitySettings"]
+                if mldsa_seed:
+                    self.assertEqual(query["pqv"], [reality["mldsa65Verify"]])
+                else:
+                    self.assertNotIn("pqv", query)
+                self.assertNotIn(MLKEM_SEED, link)
+                self.assertNotIn(MLDSA_SEED, link)
+
+                link_file = self.root / ("mihomo-" + suffix + ".links")
+                link_file.write_text(link + "\n", encoding="utf-8")
+                parsed = json.loads(
+                    self.shell('parse_outbound_links "$1"', str(link_file), check=True).stdout
+                )[0]
+                self.assertEqual(parsed["settings"], outbound["settings"])
+                parsed_reality = parsed["streamSettings"]["realitySettings"]
+                self.assertEqual(
+                    parsed_reality.get("mldsa65Verify"), reality.get("mldsa65Verify")
+                )
+
+                # The flag is an optional compatibility extension; old links
+                # without it must remain importable and preserve PQ fields.
+                legacy = link.replace("&support-x25519mlkem768=true", "", 1)
+                link_file.write_text(legacy + "\n", encoding="utf-8")
+                legacy_parsed = json.loads(
+                    self.shell('parse_outbound_links "$1"', str(link_file), check=True).stdout
+                )[0]
+                self.assertEqual(legacy_parsed["settings"], outbound["settings"])
+                self.assertEqual(
+                    legacy_parsed["streamSettings"]["realitySettings"].get("mldsa65Verify"),
+                    reality.get("mldsa65Verify"),
+                )
+
+        tls_inbound = self.generate("vless-tcp-tls", decryption="none")
+        tls_source = self.write("mihomo-tls-inbound.json", tls_inbound)
+        tls_outbound = json.loads(
+            self.shell(
+                'generate_client "$@"', str(tls_source), "example.com", PUBLIC, "1", check=True
+            ).stdout
+        )
+        tls_link = self.shell(
+            'client_link "$@"', str(self.write("mihomo-tls-outbound.json", tls_outbound)), "tls-node", check=True
+        ).stdout.strip()
+        self.assertNotIn("support-x25519mlkem768", tls_link)
+
+    def test_reality_support_flag_rejects_invalid_values_and_non_reality_use(self) -> None:
+        inbound = self.generate(
+            "vless-reality", decryption=DECRYPTION, mldsa_seed=MLDSA_SEED
+        )
+        source = self.write("mihomo-invalid-inbound.json", inbound)
+        outbound = json.loads(
+            self.shell(
+                'generate_client "$@"', str(source), "example.com", PUBLIC, "1", check=True
+            ).stdout
+        )
+        link = self.shell(
+            'client_link "$@"', str(self.write("mihomo-invalid-outbound.json", outbound)), "invalid-pq", check=True
+        ).stdout.strip()
+        for index, value in enumerate(("false", "1", "")):
+            with self.subTest(value=value or "empty"):
+                candidate = link.replace(
+                    "support-x25519mlkem768=true", "support-x25519mlkem768=" + value, 1
+                )
+                path = self.root / ("mihomo-invalid-" + str(index))
+                path.write_text(candidate + "\n", encoding="utf-8")
+                result = self.shell('parse_outbound_links "$1"', str(path))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn(MLKEM_SEED, result.stdout + result.stderr)
+                self.assertNotIn(MLDSA_SEED, result.stdout + result.stderr)
+
+        tls_inbound = self.generate("vless-tcp-tls", decryption="none")
+        tls_source = self.write("mihomo-non-reality-inbound.json", tls_inbound)
+        tls_outbound = json.loads(
+            self.shell(
+                'generate_client "$@"', str(tls_source), "example.com", PUBLIC, "1", check=True
+            ).stdout
+        )
+        tls_link = self.shell(
+            'client_link "$@"', str(self.write("mihomo-non-reality-outbound.json", tls_outbound)), "tls-pq", check=True
+        ).stdout.strip()
+        self.assertNotIn("support-x25519mlkem768", tls_link)
+        non_reality = tls_link.replace(
+            "security=tls", "security=tls&support-x25519mlkem768=true", 1
+        )
+        path = self.root / "mihomo-non-reality-invalid"
+        path.write_text(non_reality + "\n", encoding="utf-8")
+        result = self.shell('parse_outbound_links "$1"', str(path))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(MLKEM_SEED, result.stdout + result.stderr)
+        self.assertNotIn(MLDSA_SEED, result.stdout + result.stderr)
+
     def test_none_client_derivation_does_not_call_core_and_keeps_old_output(self) -> None:
         inbound = self.generate("vless-tcp", decryption="none")
         source = self.write("none-pq-inbound.json", inbound)

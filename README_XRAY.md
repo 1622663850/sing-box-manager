@@ -53,6 +53,14 @@ VLESS、VMess、Trojan、Hy2 可按用户添加/删除独立认证并导出；SS
 
 参数依据：[官方 VLESS 文档](https://xtls.github.io/config/outbounds/vless.html)、[REALITY 文档](https://xtls.github.io/config/transports/reality.html)、[官方分享链接标准](https://github.com/XTLS/Xray-core/discussions/716)。实际加密转发及错误密钥拒绝验证见 `tests/smoke_xray_pq.py`。
 
+### Clash Verge / Mihomo 的 REALITY 兼容
+
+面板 **v1.1.1** 起，REALITY 分享链接附带 Mihomo 支持的 `support-x25519mlkem768=true` 参数。Xray v26.10.31 使用的 REALITY 服务端要求客户端提供这组混合密钥交换；Mihomo v1.19.33 默认关闭，原链接导入后可能握手失败并显示 Timeout。已有节点无需换密钥或重启，重新导出并导入链接即可。原生 Xray 导入只接受此参数为 `true`，不把它写入 Xray JSON；旧的无此参数链接仍可导入。
+
+Mihomo v1.19.33 支持 VLESS Encryption，但尚未实现 REALITY **ML-DSA-65 验签**，会忽略链接中的 `pqv`。开启混合密钥交换能够连接，**不表示客户端验证了 ML-DSA 签名**；要求两项功能都在客户端实际生效时，使用支持完整 `encryption` 和 `mldsa65Verify` 的 Xray 客户端。面板保留完整 `pqv`，不关闭服务器的任何后量子设置。
+
+实现依据：[Mihomo 默认开关及握手处理](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/component/tls/reality.go)、[Mihomo 链接参数解析](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/common/convert/v.go)、[固定 REALITY 服务端握手要求](https://github.com/XTLS/REALITY/blob/83f621788ca8/tls.go#L215)。
+
 ## 出站、IPv6 与 BBR
 
 出站管理支持协议向导、粘贴分享链接、原生 Xray outbound JSON/JSONC 与每行一个链接的文本文件。支持单对象、数组、仅包含 outbounds 的对象；不会把 sing-box JSON 当成 Xray 格式。新增只追加，不改变路由；绑定入站时增加优先 `inboundTag → outboundTag` 规则，取消只移除面板登记的原样规则；外部改过/重复的规则拒绝自动处理，路由/代理引用未解除时禁止删除出站。完整 JSON 粘贴不回显，以单独一行 `END` 结束。
