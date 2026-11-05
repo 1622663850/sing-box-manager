@@ -295,7 +295,7 @@ sudo sing-box core run -c /root/another-config.json
 
 也可执行 `sudo sing-box uninstall --purge` 直接进入彻底卸载确认。界面先列出删除路径，只有输入大写 **DELETE** 才执行；其余输入取消。此操作不可撤销，需要保留的节点或备份请先另行导出至删除清单之外。
 
-彻底卸载按用户选择保留整机共享的 **TCP BBR**：当前内核参数和 `/etc/sysctl.d/99-sing-box-manager-bbr.conf` 保持原样；若有有效的开启前恢复记录，仅将该记录及对应 BBR 备份保存至 `/var/lib/sing-box-manager-bbr-recovery-时间-随机值/`，目录 `700`、文件 `600`，不复制节点配置或其他面板备份。若以后需要恢复，重新安装面板，将该目录内的 `bbr-active` 和 `backups` 中的对应备份复制回 `/var/lib/sing-box-manager`，再执行 `sudo sing-box bbr-disable`。损坏或缺失的已登记 BBR 恢复资料会阻止彻底卸载，以免丢失恢复依据。
+彻底卸载按用户选择保留整机共享的 **TCP BBR**：当前内核参数和 `/etc/sysctl.d/99-sing-box-manager-bbr.conf` 保持原样；若有有效的开启前恢复记录，仅将该记录及对应 BBR 备份保存至 `/var/lib/sing-box-manager-bbr-recovery-时间-随机值/`，目录 `700`、文件 `600`，不复制节点配置或其他面板备份。若以后需要恢复，重新安装面板，将该目录内的 `bbr-active` 和 `backups` 中的对应备份复制回 `/var/lib/sing-box-manager`，再执行 `sudo sing-box bbr-disable`。恢复记录缺失、损坏或另存失败时，仅提示并继续彻底卸载，不会猜测原算法或修改当前系统 BBR 设置；未能另存的恢复资料会随面板状态目录删除。
 
 ACME 菜单、目录外的证书与私钥、Xray、系统日志及其他程序保留；放在 `/etc/sing-box` 内的文件属于上述删除范围。卸载拒绝路径被改到其他位置、符号链接或子挂载点、非本面板的入口与 unit。无法停止服务时不删除文件。
 

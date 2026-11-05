@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.26.0"
+SB_MANAGER_VERSION="1.26.1"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1730,25 +1730,38 @@ except (ValueError, OSError, UnicodeError):
 PY_PURGE_PATHS
 }
 
+archive_bbr_recovery() (
+    umask 077
+    local bbr_backup=$1 bbr_archive=""
+    # Archive only validated recovery material; never restore shared kernel settings during purge.
+    bbr_archive=$(mktemp -d "${STATE_DIR%/*}/sing-box-manager-bbr-recovery-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+    install -d -m 700 "$bbr_archive/backups" "$bbr_archive/backups/${bbr_backup##*/}" &&
+        install -m 600 "$BBR_RESTORE_FILE" "$bbr_archive/bbr-active" &&
+        install -m 600 /dev/null "$bbr_archive/backups/${bbr_backup##*/}/runtime.json" &&
+        jq '{tcp_congestion_control,default_qdisc,config_existed,config_mode}' "$bbr_backup/runtime.json" \
+            >"$bbr_archive/backups/${bbr_backup##*/}/runtime.json" || return 1
+    if [[ $(jq -r .config_existed "$bbr_archive/backups/${bbr_backup##*/}/runtime.json") == true ]]; then
+        [[ ! -L $bbr_backup/sysctl.conf ]] &&
+            install -m 600 "$bbr_backup/sysctl.conf" "$bbr_archive/backups/${bbr_backup##*/}/sysctl.conf" || return 1
+    fi
+    printf '仅保存共享 TCP BBR 的开启前恢复资料，不包含节点配置。\n如需恢复，重新安装面板后，将 bbr-active 和 backups 中的该项备份复制回 %s，再执行 sing-box bbr-disable。\n' "$STATE_DIR" >"$bbr_archive/README.txt" || return 1
+    chmod 600 "$bbr_archive/README.txt" || return 1
+    printf '%s\n' "$bbr_archive"
+)
+
 purge_install_locked() {
     local source=${1:-} bbr_backup="" bbr_archive=""
     [[ $# -le 1 ]] || return 1
     is_managed && validate_purge_paths "$source" && check_conflicts || return 1
-    if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then bbr_backup=$(bbr_restore_backup) || return 1; fi
-    # Keep recovery data for a shared kernel setting, never node credentials or all panel backups.
-    if [[ -n $bbr_backup ]]; then
-        bbr_archive=$(mktemp -d "${STATE_DIR%/*}/sing-box-manager-bbr-recovery-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
-        install -d -m 700 "$bbr_archive/backups" "$bbr_archive/backups/${bbr_backup##*/}" &&
-            install -m 600 "$BBR_RESTORE_FILE" "$bbr_archive/bbr-active" &&
-            install -m 600 /dev/null "$bbr_archive/backups/${bbr_backup##*/}/runtime.json" &&
-            jq '{tcp_congestion_control,default_qdisc,config_existed,config_mode}' "$bbr_backup/runtime.json" \
-                >"$bbr_archive/backups/${bbr_backup##*/}/runtime.json" || return 1
-        if [[ $(jq -r .config_existed "$bbr_archive/backups/${bbr_backup##*/}/runtime.json") == true ]]; then
-            [[ ! -L $bbr_backup/sysctl.conf ]] &&
-                install -m 600 "$bbr_backup/sysctl.conf" "$bbr_archive/backups/${bbr_backup##*/}/sysctl.conf" || return 1
+    if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
+        if bbr_backup=$(bbr_restore_backup 2>/dev/null); then
+            if ! bbr_archive=$(archive_bbr_recovery "$bbr_backup" 2>/dev/null); then
+                bbr_archive=""
+                warn "BBR 恢复资料另存失败；继续卸载，当前 TCP BBR 参数及系统配置保持不变，恢复资料可能丢失。"
+            fi
+        else
+            warn "BBR 恢复记录缺失或无效；跳过恢复资料另存并继续卸载，当前 TCP BBR 参数及系统配置保持不变。"
         fi
-        printf '仅保存共享 TCP BBR 的开启前恢复资料，不包含节点配置。\n如需恢复，重新安装面板后，将 bbr-active 和 backups 中的该项备份复制回 %s，再执行 sing-box bbr-disable。\n' "$STATE_DIR" >"$bbr_archive/README.txt" || return 1
-        chmod 600 "$bbr_archive/README.txt" || return 1
     fi
     uninstall_core_locked purge || return 1
     validate_purge_paths "$source" || return 1
@@ -1770,7 +1783,7 @@ purge_uninstall() {
     [[ $source != 0 ]] || return 0
     validate_purge_paths "$source" && check_conflicts || return 1
     if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
-        info "系统 TCP BBR 保留；现有恢复资料会单独保存到 /var/lib/sing-box-manager-bbr-recovery-*。"
+        info "系统 TCP BBR 保留；有效恢复资料会尝试另存到 /var/lib/sing-box-manager-bbr-recovery-*；资料缺失、损坏或另存失败不阻止卸载。"
     fi
     printf '\n将永久删除以下路径（含全部节点及面板备份）：\n  %s\n  %s\n  %s\n  %s\n  %s\n' "$CORE_BIN" "$LIB_DIR" "$WRAPPER" "$CONFIG_DIR" "$STATE_DIR"
     printf '  %s\n' "$UNIT_FILE"

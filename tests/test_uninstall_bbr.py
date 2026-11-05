@@ -200,53 +200,72 @@ class UninstallBbrTest(unittest.TestCase):
             tuple(kernel_before[key] for key in ("tcp_congestion_control", "default_qdisc")),
         )
 
-    def test_missing_or_corrupt_bbr_record_refuses_before_stopping_service(self) -> None:
+    def _assert_purge_preserves_bbr_without_recovery(self, body: str = "purge_install_locked") -> None:
         self.state(active=True, enabled=True)
         self.read_bbr_state(tcp_congestion_control="bbr", default_qdisc="fq")
         self.bbr_file.write_bytes(self._desired_conf())
-        before = self._panel_snapshot()
-        result = self.shell("purge_install_locked")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self._panel_snapshot(), before)
-        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "bbr")
-        self.assertFalse(any(any(action in call for action in ("disable", "stop")) for call in fixture.ManagerTest.calls(self, self.system_log)))
+        before_bbr = self.bbr_file.read_bytes()
+        before_state = self.bbr_state.read_bytes()
+        result = self.shell(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[提示]", result.stdout + result.stderr)
+        self.assertNotIn("[错误]", result.stdout + result.stderr)
+        self._assert_panel_removed()
+        self.assertEqual(self.bbr_file.read_bytes(), before_bbr)
+        self.assertEqual(self.bbr_state.read_bytes(), before_state)
+        self.assertFalse(self.state()["active"])
+        self.assertFalse(self.state()["enabled"])
 
+    def test_missing_bbr_record_warns_and_allows_purge(self) -> None:
+        self._assert_purge_preserves_bbr_without_recovery()
+        self.assertEqual(self._archive_dirs(), [])
+
+    def test_corrupt_bbr_record_warns_and_allows_purge(self) -> None:
         self.restore_file.write_text("../outside\n", encoding="utf-8")
-        before = self._panel_snapshot()
-        result = self.shell("purge_install_locked")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self._panel_snapshot(), before)
-        self.assertFalse(any(any(action in call for action in ("disable", "stop")) for call in fixture.ManagerTest.calls(self, self.system_log)))
+        outside = self.root / "outside"
+        outside.write_text("foreign recovery data\n", encoding="utf-8")
+        self._assert_purge_preserves_bbr_without_recovery()
+        self.assertEqual(outside.read_text(), "foreign recovery data\n")
+        self.assertEqual(self._archive_dirs(), [])
 
-    def test_bbr_archive_copy_failure_keeps_original_panel_and_bbr_inputs(self) -> None:
+    def test_missing_registered_bbr_backup_warns_and_allows_purge(self) -> None:
         self._enable_bbr()
-        before = self._panel_snapshot()
-        bbr_file_before = self.bbr_file.read_bytes()
-        restore_before = self.restore_file.read_bytes()
-        body = r'''
+        reference = self.restore_file.read_text().strip()
+        (self.state_dir / "backups" / reference / "runtime.json").unlink()
+        self._assert_purge_preserves_bbr_without_recovery()
+        self.assertEqual(self._archive_dirs(), [])
+
+    def test_corrupt_registered_bbr_backup_warns_and_allows_purge(self) -> None:
+        self._enable_bbr()
+        reference = self.restore_file.read_text().strip()
+        (self.state_dir / "backups" / reference / "runtime.json").write_text("invalid\n")
+        self._assert_purge_preserves_bbr_without_recovery()
+        self.assertEqual(self._archive_dirs(), [])
+
+    def test_bbr_archive_copy_failure_warns_and_allows_purge(self) -> None:
+        self._enable_bbr()
+        self._assert_purge_preserves_bbr_without_recovery(r'''
 install() {
     for argument in "$@"; do
         [[ $argument == *sing-box-manager-bbr-recovery-* ]] && return 1
     done
     command install "$@"
 }
-cp() {
+purge_install_locked
+''')
+
+    def test_bbr_archive_creation_failure_warns_and_allows_purge(self) -> None:
+        self._enable_bbr()
+        self._assert_purge_preserves_bbr_without_recovery(r'''
+mktemp() {
     for argument in "$@"; do
         [[ $argument == *sing-box-manager-bbr-recovery-* ]] && return 1
     done
-    command cp "$@"
+    command mktemp "$@"
 }
 purge_install_locked
-'''
-        result = self.shell(body)
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self._panel_snapshot(), before)
-        self.assertEqual(self.bbr_file.read_bytes(), bbr_file_before)
-        self.assertEqual(self.restore_file.read_bytes(), restore_before)
-        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "bbr")
-        self.assertTrue(self.core.exists())
-        self.assertTrue(self.wrapper.exists())
-        self.assertTrue(self.unit.exists())
+''')
+        self.assertEqual(self._archive_dirs(), [])
 
     def test_cancelled_purge_confirmation_preserves_panel_and_bbr(self) -> None:
         self._enable_bbr()
