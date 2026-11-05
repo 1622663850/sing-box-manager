@@ -10,9 +10,19 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import time
 import unittest
+
+if os.name != "nt":
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
 
 import test_xray_manager as fixture
 
@@ -130,6 +140,51 @@ class XrayUserOutboundRouteTest(fixture.XrayFixture):
         self.assertNotIn(identity("vless", UUID), self.metadata()["user_outbound_routes"])
         self.assertIn(identity("vless", UUID2), self.metadata()["user_outbound_routes"])
         self.assertEqual(sorted(self.backups_dir.iterdir()), before_backups)
+
+    def test_new_inbound_default_user_add_second_edit_and_unbind(self) -> None:
+        self.write_config([], outbounds=self.outbounds, routing={"rules": []})
+        driver = r'''prompt() {
+    case "$1" in
+        protocol_choice) printf -v "$1" 2;;
+        tag) printf -v "$1" user-route-node;;
+        port) printf -v "$1" 18600;;
+        server) printf -v "$1" example.com;;
+        choice) if [[ $2 == *"选择用户"* ]]; then printf -v "$1" 2; else printf -v "$1" '%s' "${3:-}"; fi;;
+        *) printf -v "$1" '%s' "${3:-}";;
+    esac
+}
+confirm() { return 0; }
+prompt_secret() { printf -v "$1" '%s' "$XR_TEST_USER_CREDENTIAL"; }
+add_wizard_locked'''
+        self.env["XR_TEST_USER_CREDENTIAL"] = UUID
+        self.shell(driver, check=True)
+        first = json.loads(self.config.read_text())["inbounds"][0]["settings"]["users"][0]
+        self.assertEqual(first, {"id": UUID, "email": "user1"})
+        added = r'''prompt() { printf -v "$1" '%s' "$XR_TEST_USER_NAME"; }
+prompt_secret() { printf -v "$1" '%s' "$XR_TEST_USER_CREDENTIAL"; }
+confirm() { return 0; }
+change_inbound_user add user-route-node'''
+        self.env.update(XR_TEST_USER_NAME="user2", XR_TEST_USER_CREDENTIAL=UUID2)
+        self.shell(added, check=True)
+        users = json.loads(self.config.read_text())["inbounds"][0]["settings"]["users"]
+        self.assertEqual(users, [first, {"id": UUID2, "email": "user2"}])
+        self.env.update(XR_TEST_USER_NAME="user1", XR_TEST_USER_CREDENTIAL=UUID3)
+        before = self.snapshot_bytes()
+        duplicate = self.shell(added)
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("用户名已存在", duplicate.stderr)
+        self.assertEqual(self.snapshot_bytes(), before)
+        self.bind(1, "exit-a")
+        self.bind(2, "exit-b")
+        self.env["XR_TEST_USER_CREDENTIAL"] = UUID2
+        edit = driver.replace("port) printf -v \"$1\" 18600", "port) printf -v \"$1\" 18602")
+        edit = edit.replace("add_wizard_locked", "edit_wizard_locked user-route-node")
+        self.shell(edit, check=True)
+        self.assertEqual(json.loads(self.config.read_text())["inbounds"][0]["settings"]["users"], users)
+        self.unbind(2)
+        self.assertTrue(any(r.get("user") == ["user1"] for r in self.routes()))
+        self.assertFalse(any(r.get("user") == ["user2"] for r in self.routes()))
+        self.assertEqual(sorted(self.backups_dir.iterdir()), [])
 
     def test_interactive_wizard_selects_node_user_outbound_and_unbinds(self) -> None:
         self.seed()
@@ -292,6 +347,109 @@ user_outbound_wizard_locked bind'''
         rules = self.routes()
         self.assertEqual(rules[0]["inboundTag"], ["user-route-node"])
         self.assertEqual(rules[1], self.unrelated_rule)
+
+    def test_unbind_after_config_import_preserves_stale_client_cache_and_other_routes(self) -> None:
+        self.seed()
+        self.bind(1, "exit-a")
+        self.bind(2, "exit-b")
+        before_meta = self.metadata()
+        # Full-config import intentionally leaves client metadata untouched.
+        imported = json.loads(self.config.read_text(encoding="utf-8"))
+        imported["inbounds"][0]["port"] = 18602
+        path = self.candidate(imported, "imported-user-route-config.json")
+        self.shell('import_config "$1"', str(path), check=True)
+        expected = copy.deepcopy(imported)
+        selected_rule = before_meta["user_outbound_routes"][identity("vless", UUID2)]["rule"]
+        expected["routing"]["rules"].remove(selected_rule)
+
+        prompt = r'''prompt() { printf -v "$1" '%s' 1; }
+confirm() { return 0; }
+select_inbound_user() { printf -v "$1" '%s' 2; }
+user_outbound_wizard_locked unbind'''
+        result = self.shell(prompt)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("用户绑定未保存", result.stderr)
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")), expected)
+        after_meta = self.metadata()
+        del before_meta["user_outbound_routes"][identity("vless", UUID2)]
+        self.assertEqual(after_meta, before_meta)
+        # A repeated unbind is a no-op, including when the cache is stale.
+        before = self.snapshot_bytes()
+        self.shell(prompt, check=True)
+        self.assertEqual(self.snapshot_bytes(), before)
+        self.assertEqual(sorted(self.backups_dir.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "real menu prompts require a Linux PTY")
+    def test_real_outbound_menu_binds_and_unbinds_second_user_on_second_node(self) -> None:
+        node = self.make_node()
+        self.seed(node)
+        others = [dict(copy.deepcopy(node), tag=tag, port=port)
+                  for tag, port in (("first-node", 18601), ("third-node", 18603))]
+        self.write_config([others[0], node, others[1]], outbounds=self.outbounds,
+                          routing={"rules": [self.unrelated_rule]})
+        self.bind(1, "exit-a")
+        before_config = json.loads(self.config.read_text(encoding="utf-8"))
+        before_meta = self.metadata()
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 240, 0, 0))
+        process = subprocess.Popen(
+            ["bash", "-c", 'source "$1"; wait_healthy() { service_is_active; }; outbounds_menu',
+             "xray-user-route-menu-test", str(fixture.SCRIPT)],
+            env=self.env, stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+        )
+        os.close(slave)
+        output = b""
+        pending = b""
+        deadline = time.monotonic() + 35
+        steps = [
+            ("请选择出站操作 [0]:", "9"), ("选择用户所属节点（", "2"),
+            ("选择用户（0 返回）", "2"), ("选择出站（", "3"),
+            ("[y/N]:", "y"), ("按回车返回出站管理:", ""),
+            ("请选择出站操作 [0]:", "10"), ("选择用户所属节点（", "2"),
+            ("选择用户（0 返回）", "2"), ("[y/N]:", "y"),
+            ("按回车返回出站管理:", ""), ("请选择出站操作 [0]:", "0"),
+        ]
+        try:
+            for marker, answer in steps:
+                token = marker.encode()
+                while token not in pending:
+                    self.assertLess(time.monotonic(), deadline, "menu stalled: " + output.decode(errors="replace"))
+                    if select.select([master], [], [], 0.2)[0]:
+                        chunk = os.read(master, 65536)
+                        output += chunk
+                        pending += chunk
+                pending = pending.split(token, 1)[1]
+                os.write(master, (answer + "\n").encode())
+            process.wait(timeout=5)
+            self.assertEqual(process.returncode, 0)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            os.close(master)
+        self.assertNotIn("用户绑定未保存", output.decode())
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")), before_config)
+        self.assertEqual(self.metadata(), before_meta)
+
+    def test_stale_cache_unbind_still_rejects_changed_identity_or_owned_rule(self) -> None:
+        self.seed()
+        self.bind(2, "exit-b")
+        original = self.config.read_text(encoding="utf-8")
+        for change in ("credential", "email", "rule"):
+            with self.subTest(change=change):
+                current = json.loads(original)
+                current["inbounds"][0]["port"] = 18602
+                if change == "credential":
+                    current["inbounds"][0]["settings"]["users"][1]["id"] = UUID3
+                elif change == "email":
+                    current["inbounds"][0]["settings"]["users"][1]["email"] = "changed-user"
+                else:
+                    current["routing"]["rules"][0]["outboundTag"] = "exit-a"
+                fixture.dump(self.config, current)
+                before = self.snapshot_bytes()
+                result = self.unbind(2, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.snapshot_bytes(), before)
 
     def test_cancel_and_no_auto_backup_leave_state_unchanged(self) -> None:
         self.seed()

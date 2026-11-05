@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.2"
+XR_MANAGER_VERSION="1.2.3"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -1783,7 +1783,7 @@ try:
         users, key = users_of(node)
         if not 0 <= index < len(users): raise ValueError()
         meta = data["clients"].get(tag, {})
-        if meta.get("inbound") is not None and meta["inbound"] != node: raise ValueError()
+        if outbound != "-" and meta.get("inbound") is not None and meta["inbound"] != node: raise ValueError()
         guard(data, tag, node)
         token = identity(node, users[index], key)
         records = records_for(data, tag)
@@ -1811,7 +1811,8 @@ try:
         else:
             rules.insert(0, rule)
             records[token] = {"format":"xray-manager-user-route-v1", "rule":rule, "identity":token}
-        meta["inbound"] = node
+        # Unbinding only removes an owned rule; do not refresh stale client settings.
+        if outbound != "-": meta["inbound"] = node
         if records: meta["user_outbound_routes"] = records
         else: meta.pop("user_outbound_routes", None)
         data["clients"][tag] = meta
@@ -2676,6 +2677,7 @@ node_wizard_locked() (
         [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/snapshot")" ]] || { fail "编辑期间配置或连接信息已变化。"; exit 1; }
         replace_inbound_file "$old" "$work/updated" "$server" "$public_key" "$work/original" || exit 1
     else
+        jq 'if .settings.users != null then .settings.users[0].email="user1" else . end' "$work/generated" >"$work/named" && mv "$work/named" "$work/generated" || exit 1
         confirm "添加节点并按需启动/重启 Xray？" y || exit 0
         add_managed_inbound "$work/generated" "$server" "$public_key" || exit 1
     fi
@@ -2791,6 +2793,9 @@ change_inbound_user() (
     case "$protocol" in vless|vmess) key=id;; trojan) key=password;; hysteria) key=auth;; *) exit 1;; esac
     if [[ $action == add ]]; then
         prompt name "新用户名（字母/数字/短横线/下划线）" "user-$(date +%H%M%S)" || exit 1; valid_tag "$name" || exit 1
+        if jq -e --arg name "$name" 'any((.settings.users // .settings.clients)[]; .email==$name)' "$work/node" >/dev/null; then
+            fail "用户名已存在，请使用其他名称。"; exit 1
+        fi
         case "$key" in id) credential=$("$CORE_BIN" uuid);; *) credential=$(openssl rand -base64 16);; esac || exit 1
         prompt_secret credential "UUID/密码（回车自动生成）" "$credential" || exit 1
         jq --arg k "$key" --arg c "$credential" --arg name "$name" '.settings.users=(.settings.users // .settings.clients) | del(.settings.clients) | .settings.users+=[(.settings.users[0]|.[$k]=$c|.email=$name)]' "$work/node" >"$work/new" || exit 1

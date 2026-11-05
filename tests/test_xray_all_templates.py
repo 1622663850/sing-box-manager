@@ -274,6 +274,9 @@ class XrayAllTemplatesTest(fixture.XrayFixture):
             with self.subTest(menu_choice=menu_choice):
                 inbound, outbound, link, _ = self.run_template(menu_choice)
                 self.assertEqual(inbound["protocol"], protocol)
+                if protocol != "shadowsocks":
+                    self.assertEqual(len(inbound["settings"]["users"]), 1)
+                    self.assertEqual(inbound["settings"]["users"][0]["email"], "user1")
                 inbound_stream = inbound.get("streamSettings", {})
                 outbound_stream = outbound.get("streamSettings", {})
                 self.assertEqual(inbound_stream.get("method", "raw"), method)
