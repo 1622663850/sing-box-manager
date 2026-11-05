@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.4"
+XR_MANAGER_VERSION="1.2.5"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -1562,16 +1562,23 @@ uninstall_core() {
     with_lock uninstall_core_locked
 }
 uninstall_core_locked() (
-    local work transaction=0 active=0 enabled=0
+    local work transaction=0 active=0 enabled=0 mode=${1:-core} had_core=0 had_unit=0 unit_size
+    [[ $# -le 1 && ( $mode == core || $mode == purge ) ]] || return 1
     safe_paths && is_managed || return
+    if [[ -f $UNIT_FILE ]]; then
+        unit_size=$(stat -c '%s' "$UNIT_FILE") || return 1
+        if [[ $unit_size -gt 1048576 || $(cat "$UNIT_FILE") != "$(write_unit)" ]]; then
+            fail "Xray service 文件不属于当前受管安装，拒绝停止或删除。"; return 1
+        fi
+    fi
     work=$(mktemp -d "$STATE_DIR/uninstall.XXXXXX") || return
     # shellcheck disable=SC2317,SC2329 # EXIT transaction cleanup.
     rollback_uninstall() {
         local result=$? restored=1
         trap - EXIT INT TERM
         if [[ $transaction -eq 1 ]]; then
-            atomic_copy "$work/xray" "$CORE_BIN" 755 || restored=0
-            atomic_copy "$work/unit" "$UNIT_FILE" 644 || restored=0
+            [[ $had_core -eq 0 ]] || atomic_copy "$work/xray" "$CORE_BIN" 755 || restored=0
+            [[ $had_unit -eq 0 ]] || atomic_copy "$work/unit" "$UNIT_FILE" 644 || restored=0
             systemctl daemon-reload || restored=0
             [[ $enabled -eq 0 ]] || systemctl enable "$SERVICE" || restored=0
             [[ $active -eq 0 ]] || restart_checked || restored=0
@@ -1584,16 +1591,262 @@ uninstall_core_locked() (
     trap rollback_uninstall EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    cp -- "$CORE_BIN" "$work/xray" && cp -- "$UNIT_FILE" "$work/unit" || return
+    if [[ -f $CORE_BIN ]]; then cp -- "$CORE_BIN" "$work/xray" || return; had_core=1; fi
+    if [[ -f $UNIT_FILE ]]; then cp -- "$UNIT_FILE" "$work/unit" || return; had_unit=1; fi
+    [[ $mode == purge || ( $had_core -eq 1 && $had_unit -eq 1 ) ]] || return 1
     service_is_active && active=1
     systemctl is-enabled --quiet "$SERVICE" && enabled=1
     transaction=1
-    systemctl disable --now "$SERVICE" || return
+    if ! systemctl disable --now "$SERVICE"; then
+        [[ $mode == purge && $had_unit -eq 0 ]] || return 1
+        systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+        if service_is_active || systemctl is-enabled --quiet "$SERVICE"; then return 1; fi
+    fi
+    service_is_active && { fail "Xray 服务未停止，拒绝删除。"; return 1; }
     rm -f -- "$CORE_BIN" "$UNIT_FILE" || return
     systemctl daemon-reload || return
     transaction=0
-    info "Xray 核心已卸载，配置、证书、备份和菜单保留。"
+    [[ $mode == purge ]] || info "Xray 核心已卸载，配置、证书、备份和菜单保留。"
+    return 0
 )
+
+validate_purge_paths() {
+    python3 - "$XR_ROOT_PREFIX" "$LIB_DIR" "$CONFIG_DIR" "$STATE_DIR" "$WRAPPER" "$UNIT_FILE" \
+        "$MANAGED_MARKER" "$CORE_BIN" "$BACKUP_DIR" "$CLIENT_DIR" "$DEFAULT_SERVER_FILE" \
+        "$BBR_SYSCTL_DIR" "$BBR_SYSCTL_FILE" "$BBR_RESTORE_FILE" "$SERVICE" "${1:-}" "$CONFIG_FILE" "$(write_unit)" "$SCRIPT_FILE" <<'PY_XRAY_PURGE'
+from pathlib import Path
+import os, re, stat, sys
+try:
+    prefix = sys.argv[1]
+    if prefix and (not prefix.startswith('/') or prefix.startswith('//') or prefix == '/' or os.path.normpath(prefix) != prefix): raise ValueError()
+    expected = ['/usr/local/lib/xray-manager', '/etc/xray', '/var/lib/xray-manager',
+                '/usr/local/bin/xray', '/etc/systemd/system/xray.service',
+                '/usr/local/lib/xray-manager/.managed', '/usr/local/lib/xray-manager/xray',
+                '/var/lib/xray-manager/backups', '/var/lib/xray-manager/clients',
+                '/var/lib/xray-manager/default-server', '/etc/sysctl.d',
+                '/etc/sysctl.d/99-xray-manager-bbr.conf', '/var/lib/xray-manager/bbr-active']
+    if sys.argv[2:15] != [prefix+p for p in expected] or sys.argv[15] != 'xray.service' or sys.argv[17] != prefix+'/etc/xray/config.json': raise ValueError()
+    paths = [Path(p) for p in sys.argv[2:15]] + [Path(sys.argv[17])]
+    restored = paths[2] / 'purge-bbr-restored.json'
+    paths.append(restored)
+    source = Path(sys.argv[16]) if sys.argv[16] else None
+    if source:
+        if (not source.is_absolute() or str(source).startswith('//') or os.path.normpath(str(source)) != str(source) or
+                any(ord(c) < 32 or ord(c) == 127 for c in str(source))): raise ValueError()
+        protected = ['/usr/local/lib/sing-box-manager', '/usr/local/bin/sing-box', '/etc/sing-box',
+                     '/var/lib/sing-box-manager', '/etc/systemd/system/sing-box.service',
+                     '/root/sing-box-manager', '/root/.acme.sh', '/root/acme-script']
+        if any(source == Path(prefix+p) or Path(prefix+p) in source.parents for p in protected): raise ValueError()
+        paths.append(source)
+    for path in paths:
+        if any(p.is_symlink() for p in [path,*path.parents]) or (path.exists() and os.path.ismount(path)): raise ValueError()
+    for path in [paths[i] for i in (0,1,2,7,8,10)]:
+        if path.exists() and not path.is_dir(): raise ValueError()
+    for path in [paths[i] for i in (3,4,5,6,9,11,12,13)]:
+        if path.exists() and not stat.S_ISREG(path.stat().st_mode): raise ValueError()
+    if restored.exists() and not stat.S_ISREG(restored.stat().st_mode): raise ValueError()
+    links = list(paths[4].parent.glob('*.wants/xray.service')) + list(paths[4].parent.glob('*.requires/xray.service'))
+    for link in links:
+        if (not link.is_symlink() or link.resolve(strict=False) != paths[4] or
+                any(p.is_symlink() for p in link.parents)): raise ValueError()
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        mount = Path(re.sub(r'\\([0-7]{3})',lambda m: chr(int(m[1],8)),line.split()[4]))
+        if any(mount == p or p in mount.parents for p in paths[:3]) or any(mount == link.parent for link in links): raise ValueError()
+    if paths[5].stat().st_size > 256 or paths[5].read_text().strip() != 'xray-manager-v1': raise ValueError()
+    def owned_script(path):
+        if not path.is_file() or path.stat().st_size > 1048576: return False
+        data = path.read_bytes()
+        return (data.startswith(b'#!/usr/bin/env bash\n') and
+                b'# xray-manager: a self-contained Chinese terminal manager.' in data.splitlines() and
+                re.search(rb'^XR_MANAGER_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$',data,re.M) is not None)
+    if paths[3].exists() and not owned_script(paths[3]): raise ValueError()
+    if source and source.exists() and not owned_script(source): raise ValueError()
+    running = Path(os.path.abspath(sys.argv[19]))
+    if any(p.is_symlink() for p in [running,*running.parents]) or not owned_script(running): raise ValueError()
+    if paths[4].exists() and (paths[4].stat().st_size > 1048576 or paths[4].read_text().rstrip('\n') != sys.argv[18]): raise ValueError()
+except (ValueError,OSError,UnicodeError):
+    print('[错误] 彻底卸载路径或文件归属检查失败；拒绝删除符号链接、挂载点或非本面板文件。',file=sys.stderr)
+    raise SystemExit(1)
+PY_XRAY_PURGE
+}
+
+purge_bbr_state() {
+    python3 - "$1" "$STATE_DIR/purge-bbr-restored.json" "$BBR_SYSCTL_FILE" "${2:-}" <<'PY_XRAY_PURGE_BBR'
+from pathlib import Path
+import hashlib,json,re,stat,sys
+try:
+    mode,marker,target,backup=sys.argv[1],Path(sys.argv[2]),Path(sys.argv[3]),Path(sys.argv[4])
+    if mode=='prepare':
+        original=json.loads((backup/'runtime.json').read_text())
+        existed=original['config_existed']
+        data={'format':'xray-manager-purge-bbr-v1','existed':existed,
+              'sha256':hashlib.sha256((backup/'sysctl.conf').read_bytes()).hexdigest() if existed else '',
+              'mode':original['config_mode'] if existed else ''}
+        print(json.dumps(data));raise SystemExit(0)
+    if mode!='check' or marker.is_symlink() or marker.stat().st_size>4096: raise ValueError()
+    data=json.loads(marker.read_text())
+    if (set(data)!={'format','existed','sha256','mode'} or
+            data.get('format')!='xray-manager-purge-bbr-v1' or type(data.get('existed')) is not bool): raise ValueError()
+    if data['existed']:
+        if not re.fullmatch('[0-9a-f]{64}',data['sha256']) or not re.fullmatch('[0-7]{3,4}',data['mode']): raise ValueError()
+        match=(target.is_file() and not target.is_symlink() and
+               hashlib.sha256(target.read_bytes()).hexdigest()==data['sha256'] and
+               stat.S_IMODE(target.stat().st_mode)==int(data['mode'],8))
+    else:
+        if data.get('sha256')!='' or data.get('mode')!='': raise ValueError()
+        match=not target.exists() and not target.is_symlink()
+    print('match' if match else 'changed')
+except (OSError,ValueError,KeyError,TypeError,AttributeError):
+    raise SystemExit(1)
+PY_XRAY_PURGE_BBR
+}
+
+purge_bbr_settings() (
+    local record="$STATE_DIR/purge-bbr-restored.json" backup="" state="" temporary=""
+    if [[ -f $record && ! -e $BBR_RESTORE_FILE ]]; then
+        if state=$(purge_bbr_state check); then
+            if [[ $state == match ]]; then info "此前已恢复原 BBR 持久化状态，本次保留该原状态。"
+            else warn "此前恢复后的 BBR 文件又有变化，保留当前文件和运行参数。"; fi
+            return 0
+        fi
+        warn "BBR 清理重试标记无效，按现有恢复资料和文件归属继续核对。"
+    fi
+    [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]] || return 0
+    if backup=$(bbr_restore_backup 2>/dev/null); then
+        temporary=$(mktemp "$STATE_DIR/purge-bbr.XXXXXX") || return 1
+        trap 'rm -f -- "$temporary"' EXIT
+        purge_bbr_state prepare "$backup" >"$temporary" && atomic_copy "$temporary" "$record" 600 || return 1
+        # shellcheck disable=SC2317,SC2329 # Called inside configure_bbr_locked after DELETE.
+        confirm() { return 0; }
+        if disable_bbr_locked; then
+            info "已恢复本面板开启 TCP BBR 前的运行参数和原文件状态。"
+            return 0
+        fi
+        rm -f -- "$record" || return 1
+        warn "无法安全恢复原 TCP BBR 设置；保留当前运行参数，继续清理本面板文件。"
+    else
+        warn "BBR 恢复记录缺失或无效；不猜测原运行参数，继续清理本面板文件。"
+    fi
+    if [[ -e $BBR_SYSCTL_FILE ]]; then
+        if bbr_owned_config "$BBR_SYSCTL_FILE"; then
+            if ! rm -f -- "$BBR_SYSCTL_FILE" || [[ -e $BBR_SYSCTL_FILE || -L $BBR_SYSCTL_FILE ]]; then
+                fail "BBR 持久化文件未删除，彻底卸载未完成：$BBR_SYSCTL_FILE"; return 1;
+            fi
+        else
+            warn "BBR 文件不属于本面板或含其他设置，已保留：$BBR_SYSCTL_FILE"
+        fi
+    fi
+)
+
+purge_install_locked() (
+    umask 077
+    local source=${1:-} link work deletion_started=0 complete=0 record="$STATE_DIR/purge-bbr-restored.json"
+    [[ $# -le 1 ]] || return 1
+    is_managed && validate_purge_paths "$source" && check_conflicts || return 1
+    # Only retain the public cleanup entrypoint during this destructive transaction.
+    work=$(mktemp -d "${STATE_DIR%/*}/xray-purge.XXXXXX") || return 1
+    # shellcheck disable=SC2317,SC2329 # Invoked by the transaction traps.
+    preserve_purge_entry() {
+        local result=$? restored=1
+        trap - EXIT INT TERM
+        if [[ $deletion_started -eq 1 && $complete -eq 0 ]]; then
+            if safe_paths && [[ ! -e $LIB_DIR || -d $LIB_DIR ]] &&
+               [[ ! -e $WRAPPER || -f $WRAPPER ]] &&
+               { [[ ! -e $MANAGED_MARKER ]] || cmp -s "$work/marker" "$MANAGED_MARKER"; } &&
+               { [[ ! -e $WRAPPER ]] || cmp -s "$work/panel" "$WRAPPER" ||
+                 { [[ -f $work/installed ]] && cmp -s "$work/installed" "$WRAPPER"; }; }; then
+                { [[ -d $LIB_DIR ]] || install -d -m 755 "$LIB_DIR"; } &&
+                    { [[ -d ${WRAPPER%/*} ]] || install -d -m 755 "${WRAPPER%/*}"; } &&
+                    atomic_copy "$work/marker" "$MANAGED_MARKER" 600 &&
+                    atomic_copy "$work/panel" "$WRAPPER" 755 || restored=0
+                if [[ -f $work/bbr-restored ]]; then
+                    if [[ ! -L $record && ( ! -e $record || -f $record ) ]] &&
+                       { [[ ! -e $record ]] || cmp -s "$work/bbr-restored" "$record"; }; then
+                        { [[ -d $STATE_DIR ]] || install -d -m 700 "$STATE_DIR"; } &&
+                            atomic_copy "$work/bbr-restored" "$record" 600 || restored=0
+                    else restored=0; fi
+                fi
+            else restored=0; fi
+            warn "彻底卸载未完成；已删除的数据不会恢复，请核对错误后重新清理。"
+            [[ $restored -eq 0 ]] || warn "清理入口和管理标记已保留，可重新执行 xray uninstall --purge。"
+            result=1
+        fi
+        if [[ $restored -eq 1 ]]; then
+            rm -rf -- "$work" || { fail "临时清理文件未删除：$work"; result=1; }
+        else
+            warn "清理入口恢复失败，恢复文件保留在：$work"
+        fi
+        if [[ $complete -eq 1 && $result -eq 0 ]]; then
+            info "已彻底卸载 Xray 核心、服务、面板、配置、连接信息和面板备份。"
+            info "外部证书、ACME、sing-box、系统日志和源码仓库保留。"
+        fi
+        exit "$result"
+    }
+    trap preserve_purge_entry EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    install -m 600 "$SCRIPT_FILE" "$work/panel" &&
+        install -m 600 "$MANAGED_MARKER" "$work/marker" || return 1
+    [[ ! -f $WRAPPER ]] || install -m 600 "$WRAPPER" "$work/installed" || return 1
+    uninstall_core_locked purge || return 1
+    validate_purge_paths "$source" || return 1
+    purge_bbr_settings || return 1
+    if [[ -f $record ]] && purge_bbr_state check >/dev/null 2>&1; then
+        install -m 600 "$record" "$work/bbr-restored" || return 1
+    fi
+    validate_purge_paths "$source" || return 1
+    for link in "${UNIT_FILE%/*}"/*.wants/xray.service "${UNIT_FILE%/*}"/*.requires/xray.service; do
+        [[ -e $link || -L $link ]] || continue
+        [[ -L $link && ! -L ${link%/*} && $(readlink -m -- "$link") == "$UNIT_FILE" ]] || return 1
+        rm -f -- "$link" || return 1
+        [[ ! -e $link && ! -L $link ]] || { fail "自启链接仍有残留：$link"; return 1; }
+    done
+    systemctl daemon-reload || { fail "服务状态刷新失败，彻底卸载未完成。"; return 1; }
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    deletion_started=1
+    rm -rf --one-file-system -- "$CONFIG_DIR" || { fail "配置目录未清理完成。"; return 1; }
+    for link in "$LIB_DIR"/* "$LIB_DIR"/.[!.]* "$LIB_DIR"/..?*; do
+        [[ -e $link || -L $link ]] || continue
+        [[ $link != "$MANAGED_MARKER" ]] || continue
+        rm -rf --one-file-system -- "$link" || { fail "核心目录未清理完成。"; return 1; }
+    done
+    [[ -z $source || $source == "$WRAPPER" ]] || rm -f -- "$source" || return 1
+    rm -rf --one-file-system -- "$STATE_DIR" || { fail "状态目录未清理完成。"; return 1; }
+    rm -f -- "$WRAPPER" || { fail "面板入口未删除。"; return 1; }
+    if ! rm -f -- "$MANAGED_MARKER" || ! rmdir -- "$LIB_DIR"; then
+        fail "管理标记或核心目录仍有残留。"; return 1
+    fi
+    [[ -z $source || ( ! -e $source && ! -L $source ) ]] || { fail "指定的下载脚本仍有残留：$source"; return 1; }
+    for link in "$CORE_BIN" "$LIB_DIR" "$CONFIG_DIR" "$STATE_DIR" "$WRAPPER" "$UNIT_FILE"; do
+        [[ ! -e $link && ! -L $link ]] || { fail "卸载仍有残留：$link"; return 1; }
+    done
+    complete=1
+)
+
+purge_uninstall() {
+    local source="" answer
+    is_managed || { fail "没有本面板管理的 Xray 安装。"; return 1; }
+    prompt source "额外删除的原下载脚本绝对路径（留空保留源码副本，0 取消）" || return 1
+    [[ $source != 0 ]] || return 0
+    validate_purge_paths "$source" && check_conflicts || return 1
+    printf '\n将永久删除全部节点、连接信息和面板备份：\n  %s\n  %s\n  %s\n  %s\n  %s\n' "$LIB_DIR" "$CONFIG_DIR" "$STATE_DIR" "$WRAPPER" "$UNIT_FILE"
+    [[ -z $source ]] || printf '  %s\n' "$source"
+    if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
+        info "将恢复本面板开启 BBR 前的整机 TCP 算法、默认队列及原持久化文件状态，可能影响其他服务的共享 TCP 设置。"
+        info "恢复记录缺失或恢复失败不阻止卸载；不猜测运行参数，只删除严格归本面板所有的 $BBR_SYSCTL_FILE。"
+    fi
+    info "不递归删除源码仓库；外部证书、ACME、sing-box 和系统日志保留。"
+    prompt answer "此操作不可撤销；输入 DELETE 确认，其他输入取消" 0 || return 1
+    [[ $answer == DELETE ]] || { info "已取消彻底卸载。"; return 0; }
+    with_lock purge_install_locked "$source"
+}
+
+uninstall_menu() {
+    local uninstall_choice
+    printf '\n卸载 Xray\n  1. 仅卸载核心和服务（保留面板、配置和备份）\n  2. 彻底卸载（清除节点、面板和备份，撤销本面板 BBR 设置）\n  0. 返回\n'
+    prompt uninstall_choice "请选择卸载方式" 1 || return 1
+    case "$uninstall_choice" in 0) return 0;; 1) uninstall_core;; 2) purge_uninstall;; *) fail "无效选项。";; esac
+}
 service_action(){
     local action=$1
     require_core || return
@@ -3746,22 +3999,23 @@ Xray 中文终端管理面板
   xray quic-bbr [TAG] | quic-bbr-disable [TAG] | quic-bbr-status
                                             Hy2 显式 BBR 及开启前设置恢复
   xray acme                               安装/打开独立 ACME 项目菜单
-  xray uninstall                          卸载此面板拥有的 Xray 核心和服务
+  xray uninstall                          仅卸载本面板核心和服务，保留配置
+  xray uninstall --purge                  彻底卸载（输入 DELETE 确认）
   xray remove-panel                       核心卸载后移除菜单入口
   xray core ARGS...                       显式透传私有核心
   xray version | uuid | x25519 ...         原生命令透传
 HELP
 }
 menu(){
-    local choice selected
+    local choice selected uninstall_result
     [[ -t 0 ]] || { usage;return 0; }
     while true;do
       printf '\n========== Xray 管理面板 v%s ==========\n' "$XR_MANAGER_VERSION"
       show_status
-      printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray 核心\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / Hy2 QUIC）\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n 21. XHTTP 上下行分离（客户端）\n  0. 退出\n'
+      printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / Hy2 QUIC）\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n 21. XHTTP 上下行分离（客户端）\n  0. 退出\n'
       read -r -p "请输入选项 [0-21]: " choice || return 0
       case "$choice" in
-        0)return 0;;1)install_core;;2)uninstall_core;;3)with_lock service_action start;;4)autostart_menu;continue;;5)with_lock service_action restart;;6)with_lock service_action disable;;7)logs_menu;continue;;
+        0)return 0;;1)install_core;;2)uninstall_result=0; uninstall_menu || uninstall_result=$?; [[ -e $WRAPPER || -f $MANAGED_MARKER ]] || return "$uninstall_result"; continue;;3)with_lock service_action start;;4)autostart_menu;continue;;5)with_lock service_action restart;;6)with_lock service_action disable;;7)logs_menu;continue;;
         8)with_lock add_wizard_locked;;9)show_config;continue;;10)update_core;;11)with_lock edit_wizard_locked;;12)with_lock delete_inbound;;13)management_menu;continue;;
         14)if update_panel;then exec bash "$WRAPPER" menu;fi;;15)bbr_menu;continue;;16)disable_bbr;;17)open_acme_menu;;18)users_menu;continue;;19)outbound_preference_menu;continue;;20)outbounds_menu;continue;;21)with_lock xhttp_split_wizard_locked;;*)warn "请输入 0–21。";;
       esac || true
@@ -3782,7 +4036,10 @@ main(){
     case "$command" in
       menu)if ! is_managed;then setup_panel || return;fi;menu;;setup)setup_panel;;
       install)[[ $# -le 1 ]] || return 1;install_core "${1:-latest}";;update)[[ $# -le 1 ]] || return 1;update_core "${1:-latest}";;
-      update-panel)update_panel "$@";;uninstall)uninstall_core;;
+      update-panel)update_panel "$@";;uninstall)
+        if [[ $# -eq 0 ]]; then uninstall_core
+        elif [[ $# -eq 1 && $1 == --purge ]]; then purge_uninstall
+        else fail "用法：xray uninstall [--purge]"; return 1; fi;;
       start|restart|stop|enable|disable-autostart|disable)with_lock service_action "$command";;status)show_status;;log|logs)show_logs "${1:-}";;
       add)with_lock add_wizard_locked;;edit)[[ $# -le 1 ]] && with_lock edit_wizard_locked "$@";;delete)[[ $# -le 1 ]] && with_lock delete_inbound "$@";;
       add-file)[[ $# -eq 1 ]] && with_lock add_inbound_file "$1";;import)[[ $# -eq 1 ]] && confirm "替换完整 Xray 配置？" && with_lock import_config "$1";;

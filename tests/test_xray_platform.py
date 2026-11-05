@@ -279,6 +279,7 @@ download_https() {
         self.assertFalse(self.state()["active"])
 
     def test_uninstall_core_locked_preserves_config_and_panel(self) -> None:
+        self.unit.write_text(self.shell("write_unit", check=True).stdout,encoding="utf-8")
         wrapper_before = SCRIPT.read_bytes()
         self.wrapper.write_bytes(wrapper_before)
         self.wrapper.chmod(0o755)
@@ -395,6 +396,7 @@ update_panel_locked
         self.assertEqual(list(self.backups_dir.glob("bbr-*")), baseline_archives)
 
     def test_uninstall_daemon_reload_failure_restores_core_unit_and_service_state(self) -> None:
+        self.unit.write_text(self.shell("write_unit", check=True).stdout,encoding="utf-8")
         wrapper_before = SCRIPT.read_bytes()
         self.wrapper.write_bytes(wrapper_before)
         self.wrapper.chmod(0o755)

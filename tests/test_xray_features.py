@@ -420,6 +420,7 @@ add_outbound_wizard_locked'''
             ("bbr_menu", "BBR 设置"),
             ("autostart_menu", "开机自启"),
             ("logs_menu", "查看 Xray 日志"),
+            ("uninstall_menu", "卸载 Xray"),
             ("outbound_preference_menu", "出站 IP 优先级"),
             ("outbounds_menu", "Xray 出站管理"),
             ("users_menu", "入站用户管理"),

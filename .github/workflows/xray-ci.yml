@@ -57,3 +57,5 @@ jobs:
         run: sudo python3 tests/smoke_xray_reality_users.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
       - name: Live journal follow and Ctrl-C menu return
         run: sudo python3 tests/smoke_xray_logs.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
+      - name: Complete purge in an isolated real Xray installation
+        run: sudo python3 tests/smoke_xray_uninstall.py --core "$RUNNER_TEMP/xray-test/xray" --manager "$GITHUB_WORKSPACE/xray-manager.sh"
