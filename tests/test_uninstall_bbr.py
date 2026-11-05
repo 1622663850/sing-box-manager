@@ -82,7 +82,7 @@ class UninstallBbrTest(unittest.TestCase):
     def _archive_dirs(self) -> list[Path]:
         return sorted((self.root / "var/lib").glob("sing-box-manager-bbr-recovery-*"))
 
-    def test_keep_purges_panel_preserves_live_bbr_and_archives_only_recovery_data(self) -> None:
+    def test_valid_bbr_restore_removes_archive_and_sensitive_panel_data(self) -> None:
         original_bbr = (
             b"# Managed by sing-box-manager: TCP BBR\n"
             b"net.core.default_qdisc=fq_codel\n"
@@ -91,10 +91,6 @@ class UninstallBbrTest(unittest.TestCase):
         self.bbr_file.write_bytes(original_bbr)
         self.bbr_file.chmod(0o600)
         self._enable_bbr()
-        reference = self.restore_file.read_text(encoding="utf-8").strip()
-        source_backup = self.state_dir / "backups" / reference
-        runtime_before = (source_backup / "runtime.json").read_bytes()
-
         node_secret = "synthetic-node-secret"
         fixture.dump(
             self.config,
@@ -109,39 +105,64 @@ class UninstallBbrTest(unittest.TestCase):
         (foreign / "credentials.json").chmod(0o600)
         self._assert_valid_layout()
 
-        bbr_file_before = self.bbr_file.read_bytes()
-        bbr_mode_before = self.bbr_file.stat().st_mode & 0o777
-        kernel_before = self.read_bbr_state()
         result = self.shell("purge_install_locked", check=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self._assert_panel_removed()
-        self.assertEqual(self.bbr_file.read_bytes(), bbr_file_before)
-        self.assertEqual(self.bbr_file.stat().st_mode & 0o777, bbr_mode_before)
         self.assertEqual(
             tuple(self.read_bbr_state()[key] for key in ("tcp_congestion_control", "default_qdisc")),
-            tuple(kernel_before[key] for key in ("tcp_congestion_control", "default_qdisc")),
+            ("cubic", "fq_codel"),
         )
+        self.assertEqual(self.bbr_file.read_bytes(), original_bbr)
+        self.assertEqual(self.bbr_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self._archive_dirs(), [])
+        self.assertNotIn(node_secret.encode(), self.bbr_file.read_bytes())
+        self.assertNotIn(b"other-panel-secret", self.bbr_file.read_bytes())
 
-        archives = self._archive_dirs()
-        self.assertEqual(len(archives), 1)
-        archive = archives[0]
-        self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((archive / "bbr-active").read_text(encoding="utf-8").strip(), reference)
-        self.assertEqual((archive / "bbr-active").stat().st_mode & 0o777, 0o600)
-        archived_runtime = archive / "backups" / reference / "runtime.json"
-        self.assertEqual(archived_runtime.read_bytes(), runtime_before)
-        self.assertEqual(archived_runtime.stat().st_mode & 0o777, 0o600)
-        archived_sysctl = archive / "backups" / reference / "sysctl.conf"
-        self.assertEqual(archived_sysctl.read_bytes(), original_bbr)
-        self.assertEqual(archived_sysctl.stat().st_mode & 0o777, 0o600)
-        for path in archive.rglob("*"):
-            self.assertEqual(path.stat().st_mode & 0o777, 0o700 if path.is_dir() else 0o600)
-            if path.is_file():
-                content = path.read_bytes()
-                self.assertNotIn(node_secret.encode(), content)
-                self.assertNotIn(b"other-panel-secret", content)
-        self.assertFalse((archive / "config.json").exists())
-        self.assertFalse((archive / "clients").exists())
+    def test_purge_defaults_to_restoring_original_bbr_and_removing_persistence(self) -> None:
+        original_bbr = (
+            b"# Managed by sing-box-manager: TCP BBR\n"
+            b"# original system setting\n"
+            b"net.core.default_qdisc=fq_codel\n"
+            b"net.ipv4.tcp_congestion_control=cubic\n"
+        )
+        self.bbr_file.write_bytes(original_bbr)
+        self.bbr_file.chmod(0o600)
+        self._enable_bbr()
+        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "bbr")
+        self.assertEqual(self.read_bbr_state()["default_qdisc"], "fq")
+        self.assertTrue(self.restore_file.exists())
+
+        result = self.shell('confirm() { return 0; }; purge_install_locked')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._assert_panel_removed()
+        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "cubic")
+        self.assertEqual(self.read_bbr_state()["default_qdisc"], "fq_codel")
+        self.assertEqual(self.bbr_file.read_bytes(), original_bbr)
+        self.assertEqual(self.bbr_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self._archive_dirs(), [])
+
+    def test_purge_removes_new_bbr_file_when_no_file_existed_before_enable(self) -> None:
+        self.assertFalse(self.bbr_file.exists())
+        self._enable_bbr()
+        self.assertTrue(self.bbr_file.exists())
+        result = self.shell("confirm() { return 0; }; purge_install_locked")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._assert_panel_removed()
+        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "cubic")
+        self.assertEqual(self.read_bbr_state()["default_qdisc"], "fq_codel")
+        self.assertFalse(self.bbr_file.exists())
+        self.assertEqual(self._archive_dirs(), [])
+
+    def test_purge_keeps_bbr_when_bbr_was_already_active_before_enable(self) -> None:
+        self.read_bbr_state(tcp_congestion_control="bbr", default_qdisc="cake")
+        self._enable_bbr()
+        result = self.shell("confirm() { return 0; }; purge_install_locked")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._assert_panel_removed()
+        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "bbr")
+        self.assertEqual(self.read_bbr_state()["default_qdisc"], "cake")
+        self.assertFalse(self.bbr_file.exists())
+        self.assertEqual(self._archive_dirs(), [])
 
     def test_purge_without_bbr_has_no_external_recovery_archive(self) -> None:
         kernel_before = self.read_bbr_state()
@@ -158,7 +179,7 @@ class UninstallBbrTest(unittest.TestCase):
             tuple(kernel_before[key] for key in ("tcp_congestion_control", "default_qdisc")),
         )
 
-    def test_keep_filters_false_config_runtime_and_does_not_migrate_sysctl_file(self) -> None:
+    def test_failed_restore_filters_false_config_runtime_and_does_not_migrate_sysctl_file(self) -> None:
         self._enable_bbr()
         reference = self.restore_file.read_text(encoding="utf-8").strip()
         source_backup = self.state_dir / "backups" / reference
@@ -174,9 +195,7 @@ class UninstallBbrTest(unittest.TestCase):
             encoding="utf-8",
         )
         (source_backup / "sysctl.conf").chmod(0o600)
-        bbr_file_before = self.bbr_file.read_bytes()
-        bbr_mode_before = self.bbr_file.stat().st_mode & 0o777
-        kernel_before = self.read_bbr_state()
+        kernel_before = self.read_bbr_state(fail_write_once=True)
 
         result = self.shell("purge_install_locked", check=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -193,8 +212,7 @@ class UninstallBbrTest(unittest.TestCase):
         for path in archive.rglob("*"):
             if path.is_file():
                 self.assertNotIn(b"synthetic-node-password", path.read_bytes())
-        self.assertEqual(self.bbr_file.read_bytes(), bbr_file_before)
-        self.assertEqual(self.bbr_file.stat().st_mode & 0o777, bbr_mode_before)
+        self.assertFalse(self.bbr_file.exists())
         self.assertEqual(
             tuple(self.read_bbr_state()[key] for key in ("tcp_congestion_control", "default_qdisc")),
             tuple(kernel_before[key] for key in ("tcp_congestion_control", "default_qdisc")),
@@ -204,15 +222,17 @@ class UninstallBbrTest(unittest.TestCase):
         self.state(active=True, enabled=True)
         self.read_bbr_state(tcp_congestion_control="bbr", default_qdisc="fq")
         self.bbr_file.write_bytes(self._desired_conf())
-        before_bbr = self.bbr_file.read_bytes()
-        before_state = self.bbr_state.read_bytes()
+        before_kernel = self.read_bbr_state()
         result = self.shell(body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("[提示]", result.stdout + result.stderr)
         self.assertNotIn("[错误]", result.stdout + result.stderr)
         self._assert_panel_removed()
-        self.assertEqual(self.bbr_file.read_bytes(), before_bbr)
-        self.assertEqual(self.bbr_state.read_bytes(), before_state)
+        self.assertFalse(self.bbr_file.exists())
+        self.assertEqual(
+            tuple(self.read_bbr_state()[key] for key in ("tcp_congestion_control", "default_qdisc")),
+            tuple(before_kernel[key] for key in ("tcp_congestion_control", "default_qdisc")),
+        )
         self.assertFalse(self.state()["active"])
         self.assertFalse(self.state()["enabled"])
 
@@ -242,8 +262,29 @@ class UninstallBbrTest(unittest.TestCase):
         self._assert_purge_preserves_bbr_without_recovery()
         self.assertEqual(self._archive_dirs(), [])
 
+    def test_non_panel_bbr_sysctl_file_is_preserved(self) -> None:
+        external = (
+            b"# Managed by sing-box-manager: TCP BBR\n"
+            b"net.core.default_qdisc=fq\n"
+            b"net.ipv4.tcp_congestion_control=bbr\n"
+            b"net.ipv4.tcp_syncookies=1\n"
+        )
+        self.read_bbr_state(tcp_congestion_control="bbr", default_qdisc="fq")
+        self.bbr_file.write_bytes(external)
+        self.bbr_file.chmod(0o640)
+        result = self.shell("purge_install_locked")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._assert_panel_removed()
+        self.assertIn("不属于本面板", result.stdout + result.stderr)
+        self.assertEqual(self.bbr_file.read_bytes(), external)
+        self.assertEqual(self.bbr_file.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "bbr")
+        self.assertEqual(self.read_bbr_state()["default_qdisc"], "fq")
+        self.assertEqual(self._archive_dirs(), [])
+
     def test_bbr_archive_copy_failure_warns_and_allows_purge(self) -> None:
         self._enable_bbr()
+        self.read_bbr_state(fail_write_once=True)
         self._assert_purge_preserves_bbr_without_recovery(r'''
 install() {
     for argument in "$@"; do
@@ -256,6 +297,7 @@ purge_install_locked
 
     def test_bbr_archive_creation_failure_warns_and_allows_purge(self) -> None:
         self._enable_bbr()
+        self.read_bbr_state(fail_write_once=True)
         self._assert_purge_preserves_bbr_without_recovery(r'''
 mktemp() {
     for argument in "$@"; do
@@ -266,6 +308,47 @@ mktemp() {
 purge_install_locked
 ''')
         self.assertEqual(self._archive_dirs(), [])
+
+    def test_service_stop_failure_leaves_bbr_and_panel_untouched(self) -> None:
+        self._enable_bbr()
+        self.state(active=True, enabled=True)
+        before_panel = self._panel_snapshot()
+        before_bbr = self.bbr_file.read_bytes()
+        before_restore = self.restore_file.read_bytes()
+        before_kernel = self.bbr_state.read_bytes()
+        result = self.shell(r'''
+systemctl() {
+    for argument in "$@"; do
+        [[ $argument == disable || $argument == stop ]] && return 1
+    done
+    command systemctl "$@"
+}
+purge_install_locked
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._panel_snapshot(), before_panel)
+        self.assertEqual(self.bbr_file.read_bytes(), before_bbr)
+        self.assertEqual(self.restore_file.read_bytes(), before_restore)
+        self.assertEqual(self.bbr_state.read_bytes(), before_kernel)
+        self.assertTrue(self.state()["active"])
+        self.assertTrue(self.state()["enabled"])
+        self.assertEqual(self._archive_dirs(), [])
+
+    def test_bbr_file_delete_failure_warns_but_does_not_block_uninstall(self) -> None:
+        self._enable_bbr()
+        result = self.shell(r'''
+rm() {
+    [[ ${*: -1} == "$BBR_SYSCTL_FILE" ]] && return 1
+    command rm "$@"
+}
+purge_install_locked
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._assert_panel_removed()
+        self.assertIn("未能删除 BBR 持久化文件", result.stdout + result.stderr)
+        self.assertEqual(self.read_bbr_state()["tcp_congestion_control"], "bbr")
+        self.assertEqual(self.read_bbr_state()["default_qdisc"], "fq")
+        self.assertTrue(self.bbr_file.exists())
 
     def test_cancelled_purge_confirmation_preserves_panel_and_bbr(self) -> None:
         self._enable_bbr()

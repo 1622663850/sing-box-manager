@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.26.2"
+SB_MANAGER_VERSION="1.26.3"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1733,7 +1733,7 @@ PY_PURGE_PATHS
 archive_bbr_recovery() (
     umask 077
     local bbr_backup=$1 bbr_archive=""
-    # Archive only validated recovery material; never restore shared kernel settings during purge.
+    # Copy only validated recovery material, never node credentials or unrelated backups.
     bbr_archive=$(mktemp -d "${STATE_DIR%/*}/sing-box-manager-bbr-recovery-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
     install -d -m 700 "$bbr_archive/backups" "$bbr_archive/backups/${bbr_backup##*/}" &&
         install -m 600 "$BBR_RESTORE_FILE" "$bbr_archive/bbr-active" &&
@@ -1749,21 +1749,45 @@ archive_bbr_recovery() (
     printf '%s\n' "$bbr_archive"
 )
 
-purge_install_locked() {
-    local source=${1:-} bbr_backup="" bbr_archive=""
-    [[ $# -le 1 ]] || return 1
-    is_managed && validate_purge_paths "$source" && check_conflicts || return 1
-    if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
-        if bbr_backup=$(bbr_restore_backup 2>/dev/null); then
-            if ! bbr_archive=$(archive_bbr_recovery "$bbr_backup" 2>/dev/null); then
-                bbr_archive=""
-                warn "BBR 恢复资料另存失败；继续卸载，当前 TCP BBR 参数及系统配置保持不变，恢复资料可能丢失。"
+purge_bbr_settings() (
+    local bbr_backup="" bbr_archive=""
+    [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]] || return 0
+    if bbr_backup=$(bbr_restore_backup 2>/dev/null); then
+        # The complete purge has already been confirmed with DELETE.
+        confirm() { return 0; }
+        if disable_bbr_locked >/dev/null 2>&1; then
+            info "已恢复开启 TCP BBR 前的算法、默认队列和原持久化文件状态。"
+            return 0
+        fi
+        warn "未能安全恢复开启前的 TCP BBR 设置；继续卸载，不猜测或强制修改当前运行参数。"
+        if bbr_backup=$(bbr_restore_backup 2>/dev/null) && bbr_archive=$(archive_bbr_recovery "$bbr_backup" 2>/dev/null); then
+            warn "有效 BBR 恢复资料另存于：$bbr_archive"
+        else
+            warn "BBR 恢复资料另存失败；继续卸载，恢复资料可能丢失。"
+        fi
+    else
+        warn "BBR 恢复记录缺失或无效；无法准确还原原算法和默认队列，保留当前运行参数并继续卸载。"
+    fi
+    if [[ -e $BBR_SYSCTL_FILE ]]; then
+        if bbr_owned_config "$BBR_SYSCTL_FILE"; then
+            if rm -f -- "$BBR_SYSCTL_FILE" && [[ ! -e $BBR_SYSCTL_FILE && ! -L $BBR_SYSCTL_FILE ]]; then
+                info "已删除本面板的 TCP BBR 持久化文件：$BBR_SYSCTL_FILE"
+            else
+                warn "未能删除 BBR 持久化文件，请检查权限并手动清理：$BBR_SYSCTL_FILE"
             fi
         else
-            warn "BBR 恢复记录缺失或无效；跳过恢复资料另存并继续卸载，当前 TCP BBR 参数及系统配置保持不变。"
+            warn "BBR 文件不属于本面板或含有其他设置，已保留，请人工核对：$BBR_SYSCTL_FILE"
         fi
     fi
+)
+
+purge_install_locked() {
+    local source=${1:-}
+    [[ $# -le 1 ]] || return 1
+    is_managed && validate_purge_paths "$source" && check_conflicts || return 1
     uninstall_core_locked purge || return 1
+    validate_purge_paths "$source" || return 1
+    purge_bbr_settings
     validate_purge_paths "$source" || return 1
     if ! rm -rf --one-file-system -- "$CONFIG_DIR" "$STATE_DIR" "$LIB_DIR" ||
        ! rm -f -- "$WRAPPER"; then
@@ -1772,7 +1796,6 @@ purge_install_locked() {
     [[ -z $source ]] || rm -f -- "$source" || return 1
     info "已彻底卸载 sing-box 核心、服务、面板命令、节点配置、连接信息和面板备份。"
     [[ -z $source ]] || info "已删除指定的下载脚本：$source"
-    [[ -z $bbr_archive ]] || info "系统 TCP BBR 保留；仅 BBR 恢复资料另存于：$bbr_archive"
     info "外部 ACME 证书、ACME 菜单、其他程序及系统日志保留。"
 }
 
@@ -1783,7 +1806,9 @@ purge_uninstall() {
     [[ $source != 0 ]] || return 0
     validate_purge_paths "$source" && check_conflicts || return 1
     if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
-        info "系统 TCP BBR 保留；有效恢复资料会尝试另存到 /var/lib/sing-box-manager-bbr-recovery-*；资料缺失、损坏或另存失败不阻止卸载。"
+        info "将撤销本面板的 TCP BBR 设置，恢复原算法、默认队列和原文件状态；这会影响整机默认 TCP 设置，也可能影响 Xray 等服务。"
+        info "恢复资料缺失或恢复失败不阻止卸载；仅清理本面板的 BBR 配置，不猜测原算法，不修改其他 sysctl 文件。"
+        info "BBR 持久化文件：$BBR_SYSCTL_FILE（原来无此文件则删除；原来已有则恢复；非本面板文件保留）。"
     fi
     printf '\n将永久删除以下路径（含全部节点及面板备份）：\n  %s\n  %s\n  %s\n  %s\n  %s\n' "$CORE_BIN" "$LIB_DIR" "$WRAPPER" "$CONFIG_DIR" "$STATE_DIR"
     printf '  %s\n' "$UNIT_FILE"
@@ -1796,7 +1821,7 @@ purge_uninstall() {
 
 uninstall_menu() {
     local uninstall_choice
-    printf '\n卸载 sing-box\n  1. 仅卸载核心和服务（保留面板、配置和备份）\n  2. 彻底卸载（清除面板、核心、配置、连接信息和备份）\n  0. 返回\n'
+    printf '\n卸载 sing-box\n  1. 仅卸载核心和服务（保留面板、配置和备份）\n  2. 彻底卸载（清除面板、核心、配置和备份，撤销本面板 BBR 设置）\n  0. 返回\n'
     prompt uninstall_choice "请选择卸载方式" 1 || return 1
     case "$uninstall_choice" in 0) return 0;;1) uninstall_core;;2) purge_uninstall;;*) fail "无效选项。";;esac
 }
