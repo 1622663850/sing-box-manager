@@ -508,6 +508,28 @@ def run_protocol(
                 _assert_peer(proxy_ports[0], target_port, b"127.0.0.1", protocol + "/restored-alice")
                 _assert_peer(proxy_ports[1], target_port, b"127.0.0.1", protocol + "/restored-bob")
                 _assert_peer(proxy_ports[2], target_port, b"127.0.0.1", protocol + "/restored-other")
+            # A missing metadata record must not turn an existing user route into a no-op.
+            call("bind_user_outbound_locked", main_tag, "1", "proxy")
+            bound = json.loads(config.read_text(encoding="utf-8"))
+            preserved_name = _node(bound, main_tag)["users"][0]["name"]
+            metadata_path = root / "var/lib/sing-box-manager/clients" / (main_tag + ".json")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.pop("user_outbound_routes")
+            write_json(metadata_path, metadata)
+            with _running_phase(core, work, config, server_port, protocol == "vless", clients):
+                _assert_peer(proxy_ports[0], target_port, b"127.0.0.2", protocol + "/missing-record-before")
+                _assert_peer(proxy_ports[1], target_port, b"127.0.0.1", protocol + "/missing-record-bob")
+            call("bind_user_outbound_locked", main_tag, "1", "-")
+            check(core, config, work)
+            recovered = json.loads(config.read_text(encoding="utf-8"))
+            if _node(recovered, main_tag)["users"][0]["name"] != preserved_name:
+                raise RuntimeError("record-less unbind changed the original user name")
+            if _auth_values(_node(recovered, main_tag)) != original_main_auth:
+                raise RuntimeError("record-less unbind changed credentials")
+            with _running_phase(core, work, config, server_port, protocol == "vless", clients):
+                _assert_peer(proxy_ports[0], target_port, b"127.0.0.1", protocol + "/missing-record-unbound")
+                _assert_peer(proxy_ports[1], target_port, b"127.0.0.1", protocol + "/missing-record-bob-unchanged")
+                _assert_peer(proxy_ports[2], target_port, b"127.0.0.1", protocol + "/missing-record-other-unchanged")
     print(f"PASS user outbound {protocol}: per-user and bulk route precedence preserved", flush=True)
 
 

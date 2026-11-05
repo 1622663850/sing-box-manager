@@ -482,6 +482,58 @@ class UserOutboundTest(unittest.TestCase):
         self.assertEqual(self._meta(node["tag"])["inbound"], saved)
         self.assertIn("// keep user outbound comment", self.config.read_text(encoding="utf-8"))
 
+    def test_unbind_recovers_missing_record_and_preserves_other_user_binding(self) -> None:
+        node = self._node("hysteria2", "recover-user-node", 25691, ("user1", "user2"))
+        self._write_config([node], outbounds=self._outbounds("proxy-a", "proxy-b"), comments=True)
+        metadata = self._metadata(node, note="keep")
+        self.assertEqual(self._bind(node["tag"], 1, "proxy-a").returncode, 0)
+        self.assertEqual(self._bind(node["tag"], 2, "proxy-b").returncode, 0)
+        meta = self._meta(node["tag"])
+        meta["user_outbound_routes"]["bindings"] = [r for r in meta["user_outbound_routes"]["bindings"] if r["name"] != "user2"]
+        fixture.dump(metadata, meta)
+        before_users = copy.deepcopy(self._config()["inbounds"][0]["users"])
+        result = self._bind(node["tag"], 2, "-")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rules = self._config()["route"]["rules"]
+        self.assertFalse(any(r.get("auth_user") == ["user2"] for r in rules))
+        self.assertTrue(any(r.get("auth_user") == ["user1"] and r["outbound"] == "proxy-a" for r in rules))
+        self.assertEqual(self._config()["inbounds"][0]["users"], before_users)
+        self.assertEqual(self._meta(node["tag"]), meta)
+        self.assertIn("// keep user outbound comment", self.config.read_text())
+
+    def test_unbind_without_any_metadata_handles_simple_scalar_and_array_rules(self) -> None:
+        node = self._node("vless", "recover-unowned-node", 25692, ("user1", "user2"))
+        foreign = {"inbound": ["other-node"], "auth_user": ["user2"], "outbound": "proxy-a"}
+        for scalar in (False, True):
+            with self.subTest(scalar=scalar):
+                rule = {"inbound": node["tag"] if scalar else [node["tag"]],
+                        "auth_user": "user2" if scalar else ["user2"], "outbound": "proxy-b"}
+                if not scalar: rule["action"] = "route"
+                self._write_config([node], rules=[rule, foreign], outbounds=self._outbounds("proxy-a", "proxy-b"))
+                result = self._bind(node["tag"], 2, "-")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self._config()["route"]["rules"], [foreign])
+                self.assertEqual(self._config()["inbounds"][0]["users"], node["users"])
+                self.assertFalse((self.state_dir / "clients" / (node["tag"] + ".json")).exists())
+
+    def test_unowned_unbind_cancel_and_ambiguous_rules_preserve_everything(self) -> None:
+        node = self._node("vless", "recover-refuse-node", 25693, ("user1", "user2"))
+        base = {"inbound": [node["tag"]], "auth_user": ["user2"], "action": "route", "outbound": "proxy-a"}
+        self._write_config([node], rules=[base], outbounds=self._outbounds("proxy-a"))
+        before = self.config.read_bytes()
+        self.assertNotEqual(self._bind(node["tag"], 2, "-", confirm=False).returncode, 0)
+        self.assertEqual(self.config.read_bytes(), before)
+        for rules in ([base, base], [dict(base, auth_user=["user1", "user2"])],
+                      [dict(base, inbound=[node["tag"], "other-node"])],
+                      [dict(base, domain_suffix=["example.com"])],
+                      [{"type": "logical", "mode": "and", "rules": [{"auth_user": ["user2"]}], "action": "route", "outbound": "proxy-a"}]):
+            self._write_config([node], rules=rules, outbounds=self._outbounds("proxy-a"))
+            before = self.config.read_bytes()
+            result = self._bind(node["tag"], 2, "-")
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("绑定未变化", result.stdout)
+            self.assertEqual(self.config.read_bytes(), before)
+
     def test_same_target_noop_cancel_invalid_index_and_unsupported_protocol_do_not_write(self) -> None:
         node = self._node("vless", "noop-user-node", 25701)
         self._write_config([node], outbounds=self._outbounds("proxy-a", "proxy-b"))

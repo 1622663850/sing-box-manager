@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.26.1"
+SB_MANAGER_VERSION="1.26.2"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -4314,6 +4314,23 @@ try:
     user = users[int(index) - 1]
     record = next((r for r in records if r['name'] == user.get('name')), None)
     if target == '-' and record is None:
+        # Metadata may have been lost while the actual per-user rule survived.
+        # Only a single, unambiguous rule scoped to this inbound and user is safe to remove.
+        name = user.get('name')
+        candidates = [r for r in rules if isinstance(r, dict) and name and
+                      set(r) <= {'type', 'inbound', 'auth_user', 'action', 'outbound'} and
+                      r.get('type', 'default') == 'default' and r.get('action', 'route') == 'route' and
+                      r.get('inbound') in (tag, [tag]) and r.get('auth_user') in (name, [name]) and
+                      name_ok(r.get('outbound'))]
+        referenced = [r for r in rules if name and name in auth_names(r) and
+                      (not isinstance(r, dict) or 'inbound' not in r or r.get('invert') is True or
+                       r.get('inbound') == tag or isinstance(r.get('inbound'), list) and tag in r['inbound'])]
+        require(len(candidates) <= 1, '此用户存在多条出站规则，无法确定要解除哪一条；请先核对 route.rules。')
+        if candidates:
+            config['route']['rules'] = [r for r in rules if r is not candidates[0]]
+            print('[提示] 未找到该用户的面板绑定记录；将仅移除配置中明确匹配此入站和此用户的出站规则，保留用户名及其他路由。', file=sys.stderr)
+        else:
+            require(not referenced, '此用户仍有自定义或共用路由，无法安全自动解除；请核对 route.rules，其他用户的规则未修改。')
         print(json.dumps(bundle, ensure_ascii=False)); raise SystemExit(0)
     if target != '-':
         require(sum(o.get('tag') == target for o in config.get('outbounds', [])) == 1, '出站不存在或名称重复。')
@@ -4386,7 +4403,11 @@ bind_user_outbound_locked() (
     jq -e --arg i "$bind_inbound" '[.config.inbounds[]?|select(.tag==$i)]|if length==1 then .[0] else error("inbound") end' "$work/before.json" >"$work/node.json" || exit 1
     validate_inbound_users "$work/node.json" || exit 1
     user_outbound_bundle bind "$work/before.json" "$bind_inbound" "$user_index" "$bind_target" >"$work/after.json" || exit 1
-    if [[ $(jq -Sc '{config,clients}' "$work/before.json") == "$(jq -Sc '{config,clients}' "$work/after.json")" ]]; then info "此用户的绑定未变化，无需保存或重启。"; exit 0; fi
+    if [[ $(jq -Sc '{config,clients}' "$work/before.json") == "$(jq -Sc '{config,clients}' "$work/after.json")" ]]; then
+        if [[ $bind_target == - ]]; then info "此用户没有可解除的单独出站绑定；仍按入站默认出站及其他路由规则处理，未修改配置。"
+        else info "此用户已绑定到所选出站，无需保存或重启。"; fi
+        exit 0
+    fi
     jq .config "$work/after.json" >"$work/config.json" || exit 1
     validate_config "$work/config.json" >"$work/check.log" 2>&1 || { fail "单用户绑定未通过核心校验，未保存。";exit 1; }
     if [[ $bind_target == - ]]; then info "解除 $bind_inbound 第 $user_index 个用户的绑定，恢复其余路由及入站默认出站。"
