@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.3"
+XR_MANAGER_VERSION="1.2.4"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2920,7 +2920,24 @@ autostart_menu(){
         prompt choice "按回车返回自启菜单" "" || return
     done
 }
-show_logs(){ if [[ ${1:-} == --follow ]]; then journalctl -u "$SERVICE" -n100 -f --no-pager -o cat; else journalctl -u "$SERVICE" -n100 --no-pager -o cat; fi; }
+show_logs() (
+    if [[ ${1:-} == --follow ]]; then
+        info "正在查看实时日志，按 Ctrl+C 停止并返回。"
+        trap 'exit 0' INT
+        journalctl -u "$SERVICE" -n100 -f --no-pager -o cat
+    else
+        journalctl -u "$SERVICE" -n100 --no-pager -o cat
+    fi
+)
+logs_menu(){
+    local choice
+    [[ -t 0 ]] || { show_logs; return; }
+    while true; do
+        printf '\n查看 Xray 日志\n  1. 最近 100 行日志\n  2. 查看实时日志（Ctrl+C 停止）\n  0. 返回\n'
+        prompt choice "请选择日志操作" 0 || return
+        case "$choice" in 0) return 0;; 1) show_logs;; 2) show_logs --follow;; *) warn "无效选项。";; esac || true
+    done
+}
 diagnose(){
     local issue=0 n tag
     require_core && validate_config "$CONFIG_FILE" || return 1
@@ -3744,7 +3761,7 @@ menu(){
       printf '\n  1. 安装 Xray 核心\n  2. 卸载 Xray 核心\n  3. 启动\n  4. 开机自启（开启/关闭）\n  5. 重新启动\n  6. 停止并关闭自启\n  7. 查看日志\n  8. 添加配置\n  9. 查看配置\n 10. 更新 Xray 核心\n 11. 修改配置\n 12. 删除配置\n 13. 备份、恢复、导出和诊断\n 14. 更新面板脚本\n 15. BBR 设置（TCP / Hy2 QUIC）\n 16. 恢复本脚本开启前 TCP BBR 设置\n 17. ACME 证书菜单\n 18. 入站用户管理\n 19. 出站 IP 优先级\n 20. 出站节点管理\n 21. XHTTP 上下行分离（客户端）\n  0. 退出\n'
       read -r -p "请输入选项 [0-21]: " choice || return 0
       case "$choice" in
-        0)return 0;;1)install_core;;2)uninstall_core;;3)with_lock service_action start;;4)autostart_menu;continue;;5)with_lock service_action restart;;6)with_lock service_action disable;;7)show_logs;;
+        0)return 0;;1)install_core;;2)uninstall_core;;3)with_lock service_action start;;4)autostart_menu;continue;;5)with_lock service_action restart;;6)with_lock service_action disable;;7)logs_menu;continue;;
         8)with_lock add_wizard_locked;;9)show_config;continue;;10)update_core;;11)with_lock edit_wizard_locked;;12)with_lock delete_inbound;;13)management_menu;continue;;
         14)if update_panel;then exec bash "$WRAPPER" menu;fi;;15)bbr_menu;continue;;16)disable_bbr;;17)open_acme_menu;;18)users_menu;continue;;19)outbound_preference_menu;continue;;20)outbounds_menu;continue;;21)with_lock xhttp_split_wizard_locked;;*)warn "请输入 0–21。";;
       esac || true
