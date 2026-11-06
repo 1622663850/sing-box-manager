@@ -462,6 +462,69 @@ class UserOutboundTest(unittest.TestCase):
         self.assertEqual(self._meta(node["tag"])["inbound"], saved)
         self.assertTrue(metadata.is_file())
 
+    def test_add_user_after_manual_deletion_cleans_only_owned_orphans(self) -> None:
+        for remaining in (1, 0):
+            with self.subTest(remaining=remaining):
+                tag = f"manual-hy2-{remaining}"
+                node = self._node("hysteria2", tag, 25510 + remaining)
+                original = self.root / "quic-before.json"
+                fixture.dump(original, node)
+                record = json.loads(self.shell('make_quic_bbr_record "$1"', str(original), check=True).stdout)
+                node["ignore_client_bandwidth"] = True
+                foreign = {"inbound": ["another-inbound"], "auth_user": ["bob"], "outbound": "direct"}
+                self._write_config([node], rules=[foreign], outbounds=self._outbounds("proxy-a", "proxy-b"), comments=True)
+                metadata = self._metadata(node, quic_bbr_restore=record)
+                self.assertEqual(self._bind(tag, 1, "proxy-a").returncode, 0)
+                self.assertEqual(self._bind(tag, 2, "proxy-b").returncode, 0)
+                manual = self._config()
+                manual["inbounds"][0]["users"] = node["users"][:remaining]
+                if not remaining:
+                    manual["route"]["rules"] = [r for r in manual["route"]["rules"]
+                                                 if r.get("inbound") != [tag] or r.get("auth_user") != ["bob"]]
+                self.config.write_text("// preserve manual edit\n" + json.dumps(manual), encoding="utf-8")
+                before = (self.config.read_bytes(), metadata.read_bytes())
+                body = r'''
+prompt() { printf -v "$1" '%s' bob; }
+prompt_secret() { printf -v "$1" '%s' synthetic-new-password; }
+confirm() { return "$TEST_CANCEL"; }
+'''
+                canceled = self.shell('TEST_CANCEL=1; ' + body + 'add_inbound_user_locked "$1"', tag, check=True)
+                self.assertIn("已取消", canceled.stdout)
+                self.assertEqual((self.config.read_bytes(), metadata.read_bytes()), before)
+                self.state(active=True, restart_failures=1)
+                failed = self.shell('TEST_CANCEL=0; ' + body + 'add_inbound_user_locked "$1"', tag)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertEqual((self.config.read_bytes(), metadata.read_bytes()), before)
+                self.shell('TEST_CANCEL=0; ' + body + 'add_inbound_user_locked "$1"', tag, check=True)
+                saved = self._config()
+                self.assertEqual(saved["inbounds"][0]["users"], node["users"][:remaining] + [
+                    {"name": "bob", "password": "synthetic-new-password"},
+                ])
+                expected = ([r for r in manual["route"]["rules"] if r.get("auth_user") == ["alice"]]
+                            if remaining else [])
+                self.assertEqual(saved["route"]["rules"], expected + [foreign])
+                meta = self._meta(tag)
+                self.assertEqual(meta["quic_bbr_restore"], record)
+                self.assertEqual(meta["inbound"], saved["inbounds"][0])
+                if remaining:
+                    self.assertEqual(meta["user_outbound_routes"]["inbound"], saved["inbounds"][0])
+                    self.assertEqual([r["name"] for r in meta["user_outbound_routes"]["bindings"]], ["alice"])
+                else:
+                    self.assertNotIn("user_outbound_routes", meta)
+                self.assertIn("// preserve manual edit", self.config.read_text(encoding="utf-8"))
+
+    def test_add_first_user_without_metadata_on_empty_vless_inbound(self) -> None:
+        node = self._node("vless", "empty-vless", 25512, ())
+        self._write_config([node])
+        self.shell('''
+TEST_UUID=$1
+prompt() { printf -v "$1" '%s' first; }
+prompt_secret() { printf -v "$1" '%s' "$TEST_UUID"; }
+confirm() { return 0; }
+add_inbound_user_locked empty-vless
+''', UUID1, check=True)
+        self.assertEqual(self._config()["inbounds"][0]["users"], [{"name": "first", "uuid": UUID1}])
+
     def test_editing_user_credentials_preserves_binding(self) -> None:
         node = self._node("vless", "credential-edit-node", 25601)
         self._write_config([node], comments=True, outbounds=self._outbounds("proxy-user"))

@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.26.5"
+SB_MANAGER_VERSION="1.26.6"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -2072,7 +2072,7 @@ replace_inbound_file() (
     umask 077
     local old_tag=$1 file=$2 server=${3:-} public_key=${4:-} expected=${5:-}
     local quic_record=${6:-} expected_metadata=${7:-}
-    local activation=${8:-preserve} start_requested=0
+    local activation=${8:-preserve} add_template=${9:-} start_requested=0
     local tag port old_port work snapshot old_metadata new_metadata effective backup=""
     local transaction=0 old_metadata_exists=0 active=0 changed=0
     require_core && safe_paths || exit 1
@@ -2122,7 +2122,7 @@ replace_inbound_file() (
     if [[ -n $expected && $(jq -Sc . "$expected") != "$(jq -Sc . "$work/old-inbound.json")" ]]; then
         fail "选中的配置在编辑期间已被修改，请重新打开编辑。"; exit 1
     fi
-    [[ $(detect_inbound_template "$file") == "$(detect_inbound_template "$work/old-inbound.json")" ]] || {
+    [[ $(detect_inbound_template "$file") == "$(detect_inbound_template "${add_template:-$work/old-inbound.json}")" ]] || {
         fail "修改配置不切换协议类型，请分别添加所需协议。"; exit 1;
     }
     detect_inbound_template "$file" >/dev/null || exit 1
@@ -2139,8 +2139,6 @@ replace_inbound_file() (
     [[ $tag == "$old_tag" || ! -e $new_metadata ]] || { fail "新名称已有连接信息文件，请使用其他名称。"; exit 1; }
     if [[ $expected_metadata == - ]]; then
         [[ ! -e $old_metadata ]] || { fail "连接信息已在确认期间创建，请重新操作。"; exit 1; }
-    elif [[ -n $expected_metadata ]]; then
-        cmp -s "$expected_metadata" "$old_metadata" || { fail "连接信息已在确认期间修改，请重新操作。"; exit 1; }
     fi
     if [[ -n $quic_record ]]; then
         case "$(jq -r .type "$file")" in hysteria2|tuic) ;; *) fail "此协议不支持 QUIC 恢复记录。"; exit 1;; esac
@@ -2149,28 +2147,47 @@ replace_inbound_file() (
             validate_quic_bbr_record "$work/quic-record.json" "$(jq -r .type "$file")" || exit 1
         fi
     fi
+    if [[ -f $old_metadata ]]; then
+        old_metadata_exists=1
+        cp -- "$old_metadata" "$work/metadata-before.json" || exit 1
+        jq -e 'type == "object"' "$work/metadata-before.json" >/dev/null || exit 1
+    else printf '{}\n' >"$work/metadata-before.json"; fi
+    if [[ -n $expected_metadata && $expected_metadata != - ]]; then
+        cmp -s "$expected_metadata" "$work/metadata-before.json" || { fail "连接信息已在确认期间修改，请重新操作。"; exit 1; }
+    fi
+    local config_base="$snapshot" metadata_base="$work/metadata-before.json"
+    if [[ -n $add_template && $old_metadata_exists -eq 1 ]]; then
+        json_query "$snapshot" --arg t "$old_tag" --slurpfile meta "$metadata_base" \
+            '{config:., clients:{($t):$meta[0]}}' >"$work/users-before.json" || exit 1
+        user_outbound_bundle reconcile "$work/users-before.json" "$old_tag" >"$work/users-reconciled.json" || exit 1
+        config_base="$work/reconciled-config.json"
+        metadata_base="$work/reconciled-metadata.json"
+        jq .config "$work/users-reconciled.json" >"$config_base" || exit 1
+        jq --arg t "$old_tag" '.clients[$t]' "$work/users-reconciled.json" >"$metadata_base" || exit 1
+        if [[ $(jq -Sc .inbound "$metadata_base") == "$(jq -Sc . "$work/old-inbound.json")" ]]; then
+            server=$(jq -r '.server // ""' "$metadata_base") || exit 1
+            public_key=$(jq -r '.public_key // ""' "$metadata_base") || exit 1
+        fi
+    fi
     effective=$server
     [[ -n $effective ]] || effective=$(read_default_server) || exit 1
     if [[ -z $effective && $(jq -r .type "$file") == hysteria2 ]]; then effective=$(jq -r '.tls.server_name // ""' "$file"); fi
     generate_client "$file" "${effective:-example.invalid}" "$public_key" 1 >"$work/client-check.json" || exit 1
-    json_query "$snapshot" --arg old "$old_tag" --slurpfile node "$file" \
+    json_query "$config_base" --arg old "$old_tag" --slurpfile node "$file" \
         '.inbounds |= map(if .tag==$old then $node[0] else . end)' >"$work/candidate.json" || exit 1
     validate_config "$work/candidate.json" || exit 1
-    if [[ -f $old_metadata ]]; then
-        old_metadata_exists=1
-        jq -e 'type == "object"' "$old_metadata" >/dev/null || exit 1
-        cp -- "$old_metadata" "$work/metadata-before.json" || exit 1
-    else printf '{}\n' >"$work/metadata-before.json"; fi
     jq --arg server "$server" --arg key "$public_key" --slurpfile node "$file" --arg record "$quic_record" \
         '.server=$server | .public_key=$key | .inbound=$node[0]
          | if has("user_outbound_routes") then .user_outbound_routes.inbound=$node[0] else . end
          | if $record=="" then . elif $record=="null" then del(.quic_bbr_restore)
-           else .quic_bbr_restore=($record|fromjson) end' "$work/metadata-before.json" >"$work/metadata.json" || exit 1
-    if jq -e 'has("user_outbound_routes")' "$work/metadata-before.json" >/dev/null; then
-        snapshot_bundle >"$work/user-routes-before.json" || exit 1
-        user_outbound_bundle validate "$work/user-routes-before.json" "$old_tag" >/dev/null || exit 1
-        jq --slurpfile config "$work/candidate.json" --slurpfile metadata "$work/metadata.json" --arg t "$tag" \
-            '.config=$config[0] | .clients[$t]=$metadata[0]' "$work/user-routes-before.json" >"$work/user-routes-after.json" || exit 1
+           else .quic_bbr_restore=($record|fromjson) end' "$metadata_base" >"$work/metadata.json" || exit 1
+    if jq -e 'has("user_outbound_routes")' "$metadata_base" >/dev/null; then
+        if [[ -z $add_template ]]; then
+            snapshot_bundle >"$work/user-routes-before.json" || exit 1
+            user_outbound_bundle validate "$work/user-routes-before.json" "$old_tag" >/dev/null || exit 1
+        fi
+        jq -n --slurpfile config "$work/candidate.json" --slurpfile metadata "$work/metadata.json" --arg t "$tag" \
+            '{config:$config[0], clients:{($t):$metadata[0]}}' >"$work/user-routes-after.json" || exit 1
         user_outbound_bundle validate "$work/user-routes-after.json" "$tag" >/dev/null || {
             fail "不能删除或更名已绑定出站的用户；请先解除其绑定。"; exit 1;
         }
@@ -2183,6 +2200,9 @@ replace_inbound_file() (
     cmp -s "$CONFIG_FILE" "$snapshot" || { fail "配置已被其他程序修改，已取消保存。"; exit 1; }
     [[ $old_metadata_exists -eq 0 ]] || cmp -s "$old_metadata" "$work/metadata-before.json" || {
         fail "连接信息已被其他程序修改，已取消保存。"; exit 1;
+    }
+    [[ $old_metadata_exists -ne 0 || ( ! -e $old_metadata && ! -L $old_metadata ) ]] || {
+        fail "连接信息已被其他程序创建，已取消保存。"; exit 1;
     }
     backup=$(mktemp -d "$BACKUP_DIR/edit-$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
     install -m 600 "$snapshot" "$backup/config.json" || exit 1
@@ -2690,7 +2710,7 @@ change_inbound_user() (
     umask 077
     local action=$1; shift
     local tag=${1:-} work type user_name credential password="" selected_user_index="" count
-    local metadata expected_metadata=- server="" public_key="" activation=preserve
+    local metadata expected_metadata=- server="" public_key="" activation=preserve template add_template="" empty_template=0
     [[ $# -le 1 ]] || { fail "用户操作仅接受一个入站配置名称。"; exit 1; }
     case "$action" in add|delete) ;; *) exit 1;; esac
     require_core && safe_paths || exit 1
@@ -2699,10 +2719,8 @@ change_inbound_user() (
     work=$(mktemp -d "$STATE_DIR/users-change.XXXXXX") || exit 1
     trap 'rm -rf -- "$work"' EXIT
     config_jq -e --arg tag "$tag" '[.inbounds[]? | select(.tag==$tag)] | if length==1 then .[0] else error("配置不存在或名称重复") end' >"$work/original.json" || exit 1
-    detect_inbound_template "$work/original.json" >/dev/null || exit 1
     type=$(jq -r .type "$work/original.json") || exit 1
     case "$type" in shadowsocks|snell) fail "此模板仅支持单密码/PSK，请使用修改配置。"; exit 1;; esac
-    count=$(inbound_user_count "$work/original.json") || exit 1
     metadata="$CLIENT_DIR/$tag.json"
     [[ ! -L $metadata && ( ! -e $metadata || -f $metadata ) ]] || { fail "连接信息文件无效。"; exit 1; }
     if [[ -f $metadata ]]; then
@@ -2712,10 +2730,24 @@ change_inbound_user() (
         if [[ $(jq -Sc .inbound "$expected_metadata") == "$(jq -Sc . "$work/original.json")" ]]; then
             server=$(jq -r '.server // ""' "$expected_metadata") || exit 1
             public_key=$(jq -r '.public_key // ""' "$expected_metadata") || exit 1
-        elif jq -e 'has("quic_bbr_restore")' "$expected_metadata" >/dev/null; then
+        elif [[ $action != add ]] && jq -e 'has("quic_bbr_restore")' "$expected_metadata" >/dev/null; then
             fail "节点与恢复记录不一致，已取消用户操作。"; exit 1
         fi
     fi
+    template="$work/original.json"
+    if [[ $action == add ]] && jq -e '.users == null or .users == []' "$template" >/dev/null; then
+        if [[ -f $expected_metadata ]] && jq -e --slurpfile live "$template" '
+            (.inbound // .user_outbound_routes.inbound) as $old |
+            select(($old | del(.users)) == ($live[0] | del(.users))) | $old
+        ' "$expected_metadata" >"$work/user-template.json"; then
+            template="$work/user-template.json"
+        elif jq -e '.type == "vless" and .tls.reality.enabled == true and .transport == null' "$template" >/dev/null; then
+            fail "当前没有用户，也没有可核对的 REALITY 用户模板；请先在 JSON 中补一个包含原 flow 设置的用户。"; exit 1
+        else
+            empty_template=1
+        fi
+    fi
+    [[ $empty_template -eq 1 ]] || detect_inbound_template "$template" >/dev/null || exit 1
     if [[ $action == add ]]; then
         prompt user_name "新用户名（字母/数字/短横线/下划线）" "user-$(date +%H%M%S)" || exit 1
         valid_tag "$user_name" || { fail "用户名格式无效。"; exit 1; }
@@ -2734,14 +2766,17 @@ change_inbound_user() (
             prompt_secret password "新用户 TUIC 密码（回车自动生成，@new 重新生成）" "$password" || exit 1
             [[ $password != @new ]] || password=$("$CORE_BIN" generate rand --base64 16) || exit 1
         fi
-        jq --arg name "$user_name" --arg credential "$credential" --arg password "$password" '
-          .type as $type | .users += [(.users[0] | .name=$name |
+        jq --arg name "$user_name" --arg credential "$credential" --arg password "$password" --slurpfile template "$template" '
+          .type as $type | .users += [($template[0].users[0] | .name=$name |
             if $type=="vless" or $type=="vmess" or $type=="tuic" then .uuid=$credential else .password=$credential end
             | if $type=="tuic" then .password=$password else . end)]' "$work/original.json" >"$work/updated.json" || exit 1
         activation=start
+        add_template=$template
+        if [[ $empty_template -eq 1 ]]; then add_template="$work/updated.json"; fi
         validate_inbound_users "$work/updated.json" || exit 1
-        confirm "确认给 $tag 添加用户 $user_name？共享原端口/TLS，原用户保留；服务将启动或短暂重启，失败回滚。" || { info "已取消。"; exit 0; }
+        confirm "确认给 $tag 添加用户 $user_name？保存时同步清理已手动删除用户的面板绑定。服务将启动或短暂重启，失败回滚。" || { info "已取消。"; exit 0; }
     else
+        count=$(inbound_user_count "$work/original.json") || exit 1
         [[ $count -gt 1 ]] || { fail "不能删除最后一个用户；如需移除此入站，请使用删除配置。"; exit 1; }
         select_inbound_user selected_user_index "$work/original.json" || exit 1
         [[ -n $selected_user_index ]] || exit 0
@@ -2752,7 +2787,7 @@ change_inbound_user() (
         jq --argjson i "$((selected_user_index - 1))" 'del(.users[$i])' "$work/original.json" >"$work/updated.json" || exit 1
         confirm "确认删除 $tag 的第 $selected_user_index 个用户？其凭据将失效，其他用户保留；运行中的服务会短暂重启。" || { info "已取消。"; exit 0; }
     fi
-    replace_inbound_file "$tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" "" "$expected_metadata" "$activation" || exit 1
+    replace_inbound_file "$tag" "$work/updated.json" "$server" "$public_key" "$work/original.json" "" "$expected_metadata" "$activation" "$add_template" || exit 1
     info "入站用户已更新。可从用户管理菜单按用户导出独立分享链接。"
 )
 
@@ -4317,15 +4352,34 @@ try:
     require(isinstance(rules, list), '现有规则列表无效。')
     collection = meta.get('user_outbound_routes')
     records = []
+    reconcile = mode == 'reconcile'
+    live_users = node.get('users')
+    if reconcile and live_users is None: live_users = []
+    recorded_node = node
     if 'user_outbound_routes' in meta:
         require(isinstance(collection, dict) and set(collection) == {'format', 'created_metadata', 'bindings', 'inbound'} and
                 collection.get('format') == 'sing-box-manager-user-outbound-route-v1' and
                 isinstance(collection.get('created_metadata'), bool) and
                 isinstance(collection.get('bindings'), list) and bool(collection['bindings']), '用户绑定记录格式无效。')
-        require('inbound' not in meta or meta['inbound'] == node, '节点与用户绑定记录不一致，请先核对外部修改。')
-        require(collection.get('inbound') == node, '入站用户与绑定快照不一致，请先核对外部修改。')
         records = collection['bindings']
-    users = node.get('users')
+        if reconcile: recorded_node = collection['inbound']
+        require('inbound' not in meta or meta['inbound'] == recorded_node, '节点与用户绑定记录不一致，请先核对外部修改。')
+        require(collection.get('inbound') == recorded_node, '入站用户与绑定快照不一致，请先核对外部修改。')
+    elif reconcile:
+        recorded_node = meta.get('inbound', node)
+    users = live_users
+    sync_snapshot = False
+    if reconcile and recorded_node != node:
+        old_users = recorded_node.get('users') if isinstance(recorded_node, dict) else None
+        sync_snapshot = (isinstance(old_users, list) and isinstance(live_users, list) and
+                         {k: v for k, v in recorded_node.items() if k != 'users'} ==
+                         {k: v for k, v in node.items() if k != 'users'} and
+                         all(u in old_users for u in live_users))
+        require(sync_snapshot or not (records or 'quic_bbr_restore' in meta),
+                '入站的设置或现有用户认证也发生了变化，无法安全清理绑定或同步恢复记录。')
+        if sync_snapshot: users = old_users
+    stale_rules = []
+    surviving = []
     if mode == 'bind' or records:
         require(node.get('type') in {'vless', 'vmess', 'hysteria2', 'tuic', 'anytls'} and
                 isinstance(users, list) and bool(users) and all(isinstance(u, dict) for u in users), '此模板不支持按认证用户绑定出站。')
@@ -4347,8 +4401,18 @@ try:
         require((record['name_before_present'] and record['name_before'] == name) or
                 (not record['name_before'] and re.fullmatch(r'user-route-[0-9a-f]{16}', name)), '原用户名与自动名称恢复记录不一致。')
         require(isinstance(rule, dict) and name_ok(rule.get('outbound')) and
-                rule == {'inbound': [tag], 'auth_user': [name], 'action': 'route', 'outbound': rule.get('outbound')} and
-                sum(r == rule for r in rules) == 1, '用户绑定规则已被外部修改、删除或重复，未保存。')
+                rule == {'inbound': [tag], 'auth_user': [name], 'action': 'route', 'outbound': rule.get('outbound')}, '用户绑定规则格式无效。')
+        orphan = sync_snapshot and not any(u.get('name') == name for u in live_users)
+        matches = rules.count(rule)
+        require(matches == 1 or (orphan and matches == 0), '用户绑定规则已被外部修改、删除或重复，未保存。')
+        if orphan:
+            require(matches != 0 or not any(isinstance(r, dict) and r.get('inbound') == [tag] and
+                                           r.get('auth_user') == [name] for r in rules),
+                    '已删除用户的路由被手动修改，请先核对该规则。')
+            if matches: stale_rules.append(rule)
+        else:
+            surviving.append(record)
+    if reconcile: records = surviving
     bulk = meta.get('outbound_route')
     if bulk is not None and (records or mode == 'bind'):
         require(isinstance(bulk, dict) and bulk.get('format') == 'sing-box-manager-outbound-route-v1' and
@@ -4356,6 +4420,19 @@ try:
                 bulk['rule'] == {'inbound': [tag], 'action': 'route', 'outbound': bulk['rule']['outbound']} and
                 sum(r == bulk['rule'] for r in rules) == 1, '入站默认绑定记录已被外部修改，未保存。')
         require(all(rules.index(e['rule']) < rules.index(bulk['rule']) for e in records), '用户规则被入站默认规则遮蔽，请先核对外部调整的优先级。')
+    if reconcile:
+        if sync_snapshot:
+            if 'inbound' in meta: meta['inbound'] = node
+            if collection is not None:
+                if records:
+                    collection['inbound'] = node
+                    collection['bindings'] = records
+                else:
+                    meta.pop('user_outbound_routes')
+            if stale_rules:
+                config['route']['rules'] = [r for r in rules if r not in stale_rules]
+        print(json.dumps(bundle, ensure_ascii=False))
+        raise SystemExit(0)
     if mode == 'validate':
         print(json.dumps({'rules': [r for r in rules if any(r == e['rule'] for e in records)],
                           'names': [e['name'] for e in records]}, ensure_ascii=False))

@@ -174,6 +174,8 @@ sudo sing-box edit my-node         # 直接编辑指定节点
 
 ## 同一入站添加多个用户
 
+v1.26.6 起，手动从 JSON 删除入站用户后，可直接用 **18 → 2 添加用户**。保存时会同步清理本面板记录的失效用户绑定和对应路由，并更新连接信息。即使删到零用户，也可重新添加。需要原 `flow` 的 TCP REALITY 入站会从匹配的旧快照获取；无快照时需先手动补回原 `flow`。其余用户、外部路由和 QUIC BBR 恢复资料沿用现有配置。若同时手动更改了绑定用户的身份或其他入站设置，面板会提示核对，避免继承错误的绑定。
+
 v1.20.0 起，主菜单 **18. 入站多用户管理** 支持 VLESS、VMess、Hysteria 2、TUIC、AnyTLS：同一入站共用监听端口及 TLS，每位用户使用独立 UUID/密码。[sing-box VLESS 用户字段](https://sing-box.sagernet.org/configuration/inbound/vless/#users)及 [Hy2 用户字段](https://sing-box.sagernet.org/configuration/inbound/hysteria2/#users)对应服务端的 `users` 数组。当前 Shadowsocks 2022 单密码模板保持原有行为，不自动转换成多用户密钥格式。
 
 子菜单 **1** 查看用户序号和名称（不显示凭据），**2** 添加用户，**3** 删除用户，**4** 按用户导出客户端 JSON/分享链接，**5** 修改入站与所选用户认证，**0** 返回。新用户名使用字母、数字、短横线或下划线；UUID/密码支持隐藏输入和随机生成。重复认证、重复非空用户名、不一致的 VLESS flow 或不支持的字段会被拒绝，不能删除最后一个用户。VLESS REALITY Vision 的新用户继承原 flow；VMess 保持 AEAD `alterId=0`。
