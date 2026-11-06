@@ -94,13 +94,21 @@ prompt_secret() {
 }
 confirm() { return 0; }
 
+check_saved_layout() {
+    format_config_source "$CONFIG_FILE" >"$root/formatted.json" || return 1
+    cmp -s "$CONFIG_FILE" "$root/formatted.json"
+}
+
 add_wizard_locked || exit $?
+check_saved_layout || exit 1
 config_jq --arg t "$fixture_tag" '[.inbounds[]?|select(.tag==$t)]|if length==1 then .[0] else error("added node missing") end' >"$root/inbound-before.json" || exit 1
 edit_wizard_locked "$fixture_tag" || exit $?
+check_saved_layout || exit 1
 config_jq --arg t "$fixture_tag" '[.inbounds[]?|select(.tag==$t)]|if length==1 then .[0] else error("edited node missing") end' >"$root/inbound.json" || exit 1
 show_client "$fixture_tag" example.com json-only 1 >"$root/outbound.json" || exit 1
 show_client "$fixture_tag" example.com link-only 1 >"$root/link.txt" || exit 1
 delete_inbound "$fixture_tag" >"$root/delete.log" 2>&1 || exit 1
+check_saved_layout || exit 1
 cleaned=1
 [[ $(config_jq --arg t "$fixture_tag" '[.inbounds[]?|select(.tag==$t)]|length') == 0 ]] || exit 1
 [[ ! -e "$CLIENT_DIR/$fixture_tag.json" && ! -L "$CLIENT_DIR/$fixture_tag.json" ]] || exit 1

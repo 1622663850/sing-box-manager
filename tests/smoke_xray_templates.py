@@ -52,6 +52,9 @@ def run(core, manager, only=None):
                 *map(str, args), locked=locked, environment=env)
             if result.returncode:
                 raise RuntimeError(function + ' failed')
+            if locked and config.exists():
+                saved = config.read_text(encoding='utf-8')
+                assert saved == json.dumps(json.loads(saved), ensure_ascii=False, indent=2) + '\n', 'persisted config layout is not canonical'
             return result.stdout
 
         certificate, key = pq._large_chain_material(work)

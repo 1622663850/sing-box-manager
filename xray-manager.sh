@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.8"
+XR_MANAGER_VERSION="1.2.9"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -61,7 +61,7 @@ check_conflicts(){
     [[ -z $fragment || $fragment == "$UNIT_FILE" ]] || { fail "发现外部 Xray 服务文件，拒绝自动接管。"; return 1; }
 }
 base_config(){
-    printf '%s\n' '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct","settings":{}}],"routing":{"rules":[]}}'
+    jq -n '{log:{loglevel:"warning"},inbounds:[],outbounds:[{protocol:"freedom",tag:"direct",settings:{}}],routing:{rules:[]}}'
 }
 
 valid_port() {
@@ -145,7 +145,7 @@ config_jq() { json_query "$CONFIG_FILE" "$@"; }
 preserve_config_source() {
     have python3 || { fail "保留配置注释需要 Python 3，请重新运行 setup 安装依赖。"; return 1; }
     python3 - "$@" <<'PY_JSONC_EDITOR'
-"""Update JSONC values without rewriting untouched source text (stdlib only)."""
+"""Preserve JSONC annotations while updating and formatting configuration."""
 import difflib
 import json
 from pathlib import Path
@@ -455,7 +455,7 @@ def main():
         else:
             original = Path(sys.argv[1]).read_bytes().decode("utf-8")
             candidate = json.loads(Path(sys.argv[2]).read_bytes().decode("utf-8"))
-            result = update(original, candidate).encode("utf-8")
+            result = format_source(update(original, candidate)).encode("utf-8")
         sys.stdout.buffer.write(result)
     except Exception:
         print("JSONC 更新失败；原文件未修改。", file=sys.stderr)
@@ -550,7 +550,7 @@ commit_config() (
             fail "保留注释后的配置与目标不一致，已取消保存。"; exit 1;
         }
     else
-        cp -- "$candidate" "$snapshot" || exit 1
+        format_config_source "$candidate" >"$snapshot" || exit 1
     fi
     validate_config "$snapshot" || { fail "配置检查未通过，现有配置未修改。"; exit 1; }
     service_is_active && active=1
@@ -674,7 +674,7 @@ apply_bundle() (
         if [[ $(json_query "$work/source.json" -Sc .) != "$(jq -Sc . "$work/config.json")" ]]; then
             fail "备份的注释原文与配置数据不一致，已取消恢复。"; exit 1
         fi
-        cp -- "$work/source.json" "$work/config.json" || exit 1
+        format_config_source "$work/source.json" >"$work/config.json" || exit 1
     fi
     validate_config "$work/config.json" || exit 1
     mkdir -m 700 "$work/clients" || exit 1
@@ -1690,7 +1690,7 @@ try:
         data={'format':'xray-manager-purge-bbr-v1','existed':existed,
               'sha256':hashlib.sha256((backup/'sysctl.conf').read_bytes()).hexdigest() if existed else '',
               'mode':original['config_mode'] if existed else ''}
-        print(json.dumps(data));raise SystemExit(0)
+        print(json.dumps(data, indent=2));raise SystemExit(0)
     if mode!='check' or marker.is_symlink() or marker.stat().st_size>4096: raise ValueError()
     data=json.loads(marker.read_text())
     if (set(data)!={'format','existed','sha256','mode'} or
