@@ -135,6 +135,7 @@ raise SystemExit(2)
 WIZARD_DRIVER = r'''
 wizard_mode=${1:-off}
 wizard_selected=${2:-}
+wizard_mss=${3:-}
 prompt() {
     local variable=$1 message=${2:-} default=${3:-} value
     value=$default
@@ -162,6 +163,7 @@ prompt() {
         port)
             [[ -n $wizard_selected ]] || value=18480
             ;;
+        mss) value=$wizard_mss;;
         tls_name) value=${default:-example.com};;
         server) value=${default:-example.com};;
         choice)
@@ -263,8 +265,8 @@ class XrayPostQuantumTest(fixture.XrayFixture):
     def pq(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         return self.shell('pq_crypto "$@"', *args, check=check)
 
-    def wizard(self, mode: str, selected: str = "") -> subprocess.CompletedProcess[str]:
-        return self.shell(WIZARD_DRIVER, mode, selected)
+    def wizard(self, mode: str, selected: str = "", mss: str = "") -> subprocess.CompletedProcess[str]:
+        return self.shell(WIZARD_DRIVER, mode, selected, mss)
 
     def seed_reality(self, tag: str, *, with_pq: bool = True) -> tuple[dict, Path]:
         node = self.generate(
@@ -603,11 +605,12 @@ class XrayPostQuantumTest(fixture.XrayFixture):
         self.assertEqual(node["tag"], "pq-add-off")
         self.assertEqual(node["settings"]["decryption"], "none")
         self.assertNotIn("mldsa65Seed", node["streamSettings"].get("realitySettings", {}))
+        self.assertNotIn("sockopt", node["streamSettings"])
         calls = self.core_calls()
         self.assertFalse(any(call and call[0] in {"mlkem768", "mldsa65"} for call in calls))
 
     def test_wizard_add_can_enable_both_pq_layers(self) -> None:
-        result = self.wizard("on")
+        result = self.wizard("on", mss="01200")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(GENERATED_MLKEM_SEED, result.stdout + result.stderr)
         self.assertNotIn(GENERATED_MLDSA_SEED, result.stdout + result.stderr)
@@ -615,6 +618,9 @@ class XrayPostQuantumTest(fixture.XrayFixture):
         self.assertTrue(node["settings"]["decryption"].startswith("mlkem768x25519plus.native.600s."))
         self.assertEqual(node["settings"]["decryption"].rsplit(".", 1)[-1], GENERATED_MLKEM_SEED)
         self.assertEqual(node["streamSettings"]["realitySettings"]["mldsa65Seed"], GENERATED_MLDSA_SEED)
+        self.assertEqual(node["streamSettings"]["sockopt"], {"tcpMaxSeg": 1200})
+        exported = self.shell("show_client pq-add-on example.com json-only 1", check=True)
+        self.assertNotIn("sockopt", json.loads(exported.stdout)["streamSettings"])
         calls = self.core_calls()
         self.assertIn(["mlkem768"], calls)
         self.assertIn(["mldsa65"], calls)
@@ -736,6 +742,29 @@ class XrayPostQuantumTest(fixture.XrayFixture):
         self.assertEqual(node["settings"]["decryption"], "none")
         self.assertNotIn("mldsa65Seed", node["streamSettings"]["realitySettings"])
         self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["inbound"], node)
+
+    def test_edit_mss_on_existing_pq_node_preserves_other_settings(self) -> None:
+        original, _ = self.seed_reality("mss-edit")
+        original["streamSettings"]["sockopt"] = {"tcpKeepAliveIdle": 90}
+        self.write_config([original])
+        metadata = self.write_metadata(original, server="example.com", public_key=PUBLIC)
+        for invalid in ("87", "32768", "1200.0"):
+            with self.subTest(invalid=invalid):
+                before = self.config.read_bytes()
+                metadata_before = metadata.read_bytes()
+                result = self.wizard("retain", "mss-edit", invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TCP MSS 必须", result.stderr)
+                self.assert_unchanged(before, metadata, metadata_before)
+
+        for entered, expected in (("1200", {"tcpKeepAliveIdle": 90, "tcpMaxSeg": 1200}),
+                                  ("", {"tcpKeepAliveIdle": 90})):
+            result = self.wizard("retain", "mss-edit", entered)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            original["streamSettings"]["sockopt"] = expected
+            saved = json.loads(self.config.read_text(encoding="utf-8"))["inbounds"][0]
+            self.assertEqual(saved, original)
+            self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["inbound"], original)
 
     def test_edit_cancel_and_reality_pq_target_failure_leave_config_and_metadata_unchanged(self) -> None:
         _, metadata = self.seed_reality("cancel-pq")

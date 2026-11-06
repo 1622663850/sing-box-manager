@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.5"
+XR_MANAGER_VERSION="1.2.6"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2589,6 +2589,8 @@ elif protocol == "hysteria":
 else:
     raise SystemExit(1)
 stream = dict(value.get("streamSettings", {}))
+# Inbound socket options apply to the server listener only.
+stream.pop("sockopt", None)
 if stream:
     method = stream.get("method", stream.get("network", "raw"))
     if method == "tcp": method = "raw"
@@ -2813,6 +2815,7 @@ node_wizard_locked() (
     umask 077
     local certificate="" tls_key=""
     local obfs="" obfs_choice
+    local mss="" current_mss=""
     local decryption=none mldsa_seed="" old_mldsa="" pq_default=1 pq_target=""
     local old=${1:-} protocol="" tag port=443 credential="" extra="" private_key="" public_key="" sid="" tls_name="" cert="" key="" server="" pair work index=1 count=1 old_tls="" choice file
     require_core && safe_paths || exit 1
@@ -2847,6 +2850,18 @@ node_wizard_locked() (
     fi
     prompt tag "配置名称（字母/数字/短横线/下划线）" "$tag" && prompt port "监听端口" "$port" || exit 1
     if ! valid_tag "$tag" || ! valid_port "$port"; then fail "名称或端口无效。"; exit 1; fi
+    if [[ $protocol != hysteria ]]; then
+        if [[ -n $old ]]; then
+            current_mss=$(jq -r '.streamSettings.sockopt.tcpMaxSeg | numbers | select(. > 0)' "$work/original") || exit 1
+        fi
+        prompt mss "TCP MSS（字节，当前 ${current_mss:-系统默认}，留空使用系统默认）" || exit 1
+        if [[ -n $mss ]]; then
+            if [[ ! $mss =~ ^[0-9]{1,5}$ ]] || (( 10#$mss < 88 || 10#$mss > 32767 )); then
+                fail "TCP MSS 必须是 88 至 32767 的整数，或留空使用系统默认。"; exit 1
+            fi
+            mss=$((10#$mss))
+        fi
+    fi
     prompt_secret credential "UUID/密码（回车保留或自动生成，@new 重新生成）" "$credential" || exit 1
     if [[ $credential == @new ]]; then case "$protocol" in vless-*|vmess-*) credential=$("$CORE_BIN" uuid);; *) credential=$(openssl rand -base64 16);; esac || exit 1; fi
     case "$protocol" in *-ws|*-ws-tls|*-xhttp-*) prompt extra "传输路径" "${extra:-/xray}" || exit 1;; *-grpc-*) prompt extra "gRPC 服务名" "${extra:-TunService}" || exit 1;; esac
@@ -2925,14 +2940,28 @@ node_wizard_locked() (
         if [[ $protocol == *reality* && -z $mldsa_seed ]]; then
             jq 'del(.streamSettings.realitySettings.mldsa65Seed)' "$work/updated" >"$work/no-mldsa" && mv "$work/no-mldsa" "$work/updated" || exit 1
         fi
+        file="$work/updated"
+    else
+        jq 'if .settings.users != null then .settings.users[0].email="user1" else . end' "$work/generated" >"$work/named" || exit 1
+        file="$work/named"
+    fi
+    if [[ $protocol != hysteria ]]; then
+        jq --arg mss "$mss" '
+          if $mss != "" then .streamSettings.sockopt.tcpMaxSeg=($mss|tonumber)
+          elif (.streamSettings.sockopt | type == "object" and has("tcpMaxSeg")) then
+            del(.streamSettings.sockopt.tcpMaxSeg) |
+            if .streamSettings.sockopt=={} then del(.streamSettings.sockopt) else . end
+          else . end' "$file" >"$work/mss" || exit 1
+        file="$work/mss"
+    fi
+    if [[ -n $old ]]; then
         confirm "保存修改？（其他用户保留）" || exit 0
         snapshot_bundle >"$work/current" || exit 1
         [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/snapshot")" ]] || { fail "编辑期间配置或连接信息已变化。"; exit 1; }
-        replace_inbound_file "$old" "$work/updated" "$server" "$public_key" "$work/original" || exit 1
+        replace_inbound_file "$old" "$file" "$server" "$public_key" "$work/original" || exit 1
     else
-        jq 'if .settings.users != null then .settings.users[0].email="user1" else . end' "$work/generated" >"$work/named" && mv "$work/named" "$work/generated" || exit 1
         confirm "添加节点并按需启动/重启 Xray？" y || exit 0
-        add_managed_inbound "$work/generated" "$server" "$public_key" || exit 1
+        add_managed_inbound "$file" "$server" "$public_key" || exit 1
     fi
     info "配置已保存，请按实际传输放行云安全组和系统防火墙；面板不改防火墙。"
     if [[ -n $server ]] && ! show_client "$tag" "$server" full all; then
