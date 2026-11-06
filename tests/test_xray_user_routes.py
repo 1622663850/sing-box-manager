@@ -348,11 +348,12 @@ user_outbound_wizard_locked bind'''
         self.assertEqual(rules[0]["inboundTag"], ["user-route-node"])
         self.assertEqual(rules[1], self.unrelated_rule)
 
-    def test_unbind_after_config_import_preserves_stale_client_cache_and_other_routes(self) -> None:
+    def test_unbind_and_rebind_after_config_import_preserve_stale_client_cache_and_other_routes(self) -> None:
         self.seed()
         self.bind(1, "exit-a")
         self.bind(2, "exit-b")
-        before_meta = self.metadata()
+        original_meta = self.metadata()
+        before_meta = copy.deepcopy(original_meta)
         # Full-config import intentionally leaves client metadata untouched.
         imported = json.loads(self.config.read_text(encoding="utf-8"))
         imported["inbounds"][0]["port"] = 18602
@@ -377,6 +378,13 @@ user_outbound_wizard_locked unbind'''
         before = self.snapshot_bytes()
         self.shell(prompt, check=True)
         self.assertEqual(self.snapshot_bytes(), before)
+        rebind = prompt.replace('user_outbound_wizard_locked unbind', r'''
+select_outbound() { printf -v "$1" '%s' exit-b; }
+user_outbound_wizard_locked bind''')
+        result = self.shell(rebind)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")), imported)
+        self.assertEqual(self.metadata(), original_meta)
         self.assertEqual(sorted(self.backups_dir.iterdir()), [])
 
     @unittest.skipIf(os.name == "nt", "real menu prompts require a Linux PTY")

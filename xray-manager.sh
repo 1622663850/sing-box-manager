@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.6"
+XR_MANAGER_VERSION="1.2.7"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2036,7 +2036,7 @@ try:
         users, key = users_of(node)
         if not 0 <= index < len(users): raise ValueError()
         meta = data["clients"].get(tag, {})
-        if outbound != "-" and meta.get("inbound") is not None and meta["inbound"] != node: raise ValueError()
+        refresh_cache = not meta or meta.get("inbound") == node
         guard(data, tag, node)
         token = identity(node, users[index], key)
         records = records_for(data, tag)
@@ -2064,8 +2064,8 @@ try:
         else:
             rules.insert(0, rule)
             records[token] = {"format":"xray-manager-user-route-v1", "rule":rule, "identity":token}
-        # Unbinding only removes an owned rule; do not refresh stale client settings.
-        if outbound != "-": meta["inbound"] = node
+        # Preserve stale client settings so they cannot become valid again through a route change.
+        if outbound != "-" and refresh_cache: meta["inbound"] = node
         if records: meta["user_outbound_routes"] = records
         else: meta.pop("user_outbound_routes", None)
         data["clients"][tag] = meta
