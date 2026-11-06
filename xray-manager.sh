@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.9"
+XR_MANAGER_VERSION="1.2.10"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -878,11 +878,10 @@ prompt_secret() {
 
 
 confirm() {
-    local answer default=${2:-n} choices=y/N
+    local answer
     [[ -t 0 ]] || { fail "此操作需要交互确认，请在终端运行。"; return 1; }
-    [[ $default != y ]] || choices=Y/n
-    read -r -p "$1 [$choices]: " answer || return 1
-    answer=${answer:-$default}
+    read -r -p "$1（默认 Y） [Y/n]: " answer || return 1
+    answer=${answer:-y}
     [[ $answer == y || $answer == Y ]]
 }
 
@@ -2968,7 +2967,7 @@ node_wizard_locked() (
         [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/snapshot")" ]] || { fail "编辑期间配置或连接信息已变化。"; exit 1; }
         replace_inbound_file "$old" "$file" "$server" "$public_key" "$work/original" || exit 1
     else
-        confirm "添加节点并按需启动/重启 Xray？" y || exit 0
+        confirm "添加节点并按需启动/重启 Xray？" || exit 0
         add_managed_inbound "$file" "$server" "$public_key" || exit 1
     fi
     info "配置已保存，请按实际传输放行云安全组和系统防火墙；面板不改防火墙。"
