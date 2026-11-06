@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.10"
+XR_MANAGER_VERSION="1.2.11"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -2012,22 +2012,59 @@ def records_for(bundle, tag):
     if not isinstance(records, dict): raise ValueError()
     return records
 
+def recorded_rule(tag, token, record):
+    rule = record["rule"]
+    email = rule["user"][0]
+    expected = {"type":"field", "inboundTag":[tag], "user":[email], "outboundTag":rule["outboundTag"]}
+    if (record.get("format") != "xray-manager-user-route-v1" or record.get("identity") != token or
+        len(token) != 64 or any(c not in "0123456789abcdef" for c in token) or
+        not isinstance(email, str) or not email or email.lower().startswith("regexp:") or rule != expected):
+        raise ValueError()
+    return rule, email
+
 def guard(bundle, tag, node):
     records = records_for(bundle, tag)
     if not records: return
     users, key = users_of(node)
     rules = bundle["config"].get("routing", {}).get("rules", [])
     for token, record in records.items():
-        rule = record["rule"]
-        email = rule["user"][0]
-        expected = {"type":"field", "inboundTag":[tag], "user":[email], "outboundTag":rule["outboundTag"]}
+        rule, email = recorded_rule(tag, token, record)
         matches = [u for u in users if identity(node, u, key) == token]
-        if (record.get("format") != "xray-manager-user-route-v1" or record.get("identity") != token or
-            not isinstance(email, str) or not email or email.lower().startswith("regexp:") or
-            rule != expected or rules.count(rule) != 1 or len(matches) != 1 or
+        if (rules.count(rule) != 1 or len(matches) != 1 or
             matches[0].get("email") != email or sum(u.get("email") == email for u in users) != 1 or
             sum(o.get("tag") == rule["outboundTag"] for o in bundle["config"].get("outbounds", [])) != 1):
             raise ValueError()
+
+def reconcile_deleted_users(bundle, tag):
+    nodes = [n for n in bundle["config"].get("inbounds", []) if n.get("tag") == tag]
+    if len(nodes) != 1: raise ValueError()
+    node = nodes[0]
+    records = records_for(bundle, tag)
+    if not records: return
+    users, key = users_of(node)
+    tokens = {identity(node, user, key) for user in users}
+    rules = bundle["config"].get("routing", {}).get("rules", [])
+    if not isinstance(rules, list): raise ValueError()
+    removed = 0
+    for token, record in list(records.items()):
+        rule, email = recorded_rule(tag, token, record)
+        if token in tokens: continue
+        # Use the live pre-edit users: a newly added user must not inherit an old binding.
+        if any(user.get("email") == email for user in users): raise ValueError()
+        count = rules.count(rule)
+        scoped_rules = [r for r in rules if not r.get("inboundTag") or tag in r["inboundTag"]]
+        references = [r for r in scoped_rules if email in (r.get("user") or [])]
+        # A missing exact rule may have been replaced by a regex; do not guess its ownership.
+        regex_reference = not count and any(isinstance(name, str) and name.lower().startswith("regexp:")
+                                            for r in scoped_rules for name in (r.get("user") or []))
+        if count > 1 or any(r != rule for r in references) or regex_reference: raise ValueError()
+        if count: rules.remove(rule)
+        del records[token]
+        removed += 1
+    if not records: bundle["clients"][tag].pop("user_outbound_routes", None)
+    guard(bundle, tag, node)
+    if removed:
+        print(f"检测到 {removed} 条已删除用户的旧绑定，将随本次保存清理。", file=sys.stderr)
 
 try:
     mode = sys.argv[1]
@@ -2035,6 +2072,9 @@ try:
     if mode == "guard":
         node = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
         guard(data, sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else node["tag"], node)
+    elif mode == "reconcile":
+        reconcile_deleted_users(data, sys.argv[3])
+        print(json.dumps(data, ensure_ascii=False))
     elif mode == "bind":
         tag, index, outbound = sys.argv[3], int(sys.argv[4]) - 1, sys.argv[5]
         nodes = [n for n in data["config"].get("inbounds", []) if n.get("tag") == tag]
@@ -2042,6 +2082,7 @@ try:
         node = nodes[0]
         users, key = users_of(node)
         if not 0 <= index < len(users): raise ValueError()
+        reconcile_deleted_users(data, tag)
         meta = data["clients"].get(tag, {})
         refresh_cache = not meta or meta.get("inbound") == node
         guard(data, tag, node)
@@ -3094,11 +3135,12 @@ change_inbound_user() (
         jq --argjson i "$((index-1))" '.settings.users=(.settings.users // .settings.clients)|del(.settings.clients)|del(.settings.users[$i])' "$work/node" >"$work/new" || exit 1
     fi
     validate_inbound_users "$work/new" || { fail "认证重复或用户数据无效。"; exit 1; }
-    guard_user_routes "$work/before" "$work/new" || exit 1
+    user_route_tools reconcile "$work/before" "$selected" >"$work/reconciled" || exit 1
+    guard_user_routes "$work/reconciled" "$work/new" || exit 1
     confirm "保存用户变更（其他用户保留）？" || exit 0
     snapshot_bundle >"$work/current" || exit 1
     [[ $(jq -Sc . "$work/current") == "$(jq -Sc . "$work/before")" ]] || { fail "配置已变化。"; exit 1; }
-    jq --arg t "$selected" --slurpfile n "$work/new" '.config.inbounds|=map(if .tag==$t then $n[0] else . end)|.clients[$t]=((.clients[$t] // {})+{inbound:$n[0]})' "$work/before" >"$work/after" || exit 1
+    jq --arg t "$selected" --slurpfile n "$work/new" '.config.inbounds|=map(if .tag==$t then $n[0] else . end)|.clients[$t]=((.clients[$t] // {})+{inbound:$n[0]})' "$work/reconciled" >"$work/after" || exit 1
     if [[ $action == add ]]; then apply_bundle "$work/after" preserve start; else apply_bundle "$work/after"; fi
 )
 users_menu(){

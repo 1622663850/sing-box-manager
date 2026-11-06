@@ -113,6 +113,19 @@ class XrayUserOutboundRouteTest(fixture.XrayFixture):
     def metadata(self) -> dict:
         return json.loads((self.clients_dir / "user-route-node.json").read_text(encoding="utf-8"))
 
+    def add_user(self, name="user-c", credential=UUID3, *, confirmation="return 0"):
+        self.env.update(XR_TEST_NEW_NAME=name, XR_TEST_NEW_USER=credential)
+        return self.shell(r'''prompt() { printf -v "$1" '%s' "$XR_TEST_NEW_NAME"; }
+prompt_secret() { printf -v "$1" '%s' "$XR_TEST_NEW_USER"; }
+confirm() { ''' + confirmation + r'''; }
+change_inbound_user add user-route-node''')
+
+    def manually_remove_first_user(self):
+        current = json.loads(self.config.read_text())
+        current["inbounds"][0]["settings"]["users"].pop(0)
+        fixture.dump(self.config, current)
+        return current
+
     def test_two_users_bind_to_different_outbounds_and_unbind_one(self) -> None:
         self.seed()
         before_backups = sorted(self.backups_dir.iterdir())
@@ -497,6 +510,123 @@ user_outbound_wizard_locked bind''')
 
         self.unbind(1)
         self.assertEqual(self.bind(1, "exit-b").returncode, 0)
+
+    def test_add_user_after_manual_bound_user_deletion_cleans_only_orphan_binding(self) -> None:
+        for protocol in ("vless", "vmess", "trojan", "hysteria"):
+            with self.subTest(protocol=protocol):
+                node = self.make_node(protocol)
+                self.seed(node)
+                self.bind(1, "exit-a")
+                self.bind(2, "exit-b")
+                retained = next(r for r in self.metadata()["user_outbound_routes"].values()
+                                if r["rule"]["user"] == ["user-b"])
+                self.manually_remove_first_user()
+                result = self.add_user()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = json.loads(self.config.read_text())
+                self.assertEqual(config["inbounds"][0]["settings"]["users"],
+                                 [node["settings"]["users"][1], user(protocol, UUID3, "user-c")])
+                self.assertEqual(self.metadata()["user_outbound_routes"], {retained["identity"]: retained})
+                self.assertEqual(self.routes(), [retained["rule"], self.unrelated_rule])
+
+    def test_readding_deleted_identity_or_name_does_not_restore_old_binding(self) -> None:
+        for remove_rule in (False, True):
+            for credential in (UUID, UUID3):
+                with self.subTest(remove_rule=remove_rule, credential=credential):
+                    self.seed()
+                    self.bind(1, "exit-a")
+                    current = self.manually_remove_first_user()
+                    if remove_rule:
+                        current["routing"]["rules"] = [self.unrelated_rule]
+                        fixture.dump(self.config, current)
+                    result = self.add_user("user-a", credential)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("user_outbound_routes", self.metadata())
+                    self.assertEqual(self.routes(), [self.unrelated_rule])
+
+    def test_orphan_cleanup_is_scoped_and_runs_on_bind_and_unbind(self) -> None:
+        other_rule = {"type":"field", "inboundTag":["other-node"], "user":["user-a"], "outboundTag":"exit-a"}
+        null_rule = {"type":"field", "inboundTag":None, "user":None, "domain":["unrelated.example"], "outboundTag":"direct"}
+        for target in ("exit-b", "-"):
+            with self.subTest(target=target):
+                self.seed(rules=[other_rule, null_rule, self.unrelated_rule])
+                self.bind(1, "exit-a")
+                self.bind(2, "exit-b")
+                current = self.manually_remove_first_user()
+                cache = copy.deepcopy(self.metadata()["inbound"])
+                result = self.bind(1, target, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.config.read_text())["inbounds"], current["inbounds"])
+                self.assertEqual(self.metadata()["inbound"], cache)
+                self.assertIn(other_rule, self.routes())
+                self.assertIn(null_rule, self.routes())
+                self.assertIn(self.unrelated_rule, self.routes())
+                if target == "-":
+                    self.assertNotIn("user_outbound_routes", self.metadata())
+                else:
+                    self.assertEqual(set(self.metadata()["user_outbound_routes"]), {identity("vless", UUID2)})
+
+    def test_orphan_cleanup_rejects_ambiguous_rules_or_reused_live_name(self) -> None:
+        for change in ("changed-rule", "duplicate-rule", "external-rule", "empty-inbound", "regex-user", "live-name", "bad-record"):
+            with self.subTest(change=change):
+                self.seed()
+                self.bind(1, "exit-a")
+                current = self.manually_remove_first_user()
+                if change == "changed-rule": current["routing"]["rules"][0]["outboundTag"] = "exit-b"
+                elif change == "duplicate-rule": current["routing"]["rules"].append(copy.deepcopy(current["routing"]["rules"][0]))
+                elif change == "external-rule": current["routing"]["rules"].append({"type":"field","user":["user-a"],"outboundTag":"exit-b"})
+                elif change == "empty-inbound": current["routing"]["rules"][0]["inboundTag"] = []
+                elif change == "regex-user": current["routing"]["rules"][0]["user"] = ["regexp:^user-a$"]
+                elif change == "live-name": current["inbounds"][0]["settings"]["users"][0]["email"] = "user-a"
+                else:
+                    meta = self.metadata()
+                    meta["user_outbound_routes"][identity("vless", UUID)]["identity"] = "invalid"
+                    fixture.dump(self.clients_dir / "user-route-node.json", meta)
+                fixture.dump(self.config, current)
+                before = self.snapshot_bytes()
+                result = self.add_user()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.snapshot_bytes(), before)
+
+    def test_orphan_cleanup_cancel_and_restart_failure_preserve_original_bytes(self) -> None:
+        self.seed()
+        self.bind(1, "exit-a")
+        self.manually_remove_first_user()
+        before = self.snapshot_bytes()
+        self.assertEqual(self.add_user(confirmation="return 1").returncode, 0)
+        self.assertEqual(self.snapshot_bytes(), before)
+        self.state(active=True, restart_failures=1)
+        result = self.add_user()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.snapshot_bytes()[:2], before[:2])
+        self.assertTrue(self.state()["active"])
+
+    def test_orphan_cleanup_does_not_overwrite_concurrent_manual_edit(self) -> None:
+        self.seed()
+        self.bind(1, "exit-a")
+        current = self.manually_remove_first_user()
+        meta = self.metadata()
+        edited = copy.deepcopy(current)
+        edited["log"]["loglevel"] = "debug"
+        path = self.candidate(edited, "concurrent.json")
+        self.env["XR_TEST_CONCURRENT"] = str(path)
+        result = self.add_user(confirmation='cp -- "$XR_TEST_CONCURRENT" "$CONFIG_FILE"; return 0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(self.config.read_text()), edited)
+        self.assertEqual(self.metadata(), meta)
+
+    def test_delete_unbound_user_also_cleans_preexisting_orphan_binding(self) -> None:
+        node = self.make_node()
+        node["settings"]["users"].append(user("vless", UUID3, "user-c"))
+        self.seed(node)
+        self.bind(1, "exit-a")
+        self.bind(2, "exit-b")
+        self.manually_remove_first_user()
+        result = self.shell('prompt() { printf -v "$1" 2; }; confirm() { return 0; }; change_inbound_user delete user-route-node')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())["inbounds"][0]["settings"]["users"], [user("vless", UUID2, "user-b")])
+        self.assertEqual(set(self.metadata()["user_outbound_routes"]), {identity("vless", UUID2)})
+        self.assertEqual(self.routes()[-1], self.unrelated_rule)
 
     def test_bound_outbound_and_node_deletion_are_reference_protected(self) -> None:
         node = self.make_node()

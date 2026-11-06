@@ -141,7 +141,10 @@ def run(core: Path, manager: Path, protocol: str) -> None:
                         {"protocol": "freedom", "tag": "out-a", "settings": {"redirect": f"{USER_A_HOST}:{target_a_port}", "finalRules": allow_a}},
                         {"protocol": "freedom", "tag": "out-b", "settings": {"redirect": f"{USER_B_HOST}:{target_b_port}", "finalRules": allow_b}},
                     ],
-                    "routing": {"domainStrategy": "AsIs", "rules": []},
+                    "routing": {"domainStrategy": "AsIs", "rules": [
+                        {"type":"field", "inboundTag":None, "user":None,
+                         "domain":["unrelated.example"], "outboundTag":"out-a"},
+                    ]},
                 }
                 write_json(config, initial)
                 xray_smoke.check_xray(core, config, work)
@@ -226,6 +229,35 @@ def run(core: Path, manager: Path, protocol: str) -> None:
                         require(metadata.get(key) == before_metadata.get(key), "non-route metadata changed")
                 require(not list(state.joinpath("backups").iterdir()), "per-user operations created automatic backup")
                 print("PASS user route isolation: credentials and backup directory preserved", flush=True)
+                bind_user(1, "out-b")
+                bind_user(2, "out-b")
+                edited = json.loads(config.read_text(encoding="utf-8"))
+                edited["inbounds"][0]["settings"]["users"].pop(0)
+                write_json(config, edited)
+                add_user = '''prompt() { printf -v "$1" alice; }
+prompt_secret() { printf -v "$1" '%s' "$XR_READD_CREDENTIAL"; }
+change_inbound_user add user-route'''
+                result = manager_call(manager, core, root, service, "eval", add_user, locked=True,
+                                      environment=dict(env, XR_READD_CREDENTIAL=credential_a))
+                require(result.returncode == 0, "adding user after manual deletion failed")
+                recovered = json.loads(config.read_text(encoding="utf-8"))
+                require(route_rule(recovered, "alice", "out-b") is None, "readded user inherited deleted binding")
+                require(route_rule(recovered, "bob", "out-b") is not None, "surviving user's route changed")
+                require(request_user(core, user_a, target_a_port, work, "alice-readded") == USER_A_PAYLOAD,
+                        "readded alice did not follow node route")
+                require(request_user(core, user_b, target_a_port, work, "bob-preserved") == USER_B_PAYLOAD,
+                        "bob forwarding changed during cleanup")
+                bind_user(2, "out-b")
+                edited = json.loads(config.read_text(encoding="utf-8"))
+                edited["inbounds"][0]["settings"]["users"].pop(1)
+                write_json(config, edited)
+                bind_user(1, "-")
+                require("user_outbound_routes" not in json.loads((clients / "user-route.json").read_text()),
+                        "unbinding left deleted user records")
+                require(request_user(core, user_b, target_a_port, work, "bob-cleaned") == USER_A_PAYLOAD,
+                        "bob did not fall back after orphan cleanup and unbind")
+                require(not list(state.joinpath("backups").iterdir()), "cleanup created automatic backup")
+                print("PASS manual user deletion: automatic cleanup, readd and unbind preserve forwarding", flush=True)
         finally:
             if created:
                 management.systemd(systemctl, "stop", service, check=False)
