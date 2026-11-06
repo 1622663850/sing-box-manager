@@ -760,6 +760,7 @@ printf 'INVALID_REJECTED\n'
                     prompt_quic_bbr() { printf -v "$1" 2; }
                     prepare_quic_bbr_wizard() { : >"$4"; cat -- "$1"; }
                     generate_inbound() { printf '%s\n' "$1" >> "$TEST_ROUTE_LOG"; printf '{"type":"direct","tag":"route"}\n'; }
+                    confirm() { return 0; }
                     add_managed_inbound() { return 0; }
                     atomic_copy() { return 0; }
                     show_client() { return 0; }
@@ -798,8 +799,9 @@ printf 'INVALID_REJECTED\n'
         for choice, protocol, tag in (
             (10, "vless-grpc-tls", "integration-grpc-tls"),
             (18, "vless-tcp-tls", "integration-tcp-tls"),
+            (10, "vless-grpc-tls", "integration-cancel"),
         ):
-            with self.subTest(protocol=protocol):
+            with self.subTest(protocol=protocol, tag=tag):
                 self.config.write_bytes(self.original_bytes)
                 certificate, private_key = self.tls_material()
                 env = dict(
@@ -832,6 +834,7 @@ printf 'INVALID_REJECTED\n'
                             *) printf -v "$variable" '%s' '' ;;
                         esac
                     }
+                    confirm() { [[ $TEST_TAG != integration-cancel ]]; }
                     CORE_BIN="$TEST_WIZARD_CORE"
                     add_wizard_locked
                 '''
@@ -840,6 +843,11 @@ printf 'INVALID_REJECTED\n'
                     env=env, text=True, capture_output=True, timeout=20,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if tag == "integration-cancel":
+                    self.assertIn("已取消", result.stdout)
+                    self.assertEqual(self.config.read_bytes(), self.original_bytes)
+                    self.assertFalse((self.state_dir / "clients" / (tag + ".json")).exists())
+                    continue
 
                 config = json.loads(self.config.read_text(encoding="utf-8"))
                 self.assertEqual(len(config["inbounds"]), 1)
@@ -968,6 +976,39 @@ printf 'INVALID_REJECTED\n'
         self.assertEqual(inbound["transport"]["path"], path)
         self.assertEqual(inbound["transport"]["type"], "ws")
         self.assertEqual(inbound["listen_port"], 18443)
+
+    def test_confirmation_defaults_to_yes_in_terminal(self) -> None:
+        import select
+        import time
+
+        for keys, status in ((b"\n", 0), (b"y\n", 0), (b"Y\n", 0), (b"n\n", 1),
+                             (b"N\n", 1), (b"invalid\n", 1), (b"\x04", 1)):
+            with self.subTest(keys=keys):
+                master, slave = pty.openpty()
+                process = subprocess.Popen(
+                    ["bash", "-c", 'source "$1"; confirm "保存测试配置？"', "confirmation", str(SCRIPT)],
+                    env=self.env, stdin=slave, stdout=slave, stderr=slave,
+                )
+                os.close(slave)
+                try:
+                    seen = b""
+                    deadline = time.monotonic() + 5
+                    while b"[Y/n]: " not in seen and time.monotonic() < deadline:
+                        if select.select([master], [], [], 0.1)[0]:
+                            seen += os.read(master, 4096)
+                    self.assertIn("默认 Y，回车确认".encode(), seen)
+                    self.assertIn(b"[Y/n]: ", seen)
+                    os.write(master, keys)
+                    self.assertEqual(process.wait(timeout=5), status)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+                    os.close(master)
+
+        result = self.shell('confirm "保存测试配置？"')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("需要交互确认", result.stderr)
 
     def test_prompt_allows_backspace_delete_and_cursor_editing(self) -> None:
         import select
@@ -1281,6 +1322,7 @@ printf 'INVALID_REJECTED\n'
             prepare_quic_bbr_wizard() { : >"$4"; cat -- "$1"; }
             generate_inbound() { printf '{"type":"direct","tag":"wizard-default"}\n'; }
             generate_client() { return 0; }
+            confirm() { return 0; }
             add_managed_inbound() { return 0; }
             atomic_copy() { return 0; }
             show_client() { return 0; }

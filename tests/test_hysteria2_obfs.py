@@ -335,6 +335,7 @@ class Hysteria2ObfsTest(unittest.TestCase):
                         printf -v certificate '%s' "$TEST_CERTIFICATE"
                         printf -v tls_key '%s' "$TEST_PRIVATE_KEY"
                     }
+                    confirm() { return 0; }
                     CORE_BIN="$TEST_WIZARD_CORE"
                     add_wizard_locked
                 '''

@@ -169,6 +169,7 @@ class QuicBbrWizardTest(unittest.TestCase):
                         printf -v certificate '%s' "$TEST_CERTIFICATE"
                         printf -v tls_key '%s' "$TEST_PRIVATE_KEY"
                     }
+                    confirm() { return 0; }
                     CORE_BIN="$TEST_WIZARD_CORE"
                     add_wizard_locked
                 '''
@@ -262,6 +263,7 @@ class QuicBbrWizardTest(unittest.TestCase):
             }
             prompt_hysteria2_obfs() { printf -v "$1" ''; }
             prompt_tls_certificate_files() { printf -v certificate '%s' "$TEST_CERTIFICATE"; printf -v tls_key '%s' "$TEST_PRIVATE_KEY"; }
+            confirm() { return 0; }
             CORE_BIN="$TEST_WIZARD_CORE"
             add_wizard_locked
         '''

@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.26.4"
+SB_MANAGER_VERSION="1.26.5"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1636,8 +1636,8 @@ update_core() {
 confirm() {
     local answer
     [[ -t 0 ]] || { fail "此操作需要交互确认，请在终端运行。"; return 1; }
-    read -r -p "$1 [y/N]: " answer || return 1
-    [[ $answer == y || $answer == Y ]]
+    read -r -p "$1（默认 Y，回车确认；输入 n 取消） [Y/n]: " answer || return 1
+    [[ -z $answer || $answer == y || $answer == Y ]]
 }
 
 uninstall_core_locked() {
@@ -2583,7 +2583,10 @@ add_wizard_locked() (
         21) snell_shadowtls_wizard_locked; exit $? ;;
         5|6)
             prompt file "请输入服务器上的 JSON 文件绝对路径" || exit 1
-            if [[ $choice == 5 ]]; then add_inbound_file "$file"; else
+            if [[ $choice == 5 ]]; then
+                confirm "导入单个入站配置？（自动备份）" || { info "已取消。"; exit 0; }
+                add_inbound_file "$file"
+            else
                 validate_config "$file" || exit 1
                 confirm "完整导入会替换全部配置，是否继续？（自动备份旧配置）" || exit 1
                 import_config "$file"
@@ -2653,6 +2656,7 @@ add_wizard_locked() (
         quic_record=$(cat "$work/quic-record-update.json") || exit 1
     fi
     [[ -z $server ]] || generate_client "$work/inbound.json" "$server" "$public_key" >/dev/null || exit 1
+    confirm "保存新增配置 $tag？（自动备份，服务将启动或短暂重启）" || { info "已取消。"; exit 0; }
     add_managed_inbound "$work/inbound.json" "$server" "$public_key" "$quic_record" || exit 1
     info "已添加 $tag，端口 $((10#$port))。请在服务器防火墙和云安全组放行对应端口。"
     case "$protocol" in
