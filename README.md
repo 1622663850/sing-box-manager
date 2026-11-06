@@ -290,7 +290,7 @@ sudo sing-box core run -c /root/another-config.json
 主菜单 **2. 卸载 sing-box** 或 `sudo sing-box uninstall` 可选择：
 
 - **1. 仅卸载核心和服务**：停止服务、关闭自启并移除核心及 unit；面板、节点配置、连接信息和备份保留，方便重新安装。
-- **2. 彻底卸载**：删除 `/usr/local/lib/sing-box-manager`、`/usr/local/bin/sing-box`、`/etc/sing-box`、`/var/lib/sing-box-manager` 和本面板 unit，包含所有节点、默认地址及面板备份。可额外指定一个原下载脚本的绝对路径一并删除；不递归删除整个 Git 源码仓库。完成后退出面板。
+- **2. 彻底卸载**：删除 `/usr/local/lib/sing-box-manager`、`/usr/local/bin/sing-box`、`/etc/sing-box`、`/var/lib/sing-box-manager` 和本面板 unit，包含所有节点、默认地址及面板备份。v1.26.4 起，自动将已验证的 `sing-box-manager.sh` 加入删除清单，检查当前运行的脚本、当前目录、`/root/sing-box-manager.sh` 和 `/root/sing-box-manager/sing-box-manager.sh`。其他位置可输入绝对路径追加。确认后仅删除清单中的脚本文件，源码仓库里的其他文件保留。完成后退出面板。
 - **0. 返回**：不卸载。
 
 也可执行 `sudo sing-box uninstall --purge` 直接进入彻底卸载确认。界面先列出删除路径，只有输入大写 **DELETE** 才执行；其余输入取消。此操作不可撤销，需要保留的节点或备份请先另行导出至删除清单之外。

@@ -302,10 +302,18 @@ uninstall_menu
 
     def test_real_menu_purge_exits_after_delete_without_return_prompt(self) -> None:
         source = self._install_fixture()
+        download = self.root / "root/sing-box-manager.sh"
+        checkout = self.root / "root/sing-box-manager/sing-box-manager.sh"
+        for copy in (download, checkout):
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, copy)
+        sibling = checkout.with_name("README.md")
+        sibling.write_text("keep checkout contents\n", encoding="utf-8")
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 240, 0, 0))
         process = subprocess.Popen(
-            ["bash", "-c", 'source "$1"; menu', "uninstall-menu", str(fixture.SCRIPT)],
+            ["bash", "-c", 'source "$1"; menu', "uninstall-menu", str(self.wrapper)],
+            cwd=source.parent,
             env=self.env,
             stdin=slave,
             stdout=slave,
@@ -338,6 +346,9 @@ uninstall_menu
             wait_for("额外删除的原下载脚本绝对路径")
             os.write(master, "\n".encode("utf-8"))
             wait_for("输入 DELETE 确认")
+            for copy in (source, download, checkout):
+                self.assertIn(str(copy).encode(), transcript)
+                self.assertTrue(copy.is_file())
             os.write(master, "DELETE\n".encode("utf-8"))
             self.assertEqual(process.wait(timeout=8), 0)
             # Drain the final fixed messages without sending a return key.
@@ -353,7 +364,9 @@ uninstall_menu
             self.assertEqual(transcript.decode("utf-8", errors="replace").count("请输入选项"), 1)
             for path in self._fixed_paths():
                 self.assertFalse(path.exists() or path.is_symlink(), f"owned path remains: {path}")
-            self.assertTrue(source.exists(), "blank optional source path should be retained")
+            for copy in (source, download, checkout):
+                self.assertFalse(copy.exists())
+            self.assertEqual(sibling.read_text(encoding="utf-8"), "keep checkout contents\n")
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -363,6 +376,29 @@ uninstall_menu
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=3)
             os.close(master)
+
+    def test_purge_detects_invoked_script_and_ignores_symlink_candidate(self) -> None:
+        source = self._install_fixture()
+        link = self.root / "root/sing-box-manager.sh"
+        link.parent.mkdir()
+        target = self.root / "other-copy.sh"
+        shutil.copyfile(source, target)
+        self._make_symlink(link, target)
+        result = self.shell(r'''
+SCRIPT_FILE="$1"
+prompt() {
+    case "$1" in
+        source) printf -v "$1" '%s' '' ;;
+        answer) printf -v "$1" '%s' DELETE ;;
+        *) return 1 ;;
+    esac
+}
+purge_uninstall
+''', str(source))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(source.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(target.is_file())
 
     def test_cli_uninstall_purge_requires_exact_option(self) -> None:
         marker = self.root / "cli-route"

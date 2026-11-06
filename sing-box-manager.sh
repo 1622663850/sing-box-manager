@@ -3,7 +3,7 @@
 # sing-box-manager: a self-contained Chinese terminal manager.
 # The UI command and the upstream core deliberately use different paths.
 
-SB_MANAGER_VERSION="1.26.3"
+SB_MANAGER_VERSION="1.26.4"
 SB_ROOT_PREFIX="${SB_ROOT_PREFIX:-}" # Source-only test seam; rejected by the CLI.
 LIB_DIR="${SB_ROOT_PREFIX}/usr/local/lib/sing-box-manager"
 CORE_BIN="$LIB_DIR/sing-box"
@@ -1671,7 +1671,7 @@ uninstall_core() {
 validate_purge_paths() {
     python3 - "$SB_ROOT_PREFIX" "$LIB_DIR" "$CONFIG_DIR" "$STATE_DIR" "$WRAPPER" "$UNIT_FILE" \
         "$MANAGED_MARKER" "$CORE_BIN" "$BACKUP_DIR" "$CLIENT_DIR" "$DEFAULT_SERVER_FILE" \
-        "$BBR_SYSCTL_DIR" "$BBR_SYSCTL_FILE" "$BBR_RESTORE_FILE" "$SERVICE" "${1:-}" "$CONFIG_FILE" <<'PY_PURGE_PATHS'
+        "$BBR_SYSCTL_DIR" "$BBR_SYSCTL_FILE" "$BBR_RESTORE_FILE" "$SERVICE" "$CONFIG_FILE" "$@" <<'PY_PURGE_PATHS'
 from pathlib import Path
 import os, re, stat, sys
 
@@ -1686,11 +1686,11 @@ try:
                 '/var/lib/sing-box-manager/default-server', '/etc/sysctl.d',
                 '/etc/sysctl.d/99-sing-box-manager-bbr.conf', '/var/lib/sing-box-manager/bbr-active']
     if (sys.argv[2:15] != [prefix + p for p in expected] or sys.argv[15] != 'sing-box.service' or
-        sys.argv[17] != prefix + '/etc/sing-box/config.json'):
+        sys.argv[16] != prefix + '/etc/sing-box/config.json'):
         raise ValueError()
-    paths = [Path(p) for p in sys.argv[2:15]] + [Path(sys.argv[17])]
-    source = Path(sys.argv[16]) if sys.argv[16] else None
-    if source:
+    paths = [Path(p) for p in sys.argv[2:15]] + [Path(sys.argv[16])]
+    sources = [Path(p) for p in sys.argv[17:] if p]
+    for source in sources:
         if (not source.is_absolute() or str(source).startswith('//') or os.path.normpath(str(source)) != str(source) or
             any(ord(c) < 32 or ord(c) == 127 for c in str(source))): raise ValueError()
         protected = ['/usr/local/lib/xray-manager', '/usr/local/bin/xray', '/etc/xray',
@@ -1706,7 +1706,7 @@ try:
     # A bind mount can share st_dev with its parent; --one-file-system alone cannot protect it.
     for line in Path('/proc/self/mountinfo').read_text().splitlines():
         mount = Path(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4]))
-        if any(mount == p or p in mount.parents for p in paths[:3]): raise ValueError()
+        if mount in sources or any(mount == p or p in mount.parents for p in paths[:3]): raise ValueError()
     for p in [paths[i] for i in [3, 4, 5, 6, 9, 11, 12, 13]]:
         if p.exists() and not stat.S_ISREG(p.stat().st_mode): raise ValueError()
     if paths[5].stat().st_size > 256 or paths[5].read_text().strip() != 'sing-box-manager-v1': raise ValueError()
@@ -1717,7 +1717,7 @@ try:
                 b'# sing-box-manager: a self-contained Chinese terminal manager.' in data.splitlines() and
                 re.search(rb'^SB_MANAGER_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$', data, re.M) is not None)
     if paths[3].exists() and not owned_script(paths[3]): raise ValueError()
-    if source and not owned_script(source): raise ValueError()
+    if not all(owned_script(source) for source in sources): raise ValueError()
     if paths[4].exists():
         if paths[4].stat().st_size > 1048576: raise ValueError()
         unit = paths[4].read_text()
@@ -1782,29 +1782,52 @@ purge_bbr_settings() (
 )
 
 purge_install_locked() {
-    local source=${1:-}
-    [[ $# -le 1 ]] || return 1
-    is_managed && validate_purge_paths "$source" && check_conflicts || return 1
+    local source
+    is_managed && validate_purge_paths "$@" && check_conflicts || return 1
     uninstall_core_locked purge || return 1
-    validate_purge_paths "$source" || return 1
+    validate_purge_paths "$@" || return 1
+    for source in "$@"; do
+        [[ -n $source ]] || continue
+        if ! rm -f -- "$source" || [[ -e $source || -L $source ]]; then
+            fail "未能删除面板脚本：$source，请处理后重试。"; return 1
+        fi
+        info "已删除面板脚本：$source"
+    done
     purge_bbr_settings
-    validate_purge_paths "$source" || return 1
+    validate_purge_paths || return 1
     if ! rm -rf --one-file-system -- "$CONFIG_DIR" "$STATE_DIR" "$LIB_DIR" ||
        ! rm -f -- "$WRAPPER"; then
         fail "彻底卸载未完成，请核对上方删除清单和剩余文件。"; return 1
     fi
-    [[ -z $source ]] || rm -f -- "$source" || return 1
     info "已彻底卸载 sing-box 核心、服务、面板命令、节点配置、连接信息和面板备份。"
-    [[ -z $source ]] || info "已删除指定的下载脚本：$source"
     info "外部 ACME 证书、ACME 菜单、其他程序及系统日志保留。"
 }
 
 purge_uninstall() {
-    local source="" answer
+    local source="" answer candidate absolute known
+    local -a sources=()
     is_managed || { fail "没有本脚本管理的安装。"; return 1; }
-    prompt source "额外删除的原下载脚本绝对路径（留空保留源码副本，0 取消）" || return 1
+    validate_purge_paths && check_conflicts || return 1
+    for candidate in "$SCRIPT_FILE" "$PWD/sing-box-manager.sh" \
+        "$SB_ROOT_PREFIX/root/sing-box-manager.sh" "$SB_ROOT_PREFIX/root/sing-box-manager/sing-box-manager.sh"; do
+        [[ ${candidate##*/} == sing-box-manager.sh && -f $candidate ]] || continue
+        absolute=$(realpath -ms -- "$candidate") || continue
+        [[ $absolute -ef $candidate ]] || continue
+        [[ -z $SB_ROOT_PREFIX || $absolute == "$SB_ROOT_PREFIX/"* ]] || continue
+        for known in "${sources[@]}"; do
+            [[ $known != "$absolute" ]] || continue 2
+        done
+        if validate_purge_paths "$absolute" 2>/dev/null; then sources+=("$absolute"); fi
+    done
+    prompt source "额外删除的原下载脚本绝对路径（回车使用自动识别清单，0 取消）" || return 1
     [[ $source != 0 ]] || return 0
-    validate_purge_paths "$source" && check_conflicts || return 1
+    if [[ -n $source ]]; then
+        validate_purge_paths "$source" || return 1
+        for known in "${sources[@]}"; do
+            if [[ $known == "$source" ]]; then source=""; break; fi
+        done
+        [[ -z $source ]] || sources+=("$source")
+    fi
     if [[ -e $BBR_RESTORE_FILE || -e $BBR_SYSCTL_FILE ]]; then
         info "将撤销本面板的 TCP BBR 设置，恢复原算法、默认队列和原文件状态；这会影响整机默认 TCP 设置，也可能影响 Xray 等服务。"
         info "恢复资料缺失或恢复失败不阻止卸载；仅清理本面板的 BBR 配置，不猜测原算法，不修改其他 sysctl 文件。"
@@ -1812,11 +1835,11 @@ purge_uninstall() {
     fi
     printf '\n将永久删除以下路径（含全部节点及面板备份）：\n  %s\n  %s\n  %s\n  %s\n  %s\n' "$CORE_BIN" "$LIB_DIR" "$WRAPPER" "$CONFIG_DIR" "$STATE_DIR"
     printf '  %s\n' "$UNIT_FILE"
-    [[ -z $source ]] || printf '  %s\n' "$source"
+    for source in "${sources[@]}"; do printf '  %s\n' "$source"; done
     info "不会递归删除整个源码仓库；外部证书、ACME 和 Xray 保留。"
     prompt answer "此操作不可撤销；输入 DELETE 确认，其他输入取消" 0 || return 1
     [[ $answer == DELETE ]] || { info "已取消彻底卸载。"; return 0; }
-    with_lock purge_install_locked "$source"
+    with_lock purge_install_locked "${sources[@]}"
 }
 
 uninstall_menu() {
