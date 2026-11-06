@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016 # json_query/config_jq filters intentionally contain literal jq variables.
 # xray-manager: a self-contained Chinese terminal manager.
 # This script owns its wrapper, core, service, configuration and state.
-XR_MANAGER_VERSION="1.2.7"
+XR_MANAGER_VERSION="1.2.8"
 XR_ROOT_PREFIX="${XR_ROOT_PREFIX:-}"
 LIB_DIR="${XR_ROOT_PREFIX}/usr/local/lib/xray-manager"
 CORE_BIN="$LIB_DIR/xray"
@@ -953,18 +953,26 @@ update_panel_locked() (
     trap 'exit 130' INT
     trap 'exit 143' TERM
     info "正在从 GitHub 获取最新面板脚本。"
-    download_https 'https://api.github.com/repos/1622663850/sing-box-manager/contents/xray-manager.sh?ref=main' \
-        "$work/source.json" 60 || { fail "面板下载失败，旧版本保留。"; exit 1; }
-    decode_github_file "$work/source.json" "$work/panel.sh" xray-manager.sh || exit 1
+    if download_https 'https://api.github.com/repos/1622663850/sing-box-manager/contents/xray-manager.sh?ref=main' "$work/source.json" 60; then
+        decode_github_file "$work/source.json" "$work/panel.sh" xray-manager.sh || exit 1
+    else
+        info "GitHub API 下载失败，尝试 GitHub Raw。"
+        download_https 'https://raw.githubusercontent.com/1622663850/sing-box-manager/main/xray-manager.sh' \
+            "$work/panel.sh" 60 || { fail "面板下载失败，旧版本保留。"; exit 1; }
+    fi
     version=$(python3 - "$work/panel.sh" <<'PY_PANEL_DOWNLOAD'
 from pathlib import Path
 import re
 import sys
 
 try:
-    content = Path(sys.argv[1]).read_bytes()
+    path = Path(sys.argv[1])
+    if not 0 < path.stat().st_size <= 1048576:
+        raise ValueError("invalid panel size")
+    content = path.read_bytes()
     versions = re.findall(rb'^XR_MANAGER_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$', content, re.M)
     if (not content.startswith(b"#!/usr/bin/env bash\n") or
+        b"\0" in content or
         b"# xray-manager: a self-contained Chinese terminal manager." not in content.splitlines() or
         len(versions) != 1):
         raise ValueError("invalid panel identity")

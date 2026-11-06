@@ -360,6 +360,39 @@ download_https() {
         backups = list(self.backups_dir.glob("panel-*.sh"))
         self.assertEqual(backups, [])
 
+    def test_update_panel_api_failure_uses_validated_raw_script(self) -> None:
+        old = b"#!/usr/bin/env bash\n# old panel\n"
+        candidate = self.root / "raw-panel.sh"
+        self.env["XR_RAW_PANEL_FIXTURE"] = str(candidate)
+        body = r'''
+download_https() {
+    case "$1" in
+        https://api.github.com/repos/1622663850/sing-box-manager/contents/xray-manager.sh\?ref=main) return 22;;
+        https://raw.githubusercontent.com/1622663850/sing-box-manager/main/xray-manager.sh) cp -- "$XR_RAW_PANEL_FIXTURE" "$2";;
+        *) return 77;;
+    esac
+}
+update_panel_locked
+'''
+        good = self._panel_candidate()
+        for name, content in (("valid", good), ("invalid", b"<html>403 Forbidden</html>"), ("unavailable", None)):
+            with self.subTest(raw=name):
+                self.wrapper.write_bytes(old)
+                self.wrapper.chmod(0o755)
+                candidate.unlink(missing_ok=True)
+                if content is not None:
+                    candidate.write_bytes(content)
+                before = (self.config.read_bytes(), self.mock_state.read_bytes())
+                result = self.shell(body)
+                self.assertIn("尝试 GitHub Raw", result.stdout)
+                if name == "valid":
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.wrapper.read_bytes(), good)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.wrapper.read_bytes(), old)
+                self.assertEqual((self.config.read_bytes(), self.mock_state.read_bytes()), before)
+
     def test_update_panel_locked_atomic_publish_failure_restores_old_wrapper(self) -> None:
         old = b"#!/usr/bin/env bash\n# old panel\n"
         self.wrapper.write_bytes(old)
